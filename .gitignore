@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# Local GitMesh metadata of *this* repository (the tool's own project files, if the
+# developer experiments with GitMesh inside the GitMesh checkout)
+/.gitmesh
+
+# Editor and OS noise
+*.swp
+.DS_Store
