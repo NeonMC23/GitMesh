@@ -93,6 +93,24 @@ non-zero on the first failing run.
 For the browser itself, `gitmesh gui --open` (or the printed URL) is enough: the page is
 self-contained and the network panel shows only `/api/*` calls to the local server.
 
+### Validating project creation by hand
+
+Creating a project has its own end-to-end script, because it is the one flow that starts
+from a directory that is not a project yet:
+
+```console
+$ cargo build --release && ./tools/setup-workflow.py
+```
+
+It builds `/tmp/gitmesh-setup-e2e/MyProject` — an ordinary folder with two directories to
+turn into repositories, one repository that already exists (with its own history and
+remote), and one that stays local-only — then drives the wizard's HTTP endpoints exactly
+as the page does: scan, review the plan, refuse the ambiguous layouts, confirm and execute,
+verify the `.git` directories, the generated manifest, the configured remotes and the first
+publish on disk, commit and push normally, break a bare remote on purpose to see the
+partial failure reported precisely, rerun the setup to prove it changes nothing, and
+restart the interface. It prints one line per check and exits non-zero on failure.
+
 Debugging a failing scenario: set `GITMESH_TEST_KEEP=1`-style caching is not needed —
 `TempDir` removes its directory on drop, so add a `println!("{}", fixture.path().display())`
 plus a `std::mem::forget(fixture)` when you want to inspect the state by hand.
@@ -181,13 +199,15 @@ gitmesh/
 │   ├── providers/                 GitHub (optional) provider foundation
 │   ├── git/                       Git CLI execution and output parsing
 │   ├── service.rs                 application layer shared by all front ends
+│   ├── setup.rs                   project creation: inspect, plan, apply, verify (plan-driven)
 │   ├── ui/                        terminal interface (state machine + rendering)
 │   ├── gui/                       graphical interface: model, HTTP/SSE server, assets
 │   │   └── static/                index.html, app.css, app.js (embedded at build time)
 │   └── testkit.rs                 test fixtures (temporary repositories)
 ├── tools/
 │   ├── rust-env.sh                reproducible local toolchain bootstrap
-│   └── gui-workflow.py            end-to-end validation of the graphical interface
+│   ├── gui-workflow.py            end-to-end validation of the graphical interface
+│   └── setup-workflow.py          end-to-end validation of project creation (the wizard)
 └── tests/
     ├── workflows.rs               library-level multi-repository workflows
     ├── cli.rs                     process-level CLI tests

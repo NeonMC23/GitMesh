@@ -301,6 +301,10 @@ fn cmd_init(
                 ("root", Json::from(to_slash(&project.root))),
                 ("manifest", Json::from(to_slash(&path))),
                 ("root_is_repository", Json::from(is_repository)),
+                (
+                    "warnings",
+                    Json::array(plan.warnings.iter().map(|w| Json::from(w.as_str())))
+                ),
             ])
             .to_pretty_string()
         );
@@ -310,6 +314,11 @@ fn cmd_init(
     println!("Created GitMesh project '{}'", project.name);
     println!("  root:     {}", project.root.display());
     println!("  manifest: {}", path.display());
+    // What the plan decided to leave alone is part of the answer, not a footnote the user
+    // has to discover later.
+    for warning in &plan.warnings {
+        println!("  note:     {warning}");
+    }
     if !is_repository {
         println!();
         println!("Note: the project root is not a Git repository yet.");

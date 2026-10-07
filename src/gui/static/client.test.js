@@ -513,7 +513,11 @@ function sampleInspection() {
         issues: ['repository "tools" is not a Git repository yet']
       }
     },
-    publish: [{ operation: 'First push', error: 'no remote configured' }]
+    publish: [
+      { operation: 'First commit', counts: { succeeded: 1, skipped: 1, failed: 0 },
+        outcomes: [{ id: 'engine', outcome: 'success' }, { id: 'tools', outcome: 'skipped' }] },
+      { operation: 'First push', error: 'no remote configured' }
+    ]
   };
   var text = GitMesh.setupResultText(payload, rows);
   equal(text.status, 'partial', 'the status comes from the core');
@@ -524,6 +528,9 @@ function sampleInspection() {
   contains(text.validationIssues[0], 'not a Git repository', 'the issues are carried through');
 
   var publish = GitMesh.publishResultText(payload.publish);
+  equal(publish.commits, 2, 'the follow-up reports what the first commit did');
+  equal(publish.succeeded, 1, 'and how much of it succeeded');
+  equal(publish.skipped, 1, 'and what was skipped');
   equal(publish.problems.length, 1, 'follow-up problems are surfaced');
   contains(publish.problems[0], 'First push', 'the follow-up problem names the operation');
   equal(GitMesh.publishResultText(null), null, 'no follow-up, nothing to report');

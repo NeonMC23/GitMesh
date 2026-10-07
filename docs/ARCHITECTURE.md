@@ -50,9 +50,10 @@ orchestrates them at operation time.
 └───────────────┬────────────────────────────────┬───────────────┘
                 │                                │
 ┌───────────────▼────────────────────────────────▼───────────────┐
-│ service (src/service.rs)     application layer                  │
+│ service (src/service.rs) · setup (src/setup.rs)  application    │
 │ open a project · status/changes · operations · view models      │
 │ progress events · presentation vocabulary shared by front ends  │
+│ project creation: inspect → plan → apply → verify               │
 └───────────────┬────────────────────────────────────────────────┘
                 │
 ┌───────────────▼────────────────────────────────────────────────┐
@@ -82,7 +83,14 @@ Rules that keep the layering honest:
   Git invocation.
 * **`model` is pure data.** No I/O, no Git: it is the vocabulary shared by every layer.
 * **`ops` is the only module that changes repositories** (apart from `discovery`, which
-  can `git init` when explicitly asked). Everything else is read-only.
+  can `git init` when explicitly asked, and `setup`, which drives `discovery` for exactly
+  that). Everything else is read-only.
+* **`setup` is front-end neutral and plan-driven.** `inspect` reports facts, `plan`
+  produces the complete list of steps plus the exact manifest text, `apply` replays that
+  same plan and nothing else, `verify` re-opens the result through `ProjectSession`.
+  `gitmesh init` and the graphical wizard are two front ends of it; neither contains
+  creation logic of its own, and neither can run a plan the user did not see (the plan id
+  is checked again before execution).
 * **`cli`, `ui` and `gui` contain no Git logic.** They call `service` (and, for
   configuration editing, `discovery`), so the front ends cannot drift apart. The GUI
   additionally goes through `service` exclusively: it has no direct `ops` call for
@@ -110,6 +118,7 @@ Rules that keep the layering honest:
 | `src/paths.rs` | Lexical normalisation, project-relative conversion, manifest path validation |
 | `src/json.rs` | Minimal JSON writer used by `--json` output (no serialisation dependency) |
 | `src/providers/` | Hosting provider abstraction; `github.rs` parses GitHub URLs and coordinates |
+| `src/setup.rs` | Project creation service: `inspect` (facts about a directory), `SetupRequest` → `SetupPlan` → `SetupResult` → `ValidationReport`, `FirstPublish` (a plan entry the caller runs through the ordinary commit/push), `SetupObserver` for progress |
 | `src/service.rs` | Application layer: `ProjectSession` (open, status, changes, operations), shared presentation vocabulary (`ChangeState`, `RepositoryStateKind`, `ProjectStateKind`, `PendingWork`, `ProjectBranch`), JSON view models (`status_view_json`, `operation_view_json`), `*_observed` operation entry points |
 | `src/ui/` | `app.rs` state machine (terminal-independent), `render.rs` ratatui drawing, `mod.rs` event loop |
 | `src/gui/` | `editor.rs` builds the model the interface renders from the service layer, `server.rs` is a minimal HTTP/SSE transport, `asset.rs` embeds the three front-end files, `static/` holds them (page, stylesheet, script, and the script's pure-logic tests) |
@@ -123,6 +132,8 @@ covered by tests.
 | # | Invariant | Enforcement |
 | --- | --- | --- |
 | 1 | A Git command never runs in the wrong repository | Repository-scoped commands only exist on `GitRepo`, which always passes `-C <dir>`; `verify_identity()` compares `rev-parse --show-toplevel` with the configured path and refuses mismatches |
+| 2a | Setup never deletes, replaces or re-initialises an existing repository | `setup::plan` plans `git init` only where `discovery::is_repository_root` is false, refuses overlapping or nested boundaries, and never plans a file move, rename or deletion |
+| 2b | An existing remote or manifest is never replaced silently | `RemoteAction::Update` and replacing an existing `.gitmesh/project.toml` are blockers until the request carries the explicit confirmation; `RemoteAction::Record` (record the URL, do not touch Git) is refused when it would contradict an `origin` on disk |
 | 2 | A repository never stages another repository's files | `git add -A -- . ':(exclude)<external-dir>'` plus a post-staging audit that unstages stray paths |
 | 3 | The root repository does not report external content | The analyzer drops root status entries that live inside a configured external repository |
 | 4 | Local work is never discarded | Only non-destructive Git commands are used; `pull` defaults to `--ff-only`; `checkout` relies on Git's own refusal to overwrite; `branch -d` (not `-D`) unless `--force` is explicit |
@@ -151,7 +162,7 @@ Classification used everywhere in the CLI and the UI:
 | Symbol | Kind | Meaning |
 | --- | --- | --- |
 | `✓` | success | The repository did something, or was already in the desired state |
-| `-` | skipped | There was nothing to do (clean, nothing to push, no remote) |
+| `-` | skipped | There was nothing to do (clean, nothing to push, no remote configured) |
 | `!` | conflict | The operation produced or found a merge conflict |
 | `✗` | failed | The operation could not be completed in this repository |
 

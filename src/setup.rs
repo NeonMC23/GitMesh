@@ -144,21 +144,43 @@ pub fn inspect(root: &Path, runner: &GitRunner) -> Result<Inspection> {
         });
     }
 
-    let (manifest_error, manifest_text, is_gitmesh_project) =
+    // The presence of the file decides whether this already is a GitMesh project: a
+    // manifest that cannot be read is reported, never mistaken for "no project here".
+    let is_gitmesh_project = manifest_path.exists();
+    let (manifest_error, manifest_text) = if is_gitmesh_project {
         match std::fs::read_to_string(&manifest_path) {
             Ok(text) => match manifest::parse_manifest(&text, &root, &manifest_path) {
-                Ok(project) => {
-                    let rendered = manifest::render_manifest(&project).ok();
-                    (None, rendered, true)
-                }
-                Err(err) => (Some(err.to_string()), None, true),
+                Ok(project) => (None, manifest::render_manifest(&project).ok()),
+                Err(err) => (Some(err.to_string()), None),
             },
-            Err(_) => (None, None, false),
-        };
+            Err(err) => (Some(format!("the manifest could not be read: {err}")), None),
+        }
+    } else {
+        (None, None)
+    };
 
-    let scan: ProjectScan = discovery::scan_project(&root, &ScanOptions::default(), runner)?;
-    let candidates = candidate_tree(&scan, &root, runner)?;
-    let mut notices = scan.notices.clone();
+    // The scan is best effort: people point the wizard at directories that contain an
+    // unreadable sub-directory, and refusing to show anything at all would be worse than
+    // showing exactly what could be read. The failure is always reported as a notice, and
+    // the root facts below are answered without the scan.
+    let mut notices: Vec<String> = Vec::new();
+    let scan = match discovery::scan_project(&root, &ScanOptions::default(), runner) {
+        Ok(scan) => Some(scan),
+        Err(err) => {
+            notices.push(format!(
+                "the directory could not be scanned completely ({err}); the tree below the \
+                 project root is not shown, and nothing was changed"
+            ));
+            None
+        }
+    };
+    let candidates = match &scan {
+        Some(scan) => candidate_tree(scan, &root, runner)?,
+        None => Vec::new(),
+    };
+    if let Some(scan) = &scan {
+        notices.extend(scan.notices.iter().cloned());
+    }
     if is_gitmesh_project && manifest_error.is_none() {
         notices.push(format!(
             "'{}' already contains a GitMesh project; opening it is usually what you want",
@@ -169,6 +191,15 @@ pub fn inspect(root: &Path, runner: &GitRunner) -> Result<Inspection> {
         notices.push(format!("the existing manifest could not be read: {error}"));
     }
 
+    let root_is_repository = match &scan {
+        Some(scan) => scan.root_is_repository,
+        None => discovery::is_repository_root(&root, true, runner),
+    };
+    let enclosing_repository = match &scan {
+        Some(scan) => scan.enclosing_repository.clone(),
+        None => runner.repo(&root).top_level()?.filter(|top| *top != root),
+    };
+
     Ok(Inspection {
         root,
         exists: true,
@@ -177,12 +208,12 @@ pub fn inspect(root: &Path, runner: &GitRunner) -> Result<Inspection> {
         manifest_path,
         manifest_error,
         manifest_text,
-        root_is_repository: scan.root_is_repository,
-        enclosing_repository: scan.enclosing_repository,
-        repositories: scan.repositories,
+        root_is_repository,
+        enclosing_repository,
+        repositories: scan.map(|scan| scan.repositories).unwrap_or_default(),
         candidates,
         notices,
-        truncated: scan.tree.truncated,
+        truncated: false,
     })
 }
 
@@ -229,26 +260,9 @@ fn candidate_tree(
 ) -> Result<Vec<CandidateDirectory>> {
     // Files the root repository tracks, grouped by the directory that contains them.
     let tracked_by_root = tracked_by_root_counts(scan, root, runner);
-    let nested: Vec<(PathBuf, PathBuf)> = scan
-        .repositories
-        .iter()
-        .filter_map(|repo| {
-            repo.nested_inside
-                .as_ref()
-                .map(|outer| (outer.clone(), repo.relative_path.clone()))
-        })
-        .collect();
-
     let mut nodes = Vec::new();
     for child in &scan.tree.children {
-        nodes.push(candidate_node(
-            child,
-            root,
-            runner,
-            &tracked_by_root,
-            &nested,
-            1,
-        )?);
+        nodes.push(candidate_node(child, root, runner, &tracked_by_root, 1)?);
     }
     Ok(nodes)
 }
@@ -258,7 +272,6 @@ fn candidate_node(
     root: &Path,
     runner: &GitRunner,
     tracked_by_root: &[(PathBuf, usize)],
-    nested: &[(PathBuf, PathBuf)],
     depth: usize,
 ) -> Result<CandidateDirectory> {
     let relative = node.relative_path.clone();
@@ -273,7 +286,6 @@ fn candidate_node(
             root,
             runner,
             tracked_by_root,
-            nested,
             depth + 1,
         )?);
     }
@@ -298,10 +310,10 @@ fn candidate_node(
         .filter(|(dir, _)| dir == &relative)
         .map(|(_, count)| *count)
         .sum::<usize>();
-    let _ = nested;
     // Nested repositories are looked up on the filesystem rather than through Git: the
     // directory is about to become a repository, and asking Git for every subdirectory
-    // would cost one process each.
+    // would cost one process each. This is the only place nesting is detected for the
+    // wizard, so the warning a directory gets and the warning the plan writes agree.
     let nested_here = nested_git_dirs(&absolute, NESTED_SCAN_DEPTH);
 
     Ok(CandidateDirectory {
@@ -602,6 +614,13 @@ pub enum RemoteAction {
     Update,
     /// The existing `origin` is already what the user wants (or is left alone).
     Keep,
+    /// The remote is recorded in the manifest only; Git itself is not touched.
+    ///
+    /// That is what "record the remote, do not configure Git" means (the wizard's
+    /// "configure remotes" checkbox, `gitmesh init --add-git-remote` on the command line).
+    /// Nothing about the repository changes, so a record-only remote is not a step and not
+    /// something the first publish can push to.
+    Record,
 }
 
 impl RemoteAction {
@@ -612,6 +631,7 @@ impl RemoteAction {
             RemoteAction::Add => "add",
             RemoteAction::Update => "update",
             RemoteAction::Keep => "keep",
+            RemoteAction::Record => "record",
         }
     }
 }
@@ -666,6 +686,9 @@ impl PlannedRepository {
             (RemoteAction::Add, Some(url)) => actions.push(format!("set origin {url}")),
             (RemoteAction::Update, Some(url)) => actions.push(format!("replace origin with {url}")),
             (RemoteAction::Keep, Some(url)) => actions.push(format!("keep origin {url}")),
+            (RemoteAction::Record, Some(url)) => actions.push(format!(
+                "record origin {url} in the manifest only, without touching Git"
+            )),
             (RemoteAction::None, _) => actions.push("no remote".to_string()),
             (action, None) => actions.push(format!("remote {}", action.label())),
         }
@@ -676,6 +699,8 @@ impl PlannedRepository {
     }
 
     /// True when the repository has work planned for it.
+    ///
+    /// A remote that is only recorded in the manifest is not work: nothing runs for it.
     pub fn will_change(&self) -> bool {
         self.create
             || matches!(self.remote_action, RemoteAction::Add | RemoteAction::Update)
@@ -869,6 +894,9 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
     }
 
     let name = resolve_name(&request.name, &root);
+    // "Record the remote, do not configure Git" is a request-level decision, so it is
+    // resolved once here and every repository follows it.
+    let configure_remotes = request.set_git_remote;
     let mut blockers: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
@@ -961,7 +989,8 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
         },
         current_origin: root_origin.clone(),
         create: request.create_root_repository && !root_is_repository,
-        remote_action: remote_action(
+        remote_action: planned_remote_action(
+            configure_remotes,
             project.repositories[0].remote_url.as_deref(),
             root_origin.as_deref(),
         ),
@@ -982,6 +1011,17 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
              replacing a remote must be confirmed explicitly",
             root_origin.clone().unwrap_or_default(),
             root_remote.clone().unwrap_or_default()
+        ));
+    }
+    if let Some((wanted, existing)) = record_only_conflict(
+        configure_remotes,
+        root_remote.as_deref(),
+        root_origin.as_deref(),
+    ) {
+        blockers.push(format!(
+            "the root repository already has origin '{existing}' and the request records \
+             '{wanted}' without configuring Git; enable remote configuration, or record \
+             the URL origin already has"
         ));
     }
 
@@ -1065,13 +1105,28 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
             continue;
         }
         let remote = requested_remote.clone().or_else(|| current_origin.clone());
-        let action = remote_action(remote.as_deref(), current_origin.as_deref());
+        let action = planned_remote_action(
+            configure_remotes,
+            remote.as_deref(),
+            current_origin.as_deref(),
+        );
         if action == RemoteAction::Update && !request.overwrite_remotes {
             blockers.push(format!(
                 "'{path_label}': origin currently points at '{}' and the request asks for \
                  '{}'; replacing a remote must be confirmed explicitly",
                 current_origin.clone().unwrap_or_default(),
                 requested_remote.clone().unwrap_or_default()
+            ));
+        }
+        if let Some((wanted, existing)) = record_only_conflict(
+            configure_remotes,
+            requested_remote.as_deref(),
+            current_origin.as_deref(),
+        ) {
+            blockers.push(format!(
+                "'{path_label}': origin currently points at '{existing}' and the request \
+                 records '{wanted}' without configuring Git; enable remote configuration, \
+                 or record the URL origin already has"
             ));
         }
 
@@ -1291,7 +1346,9 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
                     "the configured remote already matches".to_string(),
                 ),
             }),
-            RemoteAction::None => {}
+            // Nothing runs for a record-only remote: the manifest is the only place it
+            // appears, and the review screen says so through the repository sentence.
+            RemoteAction::Record | RemoteAction::None => {}
         }
 
         if repo.untrack {
@@ -1357,6 +1414,19 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
         },
     });
 
+    if !configure_remotes
+        && repositories
+            .iter()
+            .any(|repo| repo.remote_action == RemoteAction::Record)
+    {
+        warnings.push(
+            "remotes are recorded in the manifest but not configured in Git: GitMesh will \
+             not run `git remote add` (turn \"configure remotes\" on, or add the remote \
+             yourself) until you ask for it"
+                .to_string(),
+        );
+    }
+
     let safety = safety_statements(&steps, &repositories, &existing_manifest, &manifest);
     let mut plan = SetupPlan {
         id: String::new(),
@@ -1401,6 +1471,18 @@ fn safety_statements(
         .filter(|repo| repo.remote_action == RemoteAction::Update)
         .map(|repo| repo.id.as_str())
         .collect();
+    let recorded: Vec<&str> = repositories
+        .iter()
+        .filter(|repo| repo.remote_action == RemoteAction::Record)
+        .map(|repo| repo.id.as_str())
+        .collect();
+    if !recorded.is_empty() {
+        lines.push(format!(
+            "the remote of {} is written to the manifest only: no repository's Git \
+             configuration is touched",
+            recorded.join(", ")
+        ));
+    }
     if updates.is_empty() {
         lines.push("no existing remote is modified".to_string());
     } else {
@@ -1705,7 +1787,6 @@ pub fn apply(
     let mut outcomes: Vec<SetupStepOutcome> = Vec::new();
     let mut failed_repositories: Vec<String> = Vec::new();
     let mut manifest_written: Option<PathBuf> = None;
-    let mut manifest_failed = false;
 
     if !plan.is_ready() {
         return SetupResult {
@@ -1772,10 +1853,9 @@ pub fn apply(
             continue;
         }
 
-        let failure_targets_manifest = matches!(
-            step.kind,
-            SetupStepKind::WriteManifest | SetupStepKind::CreateMetadataDir
-        );
+        // One step at a time, exactly as the user reviewed them: a failing step never
+        // stops the others, and a repository whose creation failed only has its own
+        // follow-up steps skipped.
         let result: Result<SetupStepOutcome> = match step.kind {
             SetupStepKind::CreateMetadataDir => {
                 let dir = manifest::metadata_dir(&plan.root);
@@ -1844,10 +1924,7 @@ pub fn apply(
                         format!("wrote {}", readable(&path, &plan.root)),
                     ))
                 }
-                Err(err) => {
-                    manifest_failed = true;
-                    Err(err)
-                }
+                Err(err) => Err(err),
             },
         };
 
@@ -1856,9 +1933,6 @@ pub fn apply(
             Err(err) => {
                 if matches!(step.kind, SetupStepKind::CreateRepository) {
                     failed_repositories.push(step.target.clone());
-                }
-                if failure_targets_manifest {
-                    manifest_failed = true;
                 }
                 SetupStepOutcome::new(step, OutcomeKind::Failed, short_message(&err))
                     .with_details(error_details(&err))
@@ -1882,15 +1956,19 @@ pub fn apply(
         SetupKind::Failed
     };
 
-    let project = if manifest_written.is_some() {
+    // The project exists as soon as the manifest is on disk — including when every step
+    // was already satisfied and this run changed nothing. Validation then answers the only
+    // question that matters: can GitMesh open what is there now?
+    let manifest_on_disk = plan.manifest_path.is_file();
+    let project = if manifest_on_disk {
         Some(plan.project.clone())
     } else {
         None
     };
-    let _ = manifest_failed;
-    let validation = match (&manifest_written, dry_run) {
-        (Some(_), false) => Some(verify(&plan.root, runner)),
-        _ => None,
+    let validation = if manifest_on_disk && !dry_run {
+        Some(verify_with(&plan.root, runner, plan.request.set_git_remote))
+    } else {
+        None
     };
     // A project that was written but does not open cleanly is never reported as a
     // complete success: the validation result decides.
@@ -1911,7 +1989,19 @@ pub fn apply(
 }
 
 /// Re-open a project through the normal opening path and check every repository.
+///
+/// Remotes recorded in the manifest are expected to be configured in Git, which is the
+/// normal case for a project that has been set up with remote configuration.
 pub fn verify(root: &Path, runner: &GitRunner) -> ValidationReport {
+    verify_with(root, runner, true)
+}
+
+/// Same check, told whether `origin` is supposed to exist in Git.
+///
+/// A setup that only *records* remotes (`set_git_remote` off) must not fail validation
+/// because Git has no `origin`: the user asked for exactly that, and `verify_with` reports
+/// it as the honest state instead of an error.
+pub fn verify_with(root: &Path, runner: &GitRunner, expect_origins: bool) -> ValidationReport {
     let root =
         paths::lexical_normalize(&paths::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
     let manifest_path = manifest::manifest_path(&root);
@@ -1981,21 +2071,25 @@ pub fn verify(root: &Path, runner: &GitRunner) -> ValidationReport {
                 );
                 remote_ok = false;
             } else if let Some(remote) = &repo.remote_url {
-                match &origin {
-                    None => {
-                        remote_ok = false;
-                        repo_issues.push(format!(
-                            "the manifest records the remote {remote} but the repository has no \
-                             origin"
-                        ));
+                if !expect_origins {
+                    // Record-only: the manifest is the only place the remote has to be.
+                } else {
+                    match &origin {
+                        None => {
+                            remote_ok = false;
+                            repo_issues.push(format!(
+                                "the manifest records the remote {remote} but the repository \
+                                 has no origin"
+                            ));
+                        }
+                        Some(current) if current != remote => {
+                            remote_ok = false;
+                            repo_issues.push(format!(
+                                "origin points at {current} but the manifest records {remote}"
+                            ));
+                        }
+                        Some(_) => {}
                     }
-                    Some(current) if current != remote => {
-                        remote_ok = false;
-                        repo_issues.push(format!(
-                            "origin points at {current} but the manifest records {remote}"
-                        ));
-                    }
-                    Some(_) => {}
                 }
             }
             for issue in &repo_issues {
@@ -2043,13 +2137,48 @@ fn resolve_name(requested: &str, root: &Path) -> String {
     }
 }
 
-fn remote_action(remote: Option<&str>, current: Option<&str>) -> RemoteAction {
+/// What the plan does with one repository's `origin`, given whether Git may be touched.
+///
+/// When Git must not be touched (`set_git_remote` off) a wanted remote that is not present
+/// yet becomes [`RemoteAction::Record`]: the manifest records the URL, the repository keeps
+/// its Git configuration exactly as it is. Nothing is ever replaced in that mode, which is
+/// why it needs no "replace a remote" confirmation.
+fn planned_remote_action(
+    configure_remotes: bool,
+    remote: Option<&str>,
+    current: Option<&str>,
+) -> RemoteAction {
     match (remote, current) {
         (None, None) => RemoteAction::None,
         (None, Some(_)) => RemoteAction::Keep,
-        (Some(_), None) => RemoteAction::Add,
+        (Some(_), None) if configure_remotes => RemoteAction::Add,
+        (Some(_), None) => RemoteAction::Record,
         (Some(wanted), Some(existing)) if wanted == existing => RemoteAction::Keep,
-        (Some(_), Some(_)) => RemoteAction::Update,
+        (Some(_), Some(_)) if configure_remotes => RemoteAction::Update,
+        // A recorded remote that differs from `origin` on disk is not a replacement: Git
+        // is left alone. That state is refused by [`record_only_conflict`] rather than
+        // silently recorded, because the manifest would then disagree with where a push
+        // actually goes.
+        (Some(_), Some(_)) => RemoteAction::Record,
+    }
+}
+
+/// The recorded URL and the `origin` on disk, when recording alone would leave them
+/// disagreeing. The plan refuses that instead of producing a project whose manifest
+/// promises one remote and whose pushes use another.
+fn record_only_conflict(
+    configure_remotes: bool,
+    remote: Option<&str>,
+    current: Option<&str>,
+) -> Option<(String, String)> {
+    if configure_remotes {
+        return None;
+    }
+    match (remote, current) {
+        (Some(wanted), Some(existing)) if wanted != existing => {
+            Some((wanted.to_string(), existing.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -2297,7 +2426,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
 
-        let plan = plan(&request(dir.path()), &runner).unwrap();
+        let plan = super::plan(&request(dir.path()), &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert_eq!(plan.name, dir.path().file_name().unwrap().to_string_lossy());
         assert!(planned(&plan, SetupStepKind::CreateMetadataDir, "manifest"));
@@ -2332,7 +2461,7 @@ mod tests {
             repo("a/tools"),
             repo("b/tools"),
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert_eq!(plan.name, "MyProject");
         let ids: Vec<&str> = plan
@@ -2363,7 +2492,7 @@ mod tests {
                 ..RepositoryRequest::default()
             },
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -2385,7 +2514,7 @@ mod tests {
         let mut req = request(fixture.path());
         req.create_root_repository = true;
         req.repositories = vec![repo("engine")];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(!planned(&plan, SetupStepKind::CreateRepository, "engine"));
         assert!(!planned(&plan, SetupStepKind::CreateRepository, "root"));
@@ -2420,7 +2549,7 @@ mod tests {
 
         let mut req = request(fixture.path());
         req.repositories = vec![repo("engine"), repo("engine/core")];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -2432,7 +2561,7 @@ mod tests {
         // Selecting the outer directory after the inner one is refused as well.
         let mut reversed = request(fixture.path());
         reversed.repositories = vec![repo("engine/core"), repo("engine")];
-        let plan = plan(&reversed, fixture.runner()).unwrap();
+        let plan = super::plan(&reversed, fixture.runner()).unwrap();
         assert!(
             plan.blockers
                 .iter()
@@ -2445,7 +2574,7 @@ mod tests {
         // The project root cannot become an external repository.
         let mut req = request(fixture.path());
         req.repositories = vec![repo(".")];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(
             plan.blockers
                 .iter()
@@ -2457,7 +2586,7 @@ mod tests {
         // A file and a missing directory are refused with a reason each.
         let mut req = request(fixture.path());
         req.repositories = vec![repo("notes.txt"), repo("does-not-exist")];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(
             plan.blockers
                 .iter()
@@ -2480,7 +2609,7 @@ mod tests {
             create: true,
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -2511,7 +2640,7 @@ mod tests {
             remote: Some("git@github.com:acme/engine.git".into()),
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -2527,7 +2656,7 @@ mod tests {
         // With the confirmation, the step is planned and the safety lines say so.
         let mut confirmed = req.clone();
         confirmed.overwrite_remotes = true;
-        let plan = plan(&confirmed, fixture.runner()).unwrap();
+        let plan = super::plan(&confirmed, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(planned(&plan, SetupStepKind::ConfigureRemote, "engine"));
         assert!(
@@ -2541,7 +2670,7 @@ mod tests {
         // A request that leaves the remote alone keeps it, recorded in the manifest.
         let mut keep = request(fixture.path());
         keep.repositories = vec![repo("engine")];
-        let plan = plan(&keep, fixture.runner()).unwrap();
+        let plan = super::plan(&keep, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         let engine = plan.repositories.iter().find(|r| r.id == "engine").unwrap();
         assert_eq!(engine.remote_action, RemoteAction::Keep);
@@ -2560,7 +2689,7 @@ mod tests {
 
         let mut req = request(fixture.path());
         req.name = "renamed-project".to_string();
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -2571,7 +2700,7 @@ mod tests {
         );
 
         req.overwrite_manifest = true;
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(planned(&plan, SetupStepKind::WriteManifest, "manifest"));
         assert!(
@@ -2594,7 +2723,7 @@ mod tests {
         req.name = "idempotent".to_string();
         req.repositories = vec![repo("engine")];
         // Set the project up once, then plan the same request again.
-        let first = plan(&req, fixture.runner()).unwrap();
+        let first = super::plan(&req, fixture.runner()).unwrap();
         let result = apply(
             &first,
             false,
@@ -2603,7 +2732,7 @@ mod tests {
         );
         assert!(result.is_success(), "{}", result.summary());
 
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(
             plan.is_noop(),
@@ -2641,7 +2770,7 @@ mod tests {
             },
             repo("tools"),
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
 
         let engine = plan.repositories.iter().find(|r| r.id == "engine").unwrap();
@@ -2685,7 +2814,7 @@ mod tests {
 
         let mut req = request(fixture.path());
         req.repositories = vec![repo("engine")];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         let engine = plan.repositories.iter().find(|r| r.id == "engine").unwrap();
         assert_eq!(engine.tracked_by_root, 1);
@@ -2712,7 +2841,7 @@ mod tests {
             untrack_from_root: true,
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         assert!(planned(&plan, SetupStepKind::UntrackFromRoot, "engine"));
         assert!(plan.safety.iter().any(|line| line.contains("stay on disk")));
     }
@@ -2740,7 +2869,7 @@ mod tests {
                 ..RepositoryRequest::default()
             },
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(
             plan.warnings
@@ -2774,7 +2903,7 @@ mod tests {
             remote: Some("   ".into()),
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert_eq!(plan.name, dir.path().file_name().unwrap().to_string_lossy());
         assert!(!plan.is_ready());
         assert!(
@@ -2792,7 +2921,7 @@ mod tests {
             branch: Some(" develop ".into()),
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         assert!(plan.manifest.contains("branch = \"develop\""));
     }
@@ -2830,7 +2959,7 @@ mod tests {
             repo("renderer"),
             repo("tools"),
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
 
         let result = apply(&plan, false, &runner, &mut SetupObserver::silent());
@@ -2937,7 +3066,7 @@ mod tests {
         }];
         req.publish_first_commit = Some("Initial commit".into());
 
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
         let publish = plan
             .first_publish()
@@ -2957,7 +3086,7 @@ mod tests {
 
         // Without the request there is nothing to publish.
         req.publish_first_commit = None;
-        assert!(plan(&req, &runner)
+        assert!(super::plan(&req, &runner)
             .unwrap()
             .first_publish()
             .is_none());
@@ -2968,7 +3097,7 @@ mod tests {
             path: "engine".into(),
             ..RepositoryRequest::default()
         }];
-        assert!(plan(&req, &runner)
+        assert!(super::plan(&req, &runner)
             .unwrap()
             .first_publish()
             .is_none());
@@ -2987,7 +3116,7 @@ mod tests {
         }];
         req.publish_first_commit = Some("   ".into());
 
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(!plan.is_ready());
         assert!(
             plan.blockers
@@ -3015,7 +3144,7 @@ mod tests {
             untrack_from_root: true,
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         let result = apply(&plan, false, fixture.runner(), &mut SetupObserver::silent());
         assert!(result.is_success(), "{}", result.summary());
         assert!(fixture.path().join("engine/lib.rs").is_file());
@@ -3069,7 +3198,7 @@ mod tests {
                 ..RepositoryRequest::default()
             },
         ];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(plan.is_ready(), "{:?}", plan.blockers);
 
         // The directory disappears and is replaced by a file between the review and the
@@ -3114,7 +3243,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("engine/core")).unwrap();
         let mut req = request(dir.path());
         req.repositories = vec![repo("engine"), repo("engine/core")];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         assert!(!plan.is_ready());
 
         let result = apply(&plan, false, &runner, &mut SetupObserver::silent());
@@ -3132,7 +3261,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("engine")).unwrap();
         let mut req = request(dir.path());
         req.repositories = vec![repo("engine")];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
 
         let result = apply(&plan, true, &runner, &mut SetupObserver::silent());
         assert!(result.dry_run);
@@ -3182,7 +3311,7 @@ mod tests {
 
         let mut req = request(dir.path());
         req.repositories = vec![repo("engine")];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         let first = apply(&plan, false, &runner, &mut SetupObserver::silent());
         assert!(first.is_success(), "{}", first.summary());
         let manifest_before = std::fs::read_to_string(dir.join(".gitmesh/project.toml")).unwrap();
@@ -3192,7 +3321,7 @@ mod tests {
             .ok();
 
         // Re-plan and re-apply the very same request.
-        let plan_again = plan(&req, &runner).unwrap();
+        let plan_again = super::plan(&req, &runner).unwrap();
         assert!(plan_again.is_ready());
         assert!(
             plan_again.is_noop(),
@@ -3245,7 +3374,7 @@ mod tests {
             remote: Some(second.to_string_lossy().to_string()),
             ..RepositoryRequest::default()
         }];
-        let blocked = plan(&req, fixture.runner()).unwrap();
+        let blocked = super::plan(&req, fixture.runner()).unwrap();
         apply(
             &blocked,
             false,
@@ -3259,7 +3388,7 @@ mod tests {
 
         // Confirmed: the remote is replaced and the change is reported.
         req.overwrite_remotes = true;
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         let result = apply(&plan, false, fixture.runner(), &mut SetupObserver::silent());
         assert!(result.is_success(), "{}", result.summary());
         assert_eq!(
@@ -3278,7 +3407,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("engine")).unwrap();
         let mut req = request(dir.path());
         req.repositories = vec![repo("engine")];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
 
         let mut started: Vec<String> = Vec::new();
         let mut finished: Vec<String> = Vec::new();
@@ -3316,7 +3445,7 @@ mod tests {
             create: false,
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, &runner).unwrap();
+        let plan = super::plan(&req, &runner).unwrap();
         let result = apply(&plan, false, &runner, &mut SetupObserver::silent());
         // The directory has no repository: the setup says so instead of pretending.
         assert_eq!(result.kind, SetupKind::Partial, "{}", result.summary());
@@ -3346,7 +3475,7 @@ mod tests {
             remote: Some("git@github.com:acme/engine.git".into()),
             ..RepositoryRequest::default()
         }];
-        let plan = plan(&req, fixture.runner()).unwrap();
+        let plan = super::plan(&req, fixture.runner()).unwrap();
         let result = apply(&plan, false, fixture.runner(), &mut SetupObserver::silent());
         assert!(result.is_success(), "{}", result.summary());
 
@@ -3374,4 +3503,185 @@ mod tests {
             "{:?}",
             report.issues
         );
+    }
+
+    // ------------------------------------------------- record-only remotes --
+
+    /// A directory with one subdirectory to turn into a repository.
+    fn directory_with_engine(label: &str) -> (TempDir, GitRunner) {
+        let (dir, runner) = plain(label);
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&engine).expect("engine directory");
+        std::fs::write(engine.join("lib.rs"), "// engine\n").expect("engine file");
+        (dir, runner)
+    }
+
+    fn record_only_request(root: &Path) -> SetupRequest {
+        let mut request = request(root);
+        request.name = "MyProject".to_string();
+        // The wizard's "configure remotes" box, unchecked: record, do not touch Git.
+        request.set_git_remote = false;
+        request.repositories = vec![RepositoryRequest {
+            path: "engine".into(),
+            create: true,
+            remote: Some("git@github.com:acme/engine.git".into()),
+            ..RepositoryRequest::default()
+        }];
+        request
+    }
+
+    #[test]
+    fn a_remote_can_be_recorded_without_touching_git() {
+        let (dir, runner) = directory_with_engine("setup-record-only");
+        let mut request = record_only_request(dir.path());
+        request.publish_first_commit = Some("Initial commit".into());
+
+        let plan = plan(&request, &runner).expect("plan");
+        assert!(plan.is_ready(), "{:?}", plan.blockers);
+        let engine = plan
+            .repositories
+            .iter()
+            .find(|repo| repo.id == "engine")
+            .expect("engine");
+        assert_eq!(engine.remote_action, RemoteAction::Record);
+        // Nothing runs for it: recording is manifest work, not repository work.
+        assert!(
+            !plan
+                .planned_steps()
+                .any(|step| step.kind == SetupStepKind::ConfigureRemote),
+            "{:?}",
+            plan.planned_steps()
+                .map(|s| s.detail.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|line| line.contains("not configured in Git")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.safety
+                .iter()
+                .any(|line| line.contains("manifest only")),
+            "{:?}",
+            plan.safety
+        );
+        assert!(plan.manifest.contains("git@github.com:acme/engine.git"));
+        assert!(
+            engine.sentence().contains("without touching Git"),
+            "{}",
+            engine.sentence()
+        );
+        // Nothing to publish: a repository with no configured remote is not a push target
+        // and never a push failure.
+        assert!(plan.first_publish().is_none());
+
+        let result = apply(&plan, false, &runner, &mut SetupObserver::silent());
+        assert!(result.is_success(), "{}", result.summary());
+        assert!(
+            result.validation.as_ref().expect("validation").ok,
+            "{:?}",
+            result.validation.expect("validation").issues
+        );
+        let engine_path = dir.path().join("engine");
+        assert!(engine_path.join(".git/HEAD").is_file(), "still created");
+        assert_eq!(
+            discovery::origin_url(&engine_path, &runner).expect("origin"),
+            None,
+            "Git was not touched"
+        );
+    }
+
+    #[test]
+    fn verify_reports_recorded_remotes_only_when_they_are_expected_in_git() {
+        let (dir, runner) = directory_with_engine("setup-record-verify");
+        let request = record_only_request(dir.path());
+        let plan = plan(&request, &runner).expect("plan");
+        let result = apply(&plan, false, &runner, &mut SetupObserver::silent());
+        assert!(result.is_success(), "{}", result.summary());
+
+        // The strict check is what a normal project gets: a manifest remote without an
+        // `origin` is drift.
+        let strict = verify(dir.path(), &runner);
+        assert!(!strict.ok);
+        assert!(
+            strict
+                .issues
+                .iter()
+                .any(|issue| issue.contains("no origin")),
+            "{:?}",
+            strict.issues
+        );
+        // The record-only check accepts exactly what the user asked for.
+        let recorded = verify_with(dir.path(), &runner, false);
+        assert!(recorded.ok, "{:?}", recorded.issues);
+        assert_eq!(recorded.project_name.as_deref(), Some("MyProject"));
+    }
+
+    #[test]
+    fn a_manifest_that_cannot_be_read_is_still_a_project() {
+        let (dir, runner) = directory_with_engine("setup-manifest-unreadable");
+        // A directory where the manifest should be: it exists, and it cannot be read as a
+        // file. The wizard must say "there is a project here, and it is broken", never
+        // "there is no project here".
+        std::fs::create_dir_all(dir.path().join(".gitmesh/project.toml")).expect("manifest path");
+        let inspection = inspect(dir.path(), &runner).expect("inspect");
+        assert!(inspection.is_gitmesh_project);
+        assert!(inspection.manifest_error.is_some(), "{inspection:?}");
+        assert!(inspection
+            .notices
+            .iter()
+            .any(|notice| notice.contains("could not be read")));
+    }
+
+    #[test]
+    fn a_second_run_reports_the_project_as_ready_and_opens_it_unchanged() {
+        let (dir, runner) = directory_with_engine("setup-noop-rerun");
+        let bare_root = TempDir::new("setup-noop-remote").expect("temp");
+        let remote = bare_root.join("MyProject.git");
+        runner
+            .run(&[
+                "init".into(),
+                "--bare".into(),
+                "-q".into(),
+                remote.as_os_str().to_os_string(),
+            ])
+            .expect("bare remote");
+
+        let mut request = request(dir.path());
+        request.name = "MyProject".to_string();
+        request.repositories = vec![RepositoryRequest {
+            path: "engine".into(),
+            create: true,
+            remote: Some(remote.to_string_lossy().to_string()),
+            ..RepositoryRequest::default()
+        }];
+        let first = plan(&request, &runner).expect("plan");
+        let applied = apply(&first, false, &runner, &mut SetupObserver::silent());
+        assert!(applied.is_success(), "{}", applied.summary());
+
+        let manifest_before =
+            std::fs::read_to_string(dir.path().join(".gitmesh/project.toml")).expect("manifest");
+        let second = plan(&request, &runner).expect("plan again");
+        assert!(second.is_noop(), "{}", second.summary());
+        assert!(second.is_ready(), "{:?}", second.blockers);
+        assert_eq!(second.created_repositories().count(), 0);
+
+        let again = apply(&second, false, &runner, &mut SetupObserver::silent());
+        assert!(again.is_success(), "{}", again.summary());
+        assert!(
+            again.manifest_path.is_none(),
+            "nothing was written a second time"
+        );
+        assert!(again.project.is_some(), "the project is still the result");
+        let validation = again.validation.expect("validation runs anyway");
+        assert!(validation.ok, "{:?}", validation.issues);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitmesh/project.toml")).expect("manifest"),
+            manifest_before,
+            "the manifest is byte-for-byte the same"
+        );
+    }
 }

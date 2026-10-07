@@ -133,12 +133,98 @@ mod tests {
             "/api/push",
             "/api/dry-run",
             "/api/events/",
+            "/api/setup/inspect",
+            "/api/setup/plan",
+            "/api/setup/apply",
         ] {
             assert!(
                 APP_JS.contains(endpoint),
                 "the script should use {endpoint}"
             );
         }
+    }
+
+    /// A handler the page wires up has to exist: an undefined function is a click that
+    /// throws. (This is exactly the kind of bug a "write the helper later" leaves behind,
+    /// and the browser console is not part of `cargo test`.)
+    #[test]
+    fn every_wired_handler_is_defined() {
+        let mut checked = 0;
+        let mut rest = APP_JS;
+        while let Some(start) = rest.find("addEventListener(") {
+            rest = &rest[start + "addEventListener(".len()..];
+            let Some(comma) = rest.find(',') else { break };
+            let after = rest[comma + 1..].trim_start();
+            // The handler is either an inline function or the name of one.
+            let name: String = after
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+                .collect();
+            rest = after;
+            if name.is_empty() || name == "function" {
+                continue; // an inline function, an arrow function, or a variable.
+            }
+            checked += 1;
+            assert!(
+                APP_JS.contains(&format!("function {name}("))
+                    || APP_JS.contains(&format!("var {name} = function")),
+                "the page calls {name} as an event handler, but the script never defines it"
+            );
+        }
+        assert!(
+            checked >= 12,
+            "the check itself must stay meaningful: {checked}"
+        );
+    }
+
+    /// The wizard keeps its answers in one object; a key that is written but never
+    /// declared is a typo waiting to throw at the worst moment.
+    #[test]
+    fn the_wizard_state_only_uses_declared_keys() {
+        let start = APP_JS.find("var wizard = {").expect("the wizard state");
+        let end = APP_JS[start..]
+            .find("\n    };")
+            .map(|offset| start + offset)
+            .expect("the end of the wizard state");
+        let declaration = &APP_JS[start..end];
+        let mut keys: Vec<String> = Vec::new();
+        for line in declaration.lines().skip(1) {
+            let trimmed = line.trim();
+            if let Some((key, _)) = trimmed.split_once(':') {
+                let key = key.trim();
+                if !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+        assert!(keys.len() >= 5, "the wizard state lost its keys: {keys:?}");
+
+        let mut checked = 0;
+        let mut rest = &APP_JS[end..];
+        while let Some(start) = rest.find("wizard.") {
+            rest = &rest[start + "wizard.".len()..];
+            let key: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if key.is_empty() {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                keys.iter().any(|known| known == &key),
+                "the script uses wizard.{key}, which the wizard state does not declare \
+                 (declared: {keys:?})"
+            );
+        }
+        assert!(
+            checked > 10,
+            "the check itself must stay meaningful: {checked}"
+        );
     }
 
     #[test]

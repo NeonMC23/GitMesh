@@ -835,12 +835,18 @@ fn run_setup(
     let result = setup::apply(plan, dry_run, &runner, &mut observer);
     let setup_json = service::setup_result_view_json(&result);
 
-    // A created project is opened immediately: the user lands in the normal interface
-    // without restarting anything.
     // A complete setup hands the interface to the project it just created, with no restart.
-    // A partial one stays in the wizard with the failing steps on screen, because adopting a
-    // half-built project would hide what still has to be fixed.
-    let opened = if result.is_success() && result.manifest_path.is_some() && !dry_run {
+    // "Complete" means the project validates: a run where every step was already in place
+    // opens the existing project just as well, and a partial one stays in the wizard with
+    // the failing steps on screen, because adopting a half-built project would hide what
+    // still has to be fixed.
+    let adoptable = result.is_success()
+        && !dry_run
+        && result
+            .validation
+            .as_ref()
+            .is_some_and(|validation| validation.ok);
+    let opened = if adoptable {
         gui.adopt(&plan.root).is_ok()
     } else {
         false
@@ -957,12 +963,46 @@ fn run_first_publish(
             Stage::Commit => session.commit_observed(&commit_options, &mut observer),
             Stage::Push => session.push_observed(&push_options, &mut observer),
         };
+        // One flat section per operation: the interface counts outcomes and looks for
+        // problems without having to know how an operation report is nested, and the same
+        // shape is what `/api/commit` and `/api/push` return.
         sections.push(match result {
             Ok(report) => Json::object([
                 ("operation", Json::from(label)),
                 (
-                    "report",
-                    service::operation_view_json(&report, &session.status()),
+                    "outcome",
+                    Json::object([
+                        ("kind", Json::from(service::report_kind(&report))),
+                        ("success", Json::from(report.is_success())),
+                        ("exitCode", Json::from(report.exit_code() as i64)),
+                    ]),
+                ),
+                (
+                    "counts",
+                    Json::object([
+                        ("succeeded", Json::from(report.success().count() as i64)),
+                        ("skipped", Json::from(report.skipped().count() as i64)),
+                        ("conflicted", Json::from(report.conflicts().count() as i64)),
+                        ("failed", Json::from(report.failures().count() as i64)),
+                    ]),
+                ),
+                (
+                    "outcomes",
+                    Json::array(report.outcomes.iter().map(|outcome| {
+                        Json::object([
+                            ("id", Json::from(outcome.id.clone())),
+                            ("path", Json::from(outcome.path.clone())),
+                            ("outcome", Json::from(outcome.kind.label())),
+                            ("symbol", Json::from(outcome.kind.symbol())),
+                            ("summary", Json::from(outcome.summary.clone())),
+                            (
+                                "details",
+                                Json::array(
+                                    outcome.details.iter().map(|line| Json::from(line.as_str())),
+                                ),
+                            ),
+                        ])
+                    })),
                 ),
             ]),
             Err(err) => Json::object([
@@ -1608,5 +1648,125 @@ mod tests {
         assert_eq!(outcome_symbol(OutcomeKind::Conflict), "!");
         assert_eq!(role_label(RepositoryRole::Root), "root");
         assert_eq!(role_label(RepositoryRole::External), "external");
+    }
+
+    /// The busy guard protects the session, not only the buttons: while an operation runs,
+    /// opening another project must be refused, and the interface must stay on the project
+    /// it is working on.
+    #[test]
+    fn another_project_cannot_be_opened_while_an_operation_is_running() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        for index in 0..6 {
+            fixture.write(&format!("engine/file{index}.rs"), "// change\n");
+        }
+        let gui = gui(&fixture, false);
+        let elsewhere = plain_directory(&fixture, "Elsewhere");
+        let (project, root) = gui.opened_project().expect("a project is open");
+
+        let id = gui
+            .start_operation(GuiOperation::Commit {
+                message: "while busy".into(),
+            })
+            .expect("the commit starts");
+
+        // The window is small but real: a commit spawns several Git processes.
+        let mut refusals = 0;
+        for _ in 0..200 {
+            if gui.is_busy() {
+                if let Err(message) = gui.open(&elsewhere) {
+                    assert!(message.contains("still running"), "{message}");
+                    refusals += 1;
+                }
+                let (current, current_root) = gui.opened_project().expect("still open");
+                assert_eq!(current, project, "the open project never changed under us");
+                assert_eq!(current_root, root);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(refusals > 0, "the busy guard was never observed");
+        collect(&gui, id);
+
+        // Once the operation is done, opening a project works again.
+        assert!(
+            gui.open(&elsewhere).is_err(),
+            "a directory without a manifest is not a project, but it is looked at"
+        );
+        gui.open(&root).expect("the same project opens again");
+    }
+
+    /// A setup whose steps are all already satisfied still ends in the project: the user
+    /// asked for this configuration, and that is what is on disk now.
+    #[test]
+    fn running_the_setup_twice_opens_the_project_without_changing_it() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_directory(&fixture, "MyProject");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+        let request = setup_request(&plain);
+
+        let plan = gui.plan_setup(&request).expect("plan");
+        let id = gui
+            .start_setup(request.clone(), Some(&plan.id))
+            .expect("setup starts");
+        let events = collect(&gui, id).join("\n");
+        assert!(events.contains("\"opened\":true"), "{events}");
+        let manifest =
+            std::fs::read_to_string(plain.join(".gitmesh/project.toml")).expect("manifest");
+
+        let again = gui.plan_setup(&request).expect("plan again");
+        assert!(again.is_noop(), "{}", again.summary());
+        let id = gui
+            .start_setup(request.clone(), Some(&again.id))
+            .expect("the second setup starts");
+        let events = collect(&gui, id).join("\n");
+        assert!(
+            events.contains("\"opened\":true"),
+            "a second run stays in the project: {events}"
+        );
+        assert!(
+            events.contains("\"kind\":\"complete\""),
+            "every step was already in place: {events}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plain.join(".gitmesh/project.toml")).expect("manifest"),
+            manifest,
+            "the manifest is untouched by the second run"
+        );
+        let model = gui.model();
+        assert!(model.contains("\"name\": \"MyProject\""), "{model}");
+    }
+
+    /// The wizard's "configure remotes" answer is honoured end to end: the remote ends up
+    /// in the manifest, Git is left alone, and the interface does not claim a push it
+    /// cannot make.
+    #[test]
+    fn setup_without_remote_configuration_records_the_remote_only() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_directory(&fixture, "MyProject");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+        let mut request = setup_request(&plain);
+        request.set_git_remote = false;
+        request.repositories[0].remote = Some("git@github.com:acme/engine.git".into());
+        request.publish_first_commit = Some("Initial commit".into());
+
+        let plan = gui.plan_setup(&request).expect("plan");
+        assert!(plan.is_ready(), "{:?}", plan.blockers);
+        assert!(plan.first_publish().is_none(), "nothing can be pushed");
+        let id = gui
+            .start_setup(request.clone(), Some(&plan.id))
+            .expect("setup starts");
+        let events = collect(&gui, id).join("\n");
+        assert!(events.contains("\"opened\":true"), "{events}");
+        assert!(
+            !events.contains("\"operation\":\"First push\""),
+            "no push was attempted: {events}"
+        );
+        assert!(
+            plain.join("engine/.git/HEAD").is_file(),
+            "the repository was still created"
+        );
+        let manifest =
+            std::fs::read_to_string(plain.join(".gitmesh/project.toml")).expect("manifest");
+        assert!(manifest.contains("acme/engine.git"), "{manifest}");
     }
 }

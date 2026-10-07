@@ -105,7 +105,12 @@ fn push_one(
         );
     }
     if state.remotes.is_empty() {
-        return base(OutcomeKind::Failed, "no remote configured".to_string())
+        // A repository that was never given a remote is not a broken repository: there is
+        // simply nowhere to push to yet. Reporting it as a failure would make `gitmesh push`
+        // exit non-zero for every project that keeps some repositories local — which is a
+        // normal, supported layout — and would hide the real failures among it. Fetch and
+        // pull have always treated the same situation as skipped.
+        return base(OutcomeKind::Skipped, "no remote configured".to_string())
             .with_detail("add one with `git remote add origin <url>`".to_string());
     }
 
@@ -357,13 +362,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_remote() {
+    fn a_repository_without_a_remote_is_skipped_not_failed() {
         let fixture = RepoFixture::new();
         let project = fixture.project_with(&[("root", ".")]);
         let report = push_project(&project, fixture.runner(), &options()).unwrap();
         let root = &report.outcomes[0];
-        assert_eq!(root.kind, OutcomeKind::Failed);
+        // Local-only is a supported layout, not a failure: the reason and the fix are
+        // reported, and the operation as a whole stays successful.
+        assert_eq!(root.kind, OutcomeKind::Skipped);
         assert!(root.summary.contains("no remote"));
+        assert!(
+            root.details
+                .iter()
+                .any(|line| line.contains("git remote add")),
+            "{:?}",
+            root.details
+        );
+        assert!(report.is_success(), "nothing failed");
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn a_failing_repository_still_fails_while_a_local_one_is_skipped() {
+        let fixture = RepoFixture::new();
+        let project = fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        // The root keeps its commits local; engine has a remote that does not exist, which
+        // is a real failure and must not be softened by the local-only case.
+        fixture.publish(".", "remotes/root.git");
+        fixture
+            .runner()
+            .repo(fixture.path().join("engine"))
+            .run_checked(&[
+                "remote",
+                "add",
+                "origin",
+                fixture.bare_path("missing.git").to_str().unwrap(),
+            ])
+            .unwrap();
+        fixture.write("engine/lib.rs", "x");
+        fixture.commit("engine", "engine work");
+        let report = push_project(&project, fixture.runner(), &options()).unwrap();
+        let by_id: std::collections::HashMap<&str, &crate::ops::RepoOutcome> = report
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.id.as_str(), outcome))
+            .collect();
+        assert_eq!(
+            by_id["engine"].kind,
+            OutcomeKind::Failed,
+            "{:?}",
+            by_id["engine"]
+        );
+        assert_eq!(report.exit_code(), 1, "the real failure is still reported");
     }
 
     #[test]

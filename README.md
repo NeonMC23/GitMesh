@@ -97,6 +97,11 @@ GitMesh is a single binary with no runtime dependencies beyond Git itself.
 ## Getting started
 
 ```console
+# 0. Create the project from an ordinary folder (or use the graphical wizard below)
+$ gitmesh init . --name my-project
+#    ...or, with a remote: recorded in the manifest, and configured in Git when asked
+$ gitmesh init . --name my-project --remote git@github.com:acme/my-project.git --add-git-remote
+
 # 1. In an existing project directory
 $ cd my-project
 $ gitmesh init --name my-project
@@ -125,7 +130,16 @@ The graphical interface shows the project as **one** project — one tree, one s
 changes list, one commit message, one branch, one pull, one push — while GitMesh keeps
 managing the physical repositories underneath. It starts a small local server
 (`http://127.0.0.1:7345` by default) and calls nothing outside your machine: no account,
-no telemetry, no CDN. See [docs/GUI.md](docs/GUI.md).
+no telemetry, no CDN.
+
+It also **creates** a project: point it at an ordinary folder, let it scan the structure,
+tick the directories that should be separate repositories, configure their names and
+optional remotes, review the complete plan *and* the exact `.gitmesh/project.toml` it will
+write, confirm it, and watch the setup run step by step — then keep working in the same
+interface, with an optional first commit and push through the ordinary GitMesh operations.
+Nothing is created before you confirm, an existing repository or manifest is never
+replaced silently, and remotes are optional: a fully local project is a first-class
+project. See [docs/GUI.md](docs/GUI.md).
 
 `gitmesh ui` is the terminal equivalent and additionally supports editing the project
 configuration (marking directories as repositories, renaming ids, setting remote URLs)
@@ -142,7 +156,7 @@ $ ./examples/demo.sh /tmp/gitmesh-demo
 
 | Command | What it does |
 | --- | --- |
-| `gitmesh init [path] [--name N] [--remote URL] [--branch B]` | Create the manifest for a project (does not touch your files) |
+| `gitmesh init [path] [--name N] [--remote URL] [--add-git-remote] [--git-init] [--branch B] [--force]` | Create the manifest for a project (does not touch your files). `--remote` only *records* the URL; `--add-git-remote` also points `origin` at it, and is what allows replacing an existing one |
 | `gitmesh discover [--depth N] [--hidden] [--deep]` | Scan the tree, list the Git repositories in it |
 | `gitmesh configure add <dir> [--id I] [--remote URL] [--git-init]` | Make a directory an independent repository |
 | `gitmesh configure remove <id>` / `rename <id> <new>` / `remote <id> --url U [--set-git-remote]` | Edit the configuration |
@@ -191,15 +205,21 @@ problems in their output but exit `0` as long as the project itself could be rea
 | [`reports/DEVELOPMENT_REPORT.md`](reports/DEVELOPMENT_REPORT.md) | What was built, milestone by milestone, and why |
 | [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) | Hardening audit, limitations, technical debt, readiness assessment |
 | [`reports/GUI_REPORT.md`](reports/GUI_REPORT.md) | The graphical interface: audit, architecture, technology choice, tests, manual end-to-end validation, readiness |
+| [`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md) | Integrated project creation and repository setup: audit findings, the plan-driven setup service, the wizard, first publish, tests, end-to-end validation, limitations |
 
 ## Status
 
-GitMesh implements the complete local multi-repository workflow — discovery,
-configuration, status/ownership, commit, branch/checkout/merge, fetch/pull/push — with a
-command line, a full-screen terminal interface and a local graphical interface, over a
-GitHub-aware (but GitHub-independent) provider foundation. It is usable
-by a small team on a real multi-repository project today, with the limitations listed in
-[`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md).
+GitMesh implements the complete local multi-repository workflow — project creation,
+discovery, configuration, status/ownership, commit, branch/checkout/merge,
+fetch/pull/push — with a command line, a full-screen terminal interface and a local
+graphical interface, over a GitHub-aware (but GitHub-independent) provider foundation.
+Creating a project from an ordinary folder is part of the flow now: `gitmesh init` and the
+graphical wizard are two front ends of the same plan-driven setup service, which previews
+every change, writes the manifest, and can hand over to a first commit and push.
+
+It is usable by a small team on a real multi-repository project today, with the
+limitations listed in [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) and
+[`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md).
 
 ## Licence
 

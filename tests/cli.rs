@@ -458,3 +458,104 @@ fn http_request(address: &str, request_line: &str, headers: &[&str], body: &str)
     stream.read_to_string(&mut response).unwrap();
     response
 }
+#[test]
+fn init_records_a_remote_and_only_configures_git_when_asked() {
+    let fixture = RepoFixture::new();
+
+    // `--remote` records the URL in the manifest: no Git configuration is touched, which
+    // is what the flag has always promised.
+    let cli = Cli::new(fixture.path());
+    let stdout = cli.ok(&[
+        "init",
+        ".",
+        "--name",
+        "demo",
+        "--remote",
+        "git@github.com:acme/demo.git",
+    ]);
+    assert!(stdout.contains("demo"), "{stdout}");
+    let manifest = std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap();
+    assert!(
+        manifest.contains("git@github.com:acme/demo.git"),
+        "{manifest}"
+    );
+    assert_eq!(
+        fixture.git_ok(".", &["remote"]).trim(),
+        "",
+        "the repository itself has no remote yet"
+    );
+
+    // ...and the project still opens, because a recorded remote is a complete answer.
+    let stdout = cli.ok(&["status"]);
+    assert!(stdout.contains("demo"), "{stdout}");
+
+    // `--add-git-remote` is the explicit request to configure `origin`.
+    cli.ok(&[
+        "init",
+        ".",
+        "--name",
+        "demo",
+        "--remote",
+        "git@github.com:acme/demo.git",
+        "--add-git-remote",
+        "--force",
+    ]);
+    assert_eq!(
+        fixture.git_ok(".", &["remote", "get-url", "origin"]).trim(),
+        "git@github.com:acme/demo.git"
+    );
+}
+
+#[test]
+fn init_refuses_to_run_a_plan_it_cannot_satisfy() {
+    let fixture = RepoFixture::new();
+    fixture.init_repo("engine");
+
+    // A repository inside a repository is refused, with the reason, and nothing is written.
+    let cli = Cli::new(fixture.path());
+    let (_, stderr, code) = cli.out(&["init", ".", "--name", "demo"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    // A remote that disagrees with `origin` on disk, recorded without configuring Git, is
+    // refused: the manifest would otherwise promise a remote that pushes do not use.
+    fixture
+        .runner()
+        .repo(fixture.path())
+        .run_checked(&["remote", "add", "origin", "git@github.com:acme/other.git"])
+        .unwrap();
+    let (_, stderr, code) = cli.out(&[
+        "init",
+        ".",
+        "--name",
+        "demo",
+        "--remote",
+        "git@github.com:acme/demo.git",
+        "--force",
+    ]);
+    assert_eq!(code, 2, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("without configuring Git"),
+        "the refusal says what to do: {stderr}"
+    );
+    assert_eq!(
+        fixture.git_ok(".", &["remote", "get-url", "origin"]).trim(),
+        "git@github.com:acme/other.git",
+        "the existing remote is untouched"
+    );
+
+    // With the explicit confirmation the same call replaces `origin`, and succeeds.
+    cli.ok(&[
+        "init",
+        ".",
+        "--name",
+        "demo",
+        "--remote",
+        "git@github.com:acme/demo.git",
+        "--add-git-remote",
+        "--force",
+    ]);
+    assert_eq!(
+        fixture.git_ok(".", &["remote", "get-url", "origin"]).trim(),
+        "git@github.com:acme/demo.git"
+    );
+}

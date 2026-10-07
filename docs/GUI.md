@@ -82,6 +82,85 @@ You can start the interface anywhere:
 A directory that is not a GitMesh project produces a clear message, never an empty
 screen; opening another project is a single action and does not require restarting.
 
+## Creating a project (the setup wizard)
+
+Starting from an ordinary folder — no manifest and no repositories, or some of each — the
+interface can build the GitMesh project for you. Press **New project** (or **Create a
+GitMesh project here** on the welcome screen) and walk the twelve steps:
+
+```text
+1  choose the project root            any local directory, absolute path
+2  scan the structure                 facts only: sub-directories, files, existing .git
+3  select repository boundaries       one checkbox per directory; nested or overlapping
+                                      selections are refused, with the reason
+4  name the root repository           name, branch, optional remote, optional provider
+5  configure each selected directory  id, "create a Git repository here if there is
+                                      none", remote, and "stop tracking it in the root"
+6  see what already exists            existing repositories are adopted, explained, and
+                                      never re-initialised
+7  review the remotes                 local paths, existing remotes, or a GitHub target
+8  the manifest                       `.gitmesh/project.toml` is generated from the
+                                      answers; an existing one is kept unless you confirm
+9  review the plan                    every step, every refusal, the exact manifest text
+10 confirm                            the plan id you reviewed is what will run
+11 execute                            live per-step progress
+12 result                             validation, and the project opens with no restart
+```
+
+What the wizard is:
+
+* **plan-driven** — the step-9 review and the execution consume the *same* typed plan
+  (`SetupRequest` → `SetupPlan` → `apply` → `SetupResult` → `verify`). Changing any answer
+  invalidates the reviewed plan, and its fingerprint travels back with the confirmation,
+  so a plan that changed on disk in between is refused instead of run.
+* **read-only until you confirm** — scanning and planning create nothing at all.
+* **honest about adoption** — a directory that already is a Git repository is used as it
+  is (its history, branch and remote untouched); the plan says so instead of planning a
+  `git init` there.
+* **local-first** — a remote is optional everywhere. Unchecking "configure remotes" means
+  the URL is recorded in the manifest and Git is not touched at all; a remote that would
+  contradict an `origin` already on disk is refused rather than recorded silently.
+* **GitHub-optional** — picking a GitHub target only prepares the URL and shows the exact
+  `gh repo create` command, from the provider layer. GitMesh never creates the repository,
+  never asks for a token and stores no credential (see `docs/MANIFEST.md`).
+* **re-runnable** — running the wizard again on the created project reports every step as
+  already satisfied, leaves the manifest byte-for-byte unchanged, and simply opens the
+  project.
+
+### First publish
+
+If you tick *after the setup, make one first commit and push it*, the plan carries that
+promise (`FirstPublish`) and shows the message and the repositories it will touch. The
+setup engine itself never commits and never pushes: after a successful setup the interface
+runs the **ordinary** commit and push operations, restricted to the repositories that
+received a remote here. Concretely:
+
+* one commit message, one real commit per affected repository — never a global commit;
+* repositories without a remote stay local, are not pushed, and are not failures;
+* a failing commit or push does not stop the others and is reported per repository with
+  Git's own message; a partial result is never shown as success.
+
+### When something fails
+
+* A refusal at step 9 (overlapping boundaries, an unconfirmed remote replacement, a
+  missing directory, a path outside the project, a duplicate id, a first commit without a
+  message) blocks the whole plan: nothing is written, and each refusal says what to fix.
+* During execution a failing step does not stop the unrelated ones; a repository whose
+  creation failed has its own follow-up steps skipped, and the manifest is still written
+  when it can be, so the remaining project is honest about itself.
+* A partial setup stays in the wizard with the failing steps on screen — a half-built
+  project is not opened, because adopting it would hide what still has to be fixed. A
+  complete setup (including a re-run where everything already exists) opens the project
+  immediately, in the same interface, with no restart.
+
+### What stays manual
+
+* Creating the hosted repository itself (GitHub, GitLab, …): GitMesh prints the command
+  and records the URL; it never talks to a provider API.
+* Resolving conflicts: normal Git tooling, as everywhere else in GitMesh.
+* Editing the configuration afterwards (assigning, renaming, changing remotes): still
+  `gitmesh configure` or `gitmesh ui`, exactly as before.
+
 ## How status and changes work
 
 Status is the same unified status the CLI prints: repository, branch, staged/unstaged/
@@ -164,6 +243,24 @@ Pulling the project
 The final panel replaces it with the aggregate result: how many repositories succeeded,
 were skipped, conflicted or failed, with details per repository.
 
+## The local HTTP surface
+
+The page talks only to the server it was served from.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/model`, `POST /api/refresh` | the interface model (project, tree, repositories, changes, readiness) |
+| `POST /api/open` | open a project from a directory (refused while an operation runs) |
+| `POST /api/dry-run` | toggle dry-run mode |
+| `POST /api/commit`, `/api/branch`, `/api/sync`, `/api/push` | the logical operations, always asynchronously |
+| `GET /api/events/<id>` | server-sent stream of per-repository progress and the final result |
+| `GET /api/report/<id>` | the stored result of the last operation |
+| `GET /api/setup/status` | read-only: what the interface sees in the directory it was started in |
+| `POST /api/setup/inspect` | scan a directory as a candidate project root (`path`, optional `name`) |
+| `POST /api/setup/plan` | generate the plan for the wizard's answers — creates nothing |
+| `POST /api/setup/apply` | execute a reviewed plan; the reviewed plan id is required, and the work runs in the background on the same event stream |
+| `GET /api/health` | liveness (start-up check, workflow scripts) |
+
 ## Safety
 
 * **Local by default.** The server binds `127.0.0.1`, has no authentication and is not
@@ -188,8 +285,10 @@ were skipped, conflicted or failed, with details per repository.
 
 ## What is not supported yet
 
-* Editing the project configuration (assign/rename/remote) — deliberate for this version.
-* Creating or cloning a project (use `gitmesh init`, `git clone`, then `gitmesh gui`).
+* Editing an existing project's configuration (assign/rename/remote) — deliberate for this
+  version: the wizard *creates* a project, `gitmesh configure` and `gitmesh ui` edit one.
+* Cloning a project that does not exist locally yet (create it here, or `git clone` and
+  then open it).
 * Resolving conflicts inside the interface; they are resolved with Git, as documented.
 * A history/log view, per-file diffs, and staging individual files (the commit stages
   everything, as the CLI does).
@@ -202,9 +301,18 @@ were skipped, conflicted or failed, with details per repository.
 $ cargo test                       # includes the service layer and the GUI tests
 $ cargo test --test client         # runs the interface's client logic under Node (if installed)
 $ ./tools/gui-workflow.py          # full manual workflow over the real HTTP interface
+$ ./tools/setup-workflow.py        # the setup wizard end to end, from a blank directory
 ```
 
 `tools/gui-workflow.py` builds a temporary multi-repository project with local bare
 remotes and walks the whole workflow — open, status, changes, commit, branch, pull,
 conflict, resolve, push, reopen — printing one line per check. It is the script used
 during development to validate the interface end to end.
+
+`tools/setup-workflow.py` starts from an ordinary directory (`/tmp/gitmesh-setup-e2e`,
+which it leaves behind for inspection), scans it, reviews a plan that creates two
+repositories, adopts one that already exists and keeps a fourth local-only, executes it,
+and then checks the result on disk: real `.git` directories, the generated manifest, the
+configured remotes, the first publish, a real push, a deliberately broken remote (partial
+failure), a rerun on the now-configured project, and a restart of the interface. It also
+checks that a repository outside the project is never touched.

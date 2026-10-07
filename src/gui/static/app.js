@@ -603,22 +603,23 @@ var GitMesh = (function () {
   function publishResultText(publish) {
     if (!publish) { return null; }
     var sections = publish || [];
-    var commits = 0;
-    var pushes = 0;
-    var problems = [];
+    var result = { commits: 0, pushes: 0, problems: [], succeeded: 0, skipped: 0 };
     sections.forEach(function (section) {
-      var report = section.report || {};
-      var outcomes = report.outcomes || [];
-      if (section.operation === 'First commit') { commits = outcomes.length; }
-      if (section.operation === 'First push') { pushes = outcomes.length; }
-      if (section.error) { problems.push(section.operation + ': ' + section.error); }
+      var outcomes = section.outcomes || [];
+      var counts = section.counts || {};
+      if (section.operation === 'First commit') { result.commits = outcomes.length; }
+      if (section.operation === 'First push') { result.pushes = outcomes.length; }
+      result.succeeded += counts.succeeded || 0;
+      result.skipped += counts.skipped || 0;
+      if (section.error) { result.problems.push(section.operation + ': ' + section.error); }
       outcomes.forEach(function (outcome) {
         if (outcome.outcome === 'failed' || outcome.outcome === 'conflict') {
-          problems.push(section.operation + ' — ' + outcome.id + ': ' + (outcome.summary || outcome.outcome));
+          result.problems.push(section.operation + ' — ' + outcome.id + ': ' +
+            (outcome.summary || outcome.outcome));
         }
       });
     });
-    return { commits: commits, pushes: pushes, problems: problems };
+    return result;
   }
 
   function setupProgressRows(events, fallback) {
@@ -1728,6 +1729,14 @@ if (typeof document !== 'undefined') {
       return fields.join('&');
     }
 
+    /// The project name is part of every suggested repository id (`MyProject/engine` →
+    /// `myproject-engine`), and the suggestions come from the Rust side, so changing the
+    /// name re-scans instead of guessing. Ids the user edited are kept by `rebuildForms`.
+    function renameHints() {
+      if (!$('setup-root').value.trim()) { return; }
+      scanDirectory();
+    }
+
     /// Any answer that changes invalidates the reviewed plan: a confirmation is bound to the
     /// plan the user actually saw.
     function invalidatePlan() {
@@ -1966,7 +1975,8 @@ if (typeof document !== 'undefined') {
       if (publish) {
         html += '<div class="result-section"><h3>First commit and push</h3>' +
           '<p class="owner">' + publish.commits + ' commit result(s), ' + publish.pushes +
-          ' push result(s)</p>';
+          ' push result(s) — ' + publish.succeeded + ' succeeded, ' + publish.skipped +
+          ' skipped</p>';
         if (publish.problems.length) {
           publish.problems.forEach(function (problem) {
             html += '<p class="resolve">' + escapeHtml(problem) + '</p>';
@@ -2030,7 +2040,6 @@ if (typeof document !== 'undefined') {
       var directories = GitMesh.selectableDirectories(wizard.inspection);
       directories.forEach(function (directory) {
         wizard.selection[directory.path] = !!directory.suggested;
-        wizard.overlay[directory.path] = null;
       });
       rebuildForms();
       renderWizard();
