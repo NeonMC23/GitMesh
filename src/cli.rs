@@ -130,6 +130,9 @@ pub struct InitArgs {
     /// Replace an existing manifest.
     #[arg(long)]
     pub force: bool,
+    /// Create a Git repository in the project root when it is not one yet.
+    #[arg(long)]
+    pub git_init: bool,
 }
 
 #[derive(Debug, Args)]

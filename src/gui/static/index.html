@@ -19,6 +19,7 @@
     <span id="dry-run-badge" class="badge badge-warn" hidden>dry run</span>
     <button id="btn-refresh" class="ghost" title="Re-read the project (R)">Refresh</button>
     <button id="btn-open" class="ghost" title="Open another GitMesh project">Open…</button>
+    <button id="btn-setup" class="ghost" title="Create a GitMesh project in a directory">Set up…</button>
   </div>
 </header>
 
@@ -174,8 +175,164 @@
       </div>
       <p id="welcome-error" class="error" hidden></p>
       <p class="hint">A GitMesh project is any directory tree containing
-        <code>.gitmesh/project.toml</code>. Create one with <code>gitmesh init</code>.</p>
+        <code>.gitmesh/project.toml</code>.</p>
+      <div class="row">
+        <button id="btn-welcome-setup" class="primary">Set up a project in this directory…</button>
+      </div>
+      <p class="hint">The setup wizard scans the directory, lets you choose which parts become
+        repositories, shows you the exact plan, and writes the manifest — nothing is deleted and
+        nothing is replaced without confirmation.</p>
     </div>
+  </section>
+  <!-- The setup wizard: one linear flow, from a plain directory to a project. -->
+  <section id="setup" hidden>
+    <div class="setup-head">
+      <div>
+        <h1>Set up a GitMesh project</h1>
+        <p class="hint">Every step is shown as GitMesh sees it, and the review step shows the real
+          plan — the same plan that runs when you confirm it. Nothing is deleted, no
+          <code>.git</code> directory is re-initialised, no remote is replaced and no manifest is
+          overwritten without an explicit confirmation.</p>
+      </div>
+      <button id="btn-setup-close" class="ghost">Close</button>
+    </div>
+
+    <section class="card step" id="setup-step-1">
+      <h2><span class="step-no">1</span> Project root</h2>
+      <p class="hint">The directory that becomes the logical project. Absolute path; it may already
+        contain files, and it may already be a Git repository.</p>
+      <label class="field"><span>Directory</span>
+        <input id="setup-root" type="text" placeholder="/path/to/MyProject" autocomplete="off"></label>
+      <div class="row">
+        <button id="btn-setup-scan" class="primary">Scan this directory</button>
+        <span id="setup-scan-hint" class="hint inline"></span>
+      </div>
+      <p id="setup-scan-error" class="error" hidden></p>
+      <div id="setup-inspection"></div>
+    </section>
+
+    <section class="card step" id="setup-step-2">
+      <h2><span class="step-no">2</span> Structure</h2>
+      <p class="hint">GitMesh reads the directory as one project. Tick the sub-directories that
+        should be their own Git repository (for hosting, collaboration or size); everything else
+        stays part of the root repository. A nested repository is reported, never touched.</p>
+      <div id="setup-structure"></div>
+      <div class="row">
+        <button id="btn-setup-suggest" class="ghost">Select the suggested repositories</button>
+        <button id="btn-setup-clear" class="ghost">Clear the selection</button>
+        <span id="setup-coverage" class="hint inline"></span>
+      </div>
+      <label class="check"><input type="checkbox" id="setup-untrack"> stop tracking the selected
+        directories in the root repository (index only — the files stay on disk)</label>
+    </section>
+
+    <section class="card step" id="setup-step-3">
+      <h2><span class="step-no">3</span> Root repository</h2>
+      <p class="hint">The root repository holds the project files that no other repository owns.
+        GitMesh creates it when needed: you never run <code>git init</code> yourself.</p>
+      <div id="setup-root-state"></div>
+      <div class="grid-actions">
+        <label class="field"><span>Project name</span>
+          <input id="setup-name" type="text" placeholder="MyProject" autocomplete="off"></label>
+        <label class="check"><input type="checkbox" id="setup-root-create" checked>
+          create a Git repository in the project root if there is none</label>
+      </div>
+      <div class="grid-actions">
+        <label class="field"><span>Branch to create / expect</span>
+          <input id="setup-root-branch" type="text" placeholder="main" autocomplete="off"></label>
+        <label class="field"><span>Root remote</span>
+          <select id="setup-root-remote-kind">
+            <option value="none">no remote (fully usable locally)</option>
+            <option value="manual">a Git URL I type</option>
+            <option value="github">GitHub owner/name (no token, nothing created here)</option>
+          </select></label>
+      </div>
+      <div id="setup-root-remote-fields"></div>
+    </section>
+
+    <section class="card step" id="setup-step-4">
+      <h2><span class="step-no">4</span> Repositories inside the project</h2>
+      <p class="hint">One row per selected directory: its name in the project, whether GitMesh
+        creates the repository, and where it is hosted. Defaults are suggestions, never decisions.</p>
+      <div id="setup-repositories"></div>
+      <label class="check"><input type="checkbox" id="setup-publish"> after the setup, make one
+        first commit in the repositories created here and push it (the ordinary commit and push
+        operations, listed in the plan)</label>
+      <label class="field"><span>First commit message</span>
+        <input id="setup-first-commit" type="text" placeholder="Initial commit" autocomplete="off"></label>
+    </section>
+
+    <section class="card step" id="setup-step-5">
+      <h2><span class="step-no">5</span> Repositories that already exist</h2>
+      <p class="hint">A directory that already is a Git repository is used as it is: GitMesh never
+        converts, re-initialises or deletes it. Adopting it records it in the manifest; keeping its
+        remote is the default and its history stays untouched.</p>
+      <div id="setup-existing"></div>
+    </section>
+
+    <section class="card step" id="setup-step-6">
+      <h2><span class="step-no">6</span> Remotes</h2>
+      <p class="hint">A remote is optional: a project with no remote is fully usable locally. The
+        URL is always recorded in the manifest; configuring <code>origin</code> in Git as well is a
+        separate choice.</p>
+      <label class="check"><input type="checkbox" id="setup-configure-remotes" checked>
+        configure <code>origin</code> in Git for the remotes above</label>
+      <div id="setup-remotes"></div>
+    </section>
+
+    <section class="card step" id="setup-step-7">
+      <h2><span class="step-no">7</span> Hosting (optional)</h2>
+      <p class="hint">GitHub is optional and never required. GitMesh does not create repositories on
+        GitHub, needs no token and stores no credential: it prepares the correct remote URL and
+        tells you the command that creates the repository there, if you want one.</p>
+      <div id="setup-hosting"></div>
+    </section>
+
+    <section class="card step" id="setup-step-8">
+      <h2><span class="step-no">8</span> Manifest</h2>
+      <p class="hint">GitMesh writes <code>.gitmesh/project.toml</code> from these answers, using the
+        project schema and its validation. You never edit TOML by hand.</p>
+      <div id="setup-manifest"></div>
+    </section>
+
+    <section class="card step" id="setup-step-9">
+      <h2><span class="step-no">9</span> Review and dry run</h2>
+      <p class="hint">This is the real plan: exactly what GitMesh will create, keep, skip or refuse.
+        It is generated from the answers above and nothing runs until you confirm it.</p>
+      <div class="row">
+        <button id="btn-setup-review" class="primary">Review the plan</button>
+        <span id="setup-review-hint" class="hint inline"></span>
+      </div>
+      <p id="setup-plan-error" class="error" hidden></p>
+      <div id="setup-plan"></div>
+    </section>
+
+    <section class="card step" id="setup-step-10">
+      <h2><span class="step-no">10</span> Confirm</h2>
+      <p class="hint">The plan id below is the exact plan you reviewed. If anything in the directory
+        changes in the meantime, GitMesh refuses to run it and asks you to review again.</p>
+      <p class="mono" id="setup-plan-id">—</p>
+      <label class="check"><input type="checkbox" id="setup-confirm">
+        I have reviewed the plan above and want to create this project</label>
+      <div class="row">
+        <button id="btn-setup-apply" class="primary" disabled>Create the project</button>
+        <button id="btn-setup-cancel" class="ghost">Cancel</button>
+      </div>
+    </section>
+
+    <section class="card step operation" id="setup-step-11" hidden>
+      <h2><span class="step-no">11</span> Apply</h2>
+      <div id="setup-progress" class="progress"></div>
+    </section>
+
+    <section class="card step" id="setup-step-12" hidden>
+      <h2><span class="step-no">12</span> Result</h2>
+      <div id="setup-result" class="result"></div>
+      <div class="row">
+        <button id="btn-setup-open" class="primary" hidden>Open the project</button>
+        <button id="btn-setup-again" class="ghost">Back to the review</button>
+      </div>
+    </section>
   </section>
 </main>
 

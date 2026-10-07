@@ -38,6 +38,7 @@ pub mod ops;
 pub mod paths;
 pub mod providers;
 pub mod service;
+pub mod setup;
 pub mod testkit;
 pub mod ui;
 

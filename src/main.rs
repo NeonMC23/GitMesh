@@ -20,6 +20,7 @@ use gitmesh::ops::{
     RepositorySelection,
 };
 use gitmesh::paths::to_slash;
+use gitmesh::setup::{self, SetupRequest};
 use gitmesh::{providers, Error, Result};
 
 /// Usage/configuration errors exit with 2, operational problems with 1.
@@ -231,6 +232,8 @@ fn cmd_init(
     runner: &GitRunner,
     args: &gitmesh::cli::InitArgs,
 ) -> Result<u8> {
+    // `init` is the command-line front end of the same project setup service the
+    // graphical wizard drives (crate::setup): one implementation, two front ends.
     let root = absolute(&resolve_start_path(global, &args.path))?;
     if !root.is_dir() {
         return Err(Error::Other(format!(
@@ -246,30 +249,49 @@ fn cmd_init(
         )));
     }
 
-    let project = discovery::initial_project(
-        &root,
-        args.name.clone(),
-        args.remote.clone(),
-        args.branch.clone(),
-    )?;
-
-    let is_repository = runner.repo(&root).is_repository();
-    if args.add_git_remote {
-        if let Some(url) = args.remote.as_deref() {
-            if !is_repository {
-                return Err(Error::NotARepository { path: root.clone() });
-            }
-            let repo = runner.repo(&root);
-            let has_origin = repo.remotes()?.iter().any(|r| r.name == "origin");
-            if has_origin {
-                repo.run_checked(&["remote", "set-url", "origin", url])?;
-            } else {
-                repo.run_checked(&["remote", "add", "origin", url])?;
-            }
-        }
+    let root_is_repository = discovery::is_repository_root(&root, true, runner);
+    if args.add_git_remote && args.remote.is_some() && !args.git_init && !root_is_repository {
+        return Err(Error::NotARepository { path: root.clone() });
     }
 
-    let path = manifest::save_project(&project)?;
+    let request = SetupRequest {
+        root: root.clone(),
+        name: args.name.clone().unwrap_or_default(),
+        root_remote: args.remote.clone(),
+        root_branch: args.branch.clone(),
+        create_root_repository: args.git_init,
+        set_git_remote: args.add_git_remote,
+        overwrite_manifest: args.force,
+        // The flag itself is the confirmation: `--add-git-remote` means "point origin at
+        // this URL", which is what it has always done.
+        overwrite_remotes: args.add_git_remote,
+        untrack_from_root: false,
+        publish_first_commit: None,
+        repositories: Vec::new(),
+    };
+    let plan = setup::plan(&request, runner)?;
+    if !plan.is_ready() {
+        return Err(Error::InvalidConfiguration(plan.blockers.clone()));
+    }
+    let result = setup::apply(&plan, false, runner, &mut setup::SetupObserver::silent());
+    if !result.is_success() {
+        let mut lines: Vec<String> = vec![result.summary()];
+        for outcome in &result.outcomes {
+            if outcome.outcome.is_problem() {
+                lines.push(format!("  {} {}", outcome.symbol(), outcome.summary));
+                lines.extend(outcome.details.iter().map(|detail| format!("    {detail}")));
+            }
+        }
+        return Err(Error::Other(lines.join("\n")));
+    }
+
+    let project = &plan.project;
+    let path = result
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| manifest_file.clone());
+    // Re-check after the setup: the answer must describe the directory as it now is.
+    let is_repository = discovery::is_repository_root(&root, true, runner);
 
     if global.json {
         println!(
@@ -291,7 +313,7 @@ fn cmd_init(
     if !is_repository {
         println!();
         println!("Note: the project root is not a Git repository yet.");
-        println!("      Run `git init` there to give the root repository a history.");
+        println!("      Run `git init` there (or `gitmesh init --git-init`) to give the root repository a history.");
     }
     println!();
     println!("Next steps:");

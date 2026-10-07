@@ -25,7 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::gui::{asset, Gui, GuiOperation};
+use crate::gui::{asset, Gui, GuiOperation, SetupRefusal};
+use crate::setup::{RepositoryRequest, SetupRequest};
 
 /// Maximum size of a request head, in bytes.
 const MAX_HEAD: usize = 16 * 1024;
@@ -229,6 +230,16 @@ fn handle(mut stream: TcpStream, gui: &Arc<Gui>, allowed_hosts: &[String]) -> st
         ("GET", "/api/health") => write_response(&mut stream, Response::json(health_json())),
         ("GET", "/api/model") => write_response(&mut stream, Response::json(gui.model())),
         ("POST", "/api/refresh") => write_response(&mut stream, Response::json(gui.model())),
+        ("GET", "/api/setup/status") => write_response(&mut stream, setup_status_response(gui)),
+        ("POST", "/api/setup/inspect") => {
+            write_response(&mut stream, setup_inspect_response(gui, &request))
+        }
+        ("POST", "/api/setup/plan") => {
+            write_response(&mut stream, setup_plan_response(gui, &request))
+        }
+        ("POST", "/api/setup/apply") => {
+            write_response(&mut stream, setup_apply_response(gui, &request))
+        }
         ("POST", "/api/open") => write_response(&mut stream, open_response(gui, &request)),
         ("POST", "/api/dry-run") => write_response(&mut stream, dry_run_response(gui, &request)),
         ("POST", "/api/commit") => write_response(&mut stream, commit_response(gui, &request)),
@@ -305,6 +316,115 @@ fn dry_run_response(gui: &Arc<Gui>, request: &Request) -> Response {
         .unwrap_or(false);
     gui.set_dry_run(value);
     Response::json(gui.model())
+}
+
+/// Inspect the directory the interface runs in, without changing anything.
+fn setup_status_response(gui: &Arc<Gui>) -> Response {
+    let start = gui.start_directory();
+    inspect_response(gui, &start, None)
+}
+
+/// Inspect the directory given in the body, or the current one when the body is empty.
+fn setup_inspect_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let path = match form_value(&request.body, "path") {
+        Some(path) if !path.trim().is_empty() => std::path::PathBuf::from(path.trim()),
+        _ => gui.start_directory(),
+    };
+    let name = optional_form(&request.body, "name");
+    inspect_response(gui, &path, name.as_deref())
+}
+
+fn inspect_response(gui: &Arc<Gui>, path: &std::path::Path, name_hint: Option<&str>) -> Response {
+    match gui.inspect_directory(path) {
+        Ok(inspection) => Response::json(
+            crate::json::Json::object([(
+                "inspection",
+                crate::service::inspection_view_json(&inspection, name_hint),
+            )])
+            .to_pretty_string(),
+        ),
+        Err(message) => Response::error(422, "Unprocessable Entity", &message),
+    }
+}
+
+/// Turn the wizard's answers into a plan. Read-only: a plan creates nothing.
+fn setup_plan_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let setup = match setup_request_from_form(&request.body) {
+        Ok(setup) => setup,
+        Err(message) => return Response::error(400, "Bad Request", &message),
+    };
+    match gui.plan_setup(&setup) {
+        Ok(plan) => Response::json(
+            crate::json::Json::object([("plan", crate::service::setup_plan_view_json(&plan))])
+                .to_pretty_string(),
+        ),
+        Err(message) => Response::error(422, "Unprocessable Entity", &message),
+    }
+}
+
+/// Apply a reviewed plan, in the background, and stream its progress.
+///
+/// The plan id the interface reviewed is required: without it the request would be a
+/// setup nobody approved, and the server refuses rather than assuming consent.
+fn setup_apply_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let reviewed = form_value(&request.body, "planId").unwrap_or_default();
+    let reviewed = reviewed.trim().to_string();
+    if reviewed.is_empty() {
+        return Response::error(
+            400,
+            "Bad Request",
+            "the 'planId' field is required: the plan has to be reviewed and confirmed first",
+        );
+    }
+    let setup = match setup_request_from_form(&request.body) {
+        Ok(setup) => setup,
+        Err(message) => return Response::error(400, "Bad Request", &message),
+    };
+    match gui.start_setup(setup, Some(&reviewed)) {
+        Ok(id) => {
+            let body = crate::json::Json::object([
+                ("id", crate::json::Json::from(id as i64)),
+                (
+                    "events",
+                    crate::json::Json::from(format!("/api/events/{id}")),
+                ),
+            ])
+            .compact();
+            Response::json(body).with_status(202, "Accepted")
+        }
+        Err(SetupRefusal::Busy(message)) => Response::error(409, "Conflict", &message),
+        Err(SetupRefusal::Refused(message)) => {
+            Response::error(422, "Unprocessable Entity", &message)
+        }
+        Err(SetupRefusal::PlanChanged(plan)) => plan_refusal_response(
+            409,
+            "Conflict",
+            "the directory changed since it was reviewed; check the plan again",
+            &plan,
+        ),
+        Err(SetupRefusal::Blocked(plan)) => plan_refusal_response(
+            422,
+            "Unprocessable Entity",
+            "this plan cannot be applied as it is",
+            &plan,
+        ),
+    }
+}
+
+fn plan_refusal_response(
+    status: u16,
+    reason: &'static str,
+    message: &str,
+    plan: &crate::setup::SetupPlan,
+) -> Response {
+    Response::json(
+        crate::json::Json::object([
+            ("error", crate::json::Json::from(message)),
+            ("plan", crate::service::setup_plan_view_json(plan)),
+        ])
+        .to_pretty_string(),
+    )
+    .with_status(status, reason)
 }
 
 fn operation_response(gui: &Arc<Gui>, operation: GuiOperation) -> Response {
@@ -524,6 +644,168 @@ fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result
     stream.write_all(head.as_bytes())?;
     stream.write_all(&response.body)?;
     stream.flush()
+}
+
+// ------------------------------------------------------------ setup request --
+
+/// Read a setup request out of the wizard's form body.
+/// Read a setup request out of the wizard's form body.
+///
+/// The body is `application/x-www-form-urlencoded`. Field values are percent-encoded by
+/// the caller, and a repository record keeps its `;` and `=` separators literal while each
+/// *component* is escaped, so the server can split first and decode after. That is what
+/// makes an awkward path — one containing `&`, `;` or `=` — survive the trip. A record
+/// that cannot be read is refused instead of guessed.
+fn setup_request_from_form(body: &str) -> std::result::Result<SetupRequest, String> {
+    let path = form_value(body, "path").unwrap_or_default();
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("the project root path is required".to_string());
+    }
+    let mut request = SetupRequest {
+        root: std::path::PathBuf::from(path),
+        name: form_value(body, "name")
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        root_branch: optional_form(body, "rootBranch"),
+        create_root_repository: form_flag(body, "root"),
+        set_git_remote: form_flag(body, "configureRemotes"),
+        overwrite_manifest: form_flag(body, "overwriteManifest"),
+        overwrite_remotes: form_flag(body, "confirmRemotes"),
+        untrack_from_root: form_flag(body, "untrack"),
+        ..SetupRequest::default()
+    };
+    request.root_remote = root_remote_from_form(body)?;
+    if form_flag(body, "publish") {
+        request.publish_first_commit = Some(form_value(body, "firstCommit").unwrap_or_default());
+    }
+    for record in form_raw_values(body, "repositories") {
+        request
+            .repositories
+            .push(repository_request_from_record(&record)?);
+    }
+    Ok(request)
+}
+
+/// The root repository's remote, built by the provider layer when the wizard picked a
+/// provider instead of typing a URL.
+fn root_remote_from_form(body: &str) -> std::result::Result<Option<String>, String> {
+    if form_value(body, "rootProvider").unwrap_or_default().trim() == "github" {
+        let plan = hosted_plan(
+            &form_value(body, "rootOwner").unwrap_or_default(),
+            &form_value(body, "rootName").unwrap_or_default(),
+            &form_value(body, "rootScheme").unwrap_or_default(),
+            &form_value(body, "rootVisibility").unwrap_or_default(),
+        )?;
+        return Ok(Some(plan.url));
+    }
+    Ok(optional_form(body, "rootRemote"))
+}
+
+/// One `path=engine;id=engine;...` record from the repository list.
+fn repository_request_from_record(record: &str) -> std::result::Result<RepositoryRequest, String> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for part in record.split(';') {
+        if part.trim().is_empty() {
+            continue;
+        }
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("'{part}' is not a 'key=value' pair"))?;
+        fields.push((
+            percent_decode(key).trim().to_string(),
+            percent_decode(value),
+        ));
+    }
+    if fields.is_empty() {
+        return Err("a selected directory record is empty".to_string());
+    }
+    let get = |key: &str| -> String {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let path = get("path");
+    if path.is_empty() {
+        return Err("a selected directory has no path".to_string());
+    }
+    let provider = get("provider");
+    let (remote, visibility) = if provider == "github" {
+        let plan = hosted_plan(
+            &get("owner"),
+            &get("name"),
+            &get("scheme"),
+            &get("visibility"),
+        )?;
+        (Some(plan.url), Some(plan.visibility.label().to_string()))
+    } else {
+        (non_empty(get("remote")), non_empty(get("visibility")))
+    };
+
+    Ok(RepositoryRequest {
+        path,
+        id: get("id"),
+        remote,
+        branch: non_empty(get("branch")),
+        create: flag_value(&get("create")),
+        untrack_from_root: flag_value(&get("untrack")),
+        visibility,
+    })
+}
+
+/// Ask the provider layer for the remote of a hosted repository.
+///
+/// GitMesh never creates a GitHub repository and never stores a credential: this only
+/// turns `owner/name/visibility` into the URL that will be configured, exactly as the
+/// review step will show it.
+fn hosted_plan(
+    owner: &str,
+    name: &str,
+    scheme: &str,
+    visibility: &str,
+) -> std::result::Result<crate::providers::github::GitHubRemotePlan, String> {
+    let scheme = crate::providers::github::RemoteScheme::parse(scheme)
+        .unwrap_or(crate::providers::github::RemoteScheme::Ssh);
+    let visibility = crate::providers::github::Visibility::parse(visibility);
+    crate::providers::github::plan_remote(owner, name, scheme, visibility)
+        .map_err(|err| err.to_string())
+}
+
+/// A form value that must be present and non-empty.
+fn optional_form(body: &str, key: &str) -> Option<String> {
+    form_value(body, key).and_then(non_empty)
+}
+
+/// A trimmed string, or nothing when it is empty.
+fn non_empty(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// True for the values a browser sends for a checked box (`yes` is the wizard's own).
+fn form_flag(body: &str, key: &str) -> bool {
+    flag_value(&form_value(body, key).unwrap_or_default())
+}
+
+fn flag_value(value: &str) -> bool {
+    matches!(value.trim(), "yes" | "true" | "1" | "on")
+}
+
+/// Every `repositories` value, still percent-encoded, in the order the browser sent them.
+fn form_raw_values(body: &str, key: &str) -> Vec<String> {
+    body.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(name, _)| *name == key)
+        .map(|(_, value)| value.to_string())
+        .collect()
 }
 
 /// `application/x-www-form-urlencoded` field, percent-decoded.
@@ -834,6 +1116,197 @@ mod tests {
         );
     }
 
+    /// A plain directory outside the project: what the wizard is pointed at first.
+    fn plain_project(fixture: &RepoFixture, label: &str) -> std::path::PathBuf {
+        let path = fixture.outside_path().join(label);
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::create_dir_all(path.join("engine")).unwrap();
+        std::fs::write(path.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(path.join("engine/lib.rs"), "pub fn go() {}\n").unwrap();
+        path
+    }
+
+    /// One repository record, the way the browser builds it: escaped components, literal
+    /// `;` and `=` separators.
+    fn record(fields: &[(&str, &str)]) -> String {
+        fields
+            .iter()
+            .map(|(key, value)| format!("{key}={}", url_encode(value)))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    fn setup_body(path: &std::path::Path) -> String {
+        format!(
+            "path={}&name=MyProject&root=yes&configureRemotes=yes&untrack=yes&repositories={}",
+            url_encode(&path.to_string_lossy()),
+            record(&[("path", "engine"), ("id", "engine"), ("create", "yes")])
+        )
+    }
+
+    #[test]
+    fn setup_endpoints_inspect_plan_apply_and_open_the_project_without_a_restart() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_project(&fixture, "MyProject");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+        let port = start_server(Arc::clone(&gui));
+
+        // Status is read-only and works before any project exists.
+        let (status, body) = get(port, "/api/setup/status");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"isGitMeshProject\": false"), "{body}");
+        assert!(!plain.join(".gitmesh").exists(), "nothing was created");
+
+        // A plan is generated from the answers, and it is still read-only.
+        let (status, body) = post(port, "/api/setup/plan", &setup_body(&plain), None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"kind\": \"plan\""), "{body}");
+        assert!(body.contains("\"ready\": true"), "{body}");
+        assert!(body.contains("[[repositories]]"), "{body}");
+        assert!(body.contains("\"safety\""), "{body}");
+        let plan_id = plan_id_from(&body);
+        assert!(!plain.join(".gitmesh").exists(), "planning created nothing");
+
+        // Applying without the reviewed plan id, or with a stale one, is refused.
+        let (status, body) = post(port, "/api/setup/apply", &setup_body(&plain), None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("reviewed"), "{body}");
+        let stale = format!("{}&planId=0000", setup_body(&plain));
+        let (status, body) = post(port, "/api/setup/apply", &stale, None);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("changed since it was reviewed"), "{body}");
+        assert!(
+            !plain.join(".gitmesh").exists(),
+            "a refused apply created nothing"
+        );
+
+        // The confirmed plan runs in the background and streams its steps.
+        let confirmed = format!("{}&planId={}", setup_body(&plain), url_encode(&plan_id));
+        let (status, body) = post(port, "/api/setup/apply", &confirmed, None);
+        assert_eq!(status, 202, "{body}");
+        let id = id_from(&body);
+        let (status, events) = get(port, &format!("/api/events/{id}"));
+        assert_eq!(status, 200);
+        assert!(events.contains("\"type\":\"started\""), "{events}");
+        assert!(
+            events.contains("\"operation\":\"Project setup\""),
+            "{events}"
+        );
+        assert!(events.contains("\"type\":\"outcome\""), "{events}");
+        assert!(events.contains("\"kind\":\"complete\""), "{events}");
+        assert!(events.contains("\"type\":\"finished\""), "{events}");
+        assert!(events.contains("\"opened\":true"), "{events}");
+
+        // The interface shows the project immediately: no restart, no reopen.
+        let (status, model) = get(port, "/api/model");
+        assert_eq!(status, 200);
+        assert!(model.contains("\"kind\": \"project\""), "{model}");
+        assert!(model.contains("\"name\": \"MyProject\""), "{model}");
+        assert!(model.contains("\"id\": \"engine\""), "{model}");
+
+        // And the project on disk is a real GitMesh project.
+        assert!(plain.join(".gitmesh/project.toml").is_file());
+        assert!(plain.join(".git/HEAD").is_file());
+        assert!(plain.join("engine/.git/HEAD").is_file());
+        let (status, report) = get(port, &format!("/api/report/{id}"));
+        assert_eq!(status, 200);
+        assert!(report.contains("\"status\": \"finished\""), "{report}");
+    }
+
+    #[test]
+    fn setup_plan_view_shows_hosted_remotes_without_asking_for_credentials() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_project(&fixture, "Hosted");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+        let port = start_server(gui);
+
+        let repository = record(&[
+            ("path", "engine"),
+            ("id", "engine"),
+            ("provider", "github"),
+            ("owner", "acme"),
+            ("name", "myproject-engine"),
+            ("scheme", "ssh"),
+            ("visibility", "private"),
+            ("create", "yes"),
+        ]);
+        let body = format!(
+            "path={}&name=MyProject&root=yes&repositories={repository}",
+            url_encode(&plain.to_string_lossy())
+        );
+        let (status, body) = post(port, "/api/setup/plan", &body, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("git@github.com:acme/myproject-engine.git"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"fullName\": \"acme/myproject-engine\""),
+            "{body}"
+        );
+        assert!(body.contains("\"visibility\": \"private\""), "{body}");
+        assert!(
+            body.contains("gh repo create acme/myproject-engine --private"),
+            "{body}"
+        );
+        assert!(body.contains("\"createsRepository\": false"), "{body}");
+
+        // A hosted repository that GitHub would reject is refused, with the reason.
+        let bad = body.replace("myproject-engine", "..");
+        let (status, body) = post(port, "/api/setup/plan", &bad, None);
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn setup_requests_survive_awkward_paths_and_refuse_malformed_records() {
+        let root = "/tmp/odd;dir=1/&other".to_string();
+        let body = format!(
+            "path={}&name=Odd&repositories={}",
+            url_encode(&root),
+            record(&[("path", "engine"), ("id", "engine")])
+        );
+        let request = setup_request_from_form(&body).expect("request");
+        assert_eq!(request.root, std::path::PathBuf::from(&root));
+        assert_eq!(request.repositories.len(), 1);
+        assert_eq!(request.repositories[0].path, "engine");
+
+        // An awkward directory name inside a record survives, because only the component
+        // is escaped while the separators stay literal.
+        let body = format!(
+            "path=/tmp/x&repositories={}",
+            record(&[("path", "odd;dir=1"), ("id", "odd")])
+        );
+        assert_eq!(
+            setup_request_from_form(&body).unwrap().repositories[0].path,
+            "odd;dir=1"
+        );
+
+        // Records are read in order, and two directories stay two directories.
+        let body = format!(
+            "path=/tmp/x&repositories={}&repositories={}",
+            record(&[("path", "engine"), ("id", "engine"), ("create", "yes")]),
+            record(&[
+                ("path", "renderer"),
+                ("id", "renderer"),
+                ("remote", "/tmp/remote.git")
+            ])
+        );
+        let request = setup_request_from_form(&body).expect("request");
+        assert_eq!(request.repositories.len(), 2);
+        assert!(request.repositories[0].create);
+        assert_eq!(
+            request.repositories[1].remote.as_deref(),
+            Some("/tmp/remote.git")
+        );
+
+        // A record that cannot be read is refused instead of guessed.
+        // A record without a value is refused, and so is a request without a root.
+        let body = "path=/tmp/x&repositories=path=engine;id".to_string();
+        assert!(setup_request_from_form(&body).is_err());
+        assert!(setup_request_from_form("path=&repositories=path=engine").is_err());
+        assert!(setup_request_from_form("name=x").is_err());
+    }
+
     #[test]
     fn dry_run_endpoint_toggles_the_mode() {
         let fixture = RepoFixture::named("demo");
@@ -939,6 +1412,25 @@ mod tests {
             "127.0.0.1:7345"
         ));
         assert!(!origin_matches_host("null", "127.0.0.1:7345"));
+    }
+
+    /// The plan id out of a `{"plan": {"id": "..."}}` body.
+    fn plan_id_from(body: &str) -> String {
+        let after = body.split("\"id\": \"").nth(1).expect("plan id");
+        after.split('"').next().unwrap_or_default().to_string()
+    }
+
+    /// The operation id out of a `{"id": 3, ...}` body.
+    fn id_from(body: &str) -> i64 {
+        let compact = body.replace(' ', "");
+        let after = compact.split("\"id\":").nth(1).expect("operation id");
+        after
+            .trim_start_matches('"')
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or_default()
+            .parse()
+            .expect("numeric operation id")
     }
 
     fn url_encode(value: &str) -> String {

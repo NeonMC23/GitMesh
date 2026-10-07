@@ -356,6 +356,201 @@ function emptyModel() {
   contains(JSON.stringify(rows), 'project root', 'the root repository is labelled');
 })();
 
+// ------------------------------------------------------------------ setup --
+
+function sampleInspection() {
+  return {
+    kind: 'inspection',
+    root: '/home/dev/MyProject',
+    exists: true,
+    suggestedName: 'MyProject',
+    isGitMeshProject: false,
+    manifest: { path: '/home/dev/MyProject/.gitmesh/project.toml', exists: false, error: null },
+    rootIsRepository: false,
+    enclosingRepository: null,
+    repositories: [],
+    candidates: [
+      {
+        name: 'engine', path: 'engine', depth: 0, files: 0, subtreeFiles: 12,
+        isRepository: false, hasGitDir: false, hasCommits: false, branch: null, remote: null,
+        trackedByRoot: 2, nestedRepositories: [], suggested: true, suggestedId: 'myproject-engine',
+        children: []
+      },
+      {
+        name: 'vendor', path: 'engine/vendor', depth: 1, files: 0, subtreeFiles: 3,
+        isRepository: true, hasGitDir: true, hasCommits: true, branch: 'main', remote: '/tmp/vendor.git',
+        trackedByRoot: 0, nestedRepositories: [], suggested: false, suggestedId: 'myproject-vendor',
+        children: []
+      }
+    ],
+    notices: ['nothing unusual'],
+    truncated: false
+  };
+}
+
+(function inspectionTests() {
+  var summary = GitMesh.inspectionSummary(sampleInspection());
+  equal(summary.candidateCount, 2, 'every selectable directory is counted');
+  equal(summary.isProject, false, 'a plain directory is not a project');
+  equal(summary.manifestExists, false, 'no manifest yet');
+  equal(GitMesh.selectableDirectories(sampleInspection()).length, 2,
+    'the tree is flattened into one list');
+  var directories = GitMesh.selectableDirectories(sampleInspection());
+  equal(directories[0].suggestedId, 'myproject-engine',
+    'the suggested id comes from the inspection');
+  equal(directories[1].trackedByRoot, 0, 'ownership facts are carried through');
+  equal(GitMesh.selectableDirectories(sampleInspection())[1].isRepository, true,
+    'existing repositories are marked');
+})();
+
+(function formTests() {
+  var form = {
+    root: '/home/dev/MyProject', name: 'MyProject', publish: false, firstCommit: '',
+    repositories: [{ path: 'engine', id: 'myproject-engine', provider: '' }]
+  };
+  equal(GitMesh.setupFormProblem(form), null, 'a complete form passes');
+
+  var relative = Object.assign({}, form, { root: 'MyProject' });
+  contains(GitMesh.setupFormProblem(relative), 'absolute path',
+    'the project root must be absolute');
+  equal(GitMesh.setupFormProblem(Object.assign({}, form, { root: '' })), 'Enter the directory of the project.',
+    'an empty root is refused');
+  contains(GitMesh.setupFormProblem(Object.assign({}, form, {
+    repositories: [{ path: 'engine', id: '' }]
+  })), 'every repository in the manifest has one', 'a nameless repository is refused');
+  contains(GitMesh.setupFormProblem(Object.assign({}, form, {
+    repositories: [{ path: 'engine', id: 'same' }, { path: 'tools', id: 'same' }]
+  })), 'used twice', 'duplicate names are refused');
+  contains(GitMesh.setupFormProblem(Object.assign({}, form, {
+    publish: true, firstCommit: '   '
+  })), 'message of the first commit', 'a first publish needs a message');
+  contains(GitMesh.setupFormProblem(Object.assign({}, form, {
+    repositories: [{ path: 'engine', id: 'x', provider: 'github', owner: '', name: '' }]
+  })), 'GitHub owner', 'a hosted repository needs an owner');
+  equal(GitMesh.setupFormProblem(Object.assign({}, form, {
+    publish: true, firstCommit: 'Initial commit'
+  })), null, 'a first publish with a message passes');
+})();
+
+(function recordTests() {
+  var record = GitMesh.repositoryRecord({
+    path: 'engine/src', id: 'myproject-engine', create: true, untrack: false,
+    provider: '', remote: 'git@github.com:acme/engine.git'
+  });
+  contains(record, 'path=engine%2Fsrc', 'paths are escaped inside the record');
+  contains(record, 'id=myproject-engine', 'the id travels as it is');
+  contains(record, 'create=yes', 'checkboxes become yes/no');
+  contains(record, 'remote=git%40github.com%3Aacme%2Fengine.git', 'remote URLs are escaped');
+  equal(record.indexOf(';') > 0, true, 'the separators stay literal for the server');
+  equal(GitMesh.repositoryRecord({ path: 'tools', id: 'tools', create: false, untrack: true })
+    .indexOf('remote='), -1, 'no remote field without a remote');
+  contains(GitMesh.repositoryRecord({
+    path: 'engine', id: 'engine', provider: 'github', owner: 'acme', name: 'my-engine',
+    scheme: 'https', visibility: 'private'
+  }), 'provider=github;owner=acme;name=my-engine;scheme=https;visibility=private',
+  'a hosted repository is described by its provider fields');
+})();
+
+(function planSummaryTests() {
+  var plan = {
+    id: 'abc123', ready: true, noop: false, summary: '5 change(s)',
+    project: { name: 'MyProject', root: '/home/dev/MyProject', manifest: '/home/dev/MyProject/.gitmesh/project.toml' },
+    manifest: 'version = 1\n',
+    repositories: [
+      { id: 'root', path: '.', create: true, exists: true, remoteAction: 'none', untrack: false, sentence: 'create a Git repository' },
+      { id: 'engine', path: 'engine', create: true, exists: true, remoteAction: 'add', untrack: true, sentence: 'create + origin',
+        hosted: { fullName: 'acme/engine', visibility: 'private', command: 'gh repo create acme/engine --private', note: 'note', webUrl: 'https://github.com/acme/engine', createsRepository: false } },
+      { id: 'tools', path: 'tools', create: false, exists: true, remoteAction: 'keep', untrack: false, sentence: 'keep', hosted: null }
+    ],
+    steps: [
+      { kind: 'create-repository', heading: 'Repositories', target: 'engine', path: 'engine', detail: 'git init', state: 'planned', reason: null },
+      { kind: 'write-manifest', heading: 'Manifest', target: 'manifest', path: '.gitmesh/project.toml', detail: 'write', state: 'already', reason: 'identical' }
+    ],
+    counts: { planned: 4, already: 1, blocked: 0, createRepositories: 2 },
+    safety: ['no existing .git directory is deleted'],
+    blockers: [], warnings: [], notices: [],
+    publish: { message: 'Initial commit', repositories: ['engine'], sentence: 'after the manifest is written, ...', safety: 'files stay' }
+  };
+  var summary = GitMesh.setupPlanSummary(plan);
+  equal(summary.ready, true, 'readiness comes from the plan');
+  equal(summary.creates.length, 2, 'created repositories are grouped');
+  equal(summary.adopts.length, 1, 'adopted repositories are grouped');
+  equal(summary.addsRemote.length, 1, 'added remotes are grouped');
+  equal(summary.replacesRemote.length, 0, 'replacing a remote is only listed when the plan does it');
+  equal(summary.untracks.length, 1, 'untrack steps are grouped');
+  equal(summary.hosted.length, 1, 'hosted remotes are grouped');
+  equal(summary.planned, 4, 'counts come from the plan');
+  equal(summary.publish.message, 'Initial commit', 'the follow-up is carried through');
+  equal(GitMesh.stepStateLabel('already'), 'already in place', 'states are named in words');
+  equal(GitMesh.stepStateLabel('blocked'), 'refused', 'refusals are named plainly');
+
+  var commands = GitMesh.hostedCommands(plan);
+  equal(commands.length, 1, 'only hosted repositories produce commands');
+  contains(commands[0].command, 'gh repo create acme/engine', 'the command comes from the provider layer');
+  equal(commands[0].createsRepository, false, 'GitMesh never creates the repository itself');
+
+  var blocked = GitMesh.setupPlanSummary({ ready: false, blockers: ['nope: overlap'], repositories: [], steps: [] });
+  equal(blocked.ready, false, 'a refused plan is not ready');
+  equal(blocked.blockers.length, 1, 'the reasons are visible');
+})();
+
+(function resultTests() {
+  var rows = [
+    { id: 'create-repository:engine', status: 'success' },
+    { id: 'configure-remote:engine', status: 'success' },
+    { id: 'create-repository:tools', status: 'failed' }
+  ];
+  var payload = {
+    opened: false,
+    setup: {
+      kind: 'setup', status: 'partial', sentence: 'Project setup completed with errors',
+      summary: 'Project setup completed with errors · 6 done · 1 failed', exitCode: 1,
+      counts: { succeeded: 6, skipped: 1, failed: 1 },
+      manifest: '/home/dev/MyProject/.gitmesh/project.toml',
+      validation: {
+        ok: false,
+        repositories: [{ id: 'tools', path: 'tools', ok: false, issues: ['not a Git repository'] }],
+        issues: ['repository "tools" is not a Git repository yet']
+      }
+    },
+    publish: [{ operation: 'First push', error: 'no remote configured' }]
+  };
+  var text = GitMesh.setupResultText(payload, rows);
+  equal(text.status, 'partial', 'the status comes from the core');
+  equal(text.succeeded, 6, 'counts come from the core');
+  equal(text.validationOk, false, 'validation is reported honestly');
+  equal(text.problems.length, 1, 'the failing rows are named');
+  equal(text.opened, false, 'a partial setup does not open a project');
+  contains(text.validationIssues[0], 'not a Git repository', 'the issues are carried through');
+
+  var publish = GitMesh.publishResultText(payload.publish);
+  equal(publish.problems.length, 1, 'follow-up problems are surfaced');
+  contains(publish.problems[0], 'First push', 'the follow-up problem names the operation');
+  equal(GitMesh.publishResultText(null), null, 'no follow-up, nothing to report');
+})();
+
+(function progressTests() {
+  var events = [
+    { type: 'started', operation: 'Project setup', sentence: 'Creating the project',
+      repositories: [
+        { id: 'create-repository:root', path: '.', role: 'Repository', detail: 'git init' },
+        { id: 'write-manifest:manifest', path: '.gitmesh/project.toml', role: 'Manifest', detail: 'write' }
+      ] },
+    { type: 'repository', phase: 'running', id: 'create-repository:root', path: '.', role: 'Repository' },
+    { type: 'outcome', id: 'create-repository:root', path: '.', role: 'Repository',
+      outcome: 'success', symbol: '✓', summary: 'created a Git repository' },
+    { type: 'finished', kind: 'complete', opened: true }
+  ];
+  var folded = GitMesh.setupProgressRows(events, []);
+  equal(folded.rows.length, 2, 'every planned step gets a row, even before it runs');
+  equal(folded.rows[0].status, 'success', 'outcomes are folded in');
+  equal(folded.rows[1].status, 'pending', 'steps that never ran stay pending');
+  equal(folded.rows[0].role, 'Repository', 'the role is kept for the row label');
+  equal(folded.rows[0].label, 'Repository · create-repository:root', 'rows name the step and its target');
+  equal(folded.rows[1].role, 'Manifest', 'steps are not repositories, and the label says so');
+  equal(GitMesh.outcomeSymbol('success'), '✓', 'the symbol vocabulary is unchanged');
+})();
+
 // ----------------------------------------------------------------- result --
 
 if (failures.length) {

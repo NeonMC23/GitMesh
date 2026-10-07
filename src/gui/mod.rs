@@ -40,13 +40,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::error::{Error, Result};
+use crate::git::GitRunner;
 use crate::json::Json;
 use crate::model::{PhysicalRepository, RepositoryRole};
+use crate::ops::RepositorySelection;
 use crate::ops::{
     BranchAction, BranchOptions, CommitOptions, OperationObserver, OperationReport, OutcomeKind,
     PullStrategy, PushOptions, RepoOutcome, SyncOptions,
 };
 use crate::service::{self, ProjectSession};
+use crate::setup::{self, SetupObserver, SetupPlan, SetupRequest, SetupStepKind};
 
 /// Default port of the local interface.
 pub const DEFAULT_PORT: u16 = 7345;
@@ -283,6 +286,10 @@ struct GuiState {
     error: Option<String>,
     configuration: bool,
     dry_run: bool,
+    /// Runner used by the setup wizard, which works *before* a project exists.
+    runner: GitRunner,
+    /// Set when `git` itself is unavailable, so the wizard can say so.
+    runner_error: Option<String>,
 }
 
 impl Gui {
@@ -298,6 +305,10 @@ impl Gui {
                 err.is_configuration_error() || matches!(err, Error::ProjectNotFound { .. }),
             ),
         };
+        let (runner, runner_error) = match GitRunner::detect() {
+            Ok(runner) => (runner, None),
+            Err(err) => (GitRunner::default(), Some(err.to_string())),
+        };
         Gui {
             state: Mutex::new(GuiState {
                 start,
@@ -305,6 +316,8 @@ impl Gui {
                 error,
                 configuration,
                 dry_run,
+                runner,
+                runner_error,
             }),
             operations: Mutex::new(Operations::default()),
         }
@@ -336,11 +349,15 @@ impl Gui {
 
     /// The model currently shown by the interface.
     pub fn model(&self) -> String {
+        self.model_json().to_pretty_string()
+    }
+
+    /// The current interface model as structured data.
+    fn model_json(&self) -> Json {
         let state = self.state.lock().expect("state lock");
         match &state.session {
-            Some(session) => editor::project_model(session, state.dry_run).to_pretty_string(),
-            None => editor::empty_model(&state.start, state.error.as_deref(), state.configuration)
-                .to_pretty_string(),
+            Some(session) => editor::project_model(session, state.dry_run),
+            None => editor::empty_model(&state.start, state.error.as_deref(), state.configuration),
         }
     }
 
@@ -356,6 +373,15 @@ impl Gui {
                     .to_string(),
             );
         }
+        self.adopt(path)
+    }
+
+    /// Open a project from inside a running operation.
+    ///
+    /// Only the setup operation uses this, and only for the project it just created: the
+    /// busy check exists so that a *user* cannot switch projects under a running commit,
+    /// while the setup is the operation and finishes by adopting its own result.
+    fn adopt(&self, path: &Path) -> std::result::Result<(), String> {
         let normalized = crate::paths::lexical_normalize(path);
         match ProjectSession::open(&normalized) {
             Ok(session) => {
@@ -378,6 +404,92 @@ impl Gui {
                 Err(message)
             }
         }
+    }
+
+    /// The directory the interface was started in (and last looked at).
+    pub fn start_directory(&self) -> PathBuf {
+        self.state.lock().expect("state lock").start.clone()
+    }
+
+    /// Git runner, or the reason there is none.
+    fn runner(&self) -> std::result::Result<GitRunner, String> {
+        let state = self.state.lock().expect("state lock");
+        match &state.runner_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.runner.clone()),
+        }
+    }
+
+    /// Inspect a directory as a candidate project root. Read-only.
+    pub fn inspect_directory(&self, path: &Path) -> std::result::Result<setup::Inspection, String> {
+        let runner = self.runner()?;
+        let path = crate::paths::absolute(path).map_err(|err| err.to_string())?;
+        let inspection = setup::inspect(&path, &runner).map_err(|err| err.to_string())?;
+        let mut state = self.state.lock().expect("state lock");
+        state.start = path;
+        Ok(inspection)
+    }
+
+    /// Turn a setup request into a plan. Read-only: nothing is created.
+    pub fn plan_setup(&self, request: &SetupRequest) -> std::result::Result<SetupPlan, String> {
+        let runner = self.runner()?;
+        setup::plan(request, &runner).map_err(|err| err.to_string())
+    }
+
+    /// Apply a setup in the background and return its id.
+    ///
+    /// The request is planned again here and the identifier is compared with the plan
+    /// the user reviewed: if the directory changed in between, the plan differs and the
+    /// setup is refused instead of executing something nobody saw.
+    pub fn start_setup(
+        self: &Arc<Self>,
+        request: SetupRequest,
+        reviewed_plan: Option<&str>,
+    ) -> std::result::Result<u64, SetupRefusal> {
+        if self.is_busy() {
+            let running = self.running_label().unwrap_or_default();
+            return Err(SetupRefusal::Busy(format!(
+                "'{running}' is still running; wait for it to finish"
+            )));
+        }
+        let runner = self.runner().map_err(SetupRefusal::Refused)?;
+        let plan =
+            setup::plan(&request, &runner).map_err(|err| SetupRefusal::Refused(err.to_string()))?;
+
+        if let Some(reviewed) = reviewed_plan {
+            if reviewed != plan.id {
+                return Err(SetupRefusal::PlanChanged(Box::new(plan)));
+            }
+        }
+        if !plan.is_ready() {
+            return Err(SetupRefusal::Blocked(Box::new(plan)));
+        }
+
+        let dry_run = self.dry_run();
+        let (id, events) = {
+            let mut operations = self.operations.lock().expect("operations lock");
+            operations.sequence += 1;
+            let id = operations.sequence;
+            let events = Arc::new(EventLog::default());
+            operations.current = Some(OperationEntry {
+                id,
+                label: "Project setup".to_string(),
+                events: Arc::clone(&events),
+                result: String::new(),
+            });
+            (id, events)
+        };
+
+        let gui = Arc::clone(self);
+        std::thread::spawn(move || {
+            let result = run_setup(&gui, &plan, dry_run, id, &events);
+            events.finish();
+            let mut operations = gui.operations.lock().expect("operations lock");
+            if let Some(current) = operations.current.as_mut().filter(|entry| entry.id == id) {
+                current.result = result;
+            }
+        });
+        Ok(id)
     }
 
     /// Start an operation in the background and return its id.
@@ -431,6 +543,11 @@ impl Gui {
             }
         });
         Ok(id)
+    }
+
+    /// The open project session, if any.
+    fn session(&self) -> Option<ProjectSession> {
+        self.state.lock().expect("state lock").session.clone()
     }
 
     /// The event stream of an operation, while it is still retained.
@@ -603,6 +720,339 @@ fn run_operation(
             .to_pretty_string()
         }
     }
+}
+
+/// Why a setup was not started.
+///
+/// Each variant carries what the interface needs to react: a message, the plan that
+/// changed, or the plan that has blockers.
+#[derive(Debug)]
+pub enum SetupRefusal {
+    /// Another operation is running.
+    Busy(String),
+    /// Something went wrong before planning (no Git, unreadable directory, ...).
+    Refused(String),
+    /// The plan differs from the one the user reviewed: review it again.
+    PlanChanged(Box<SetupPlan>),
+    /// The plan cannot be applied as it is.
+    Blocked(Box<SetupPlan>),
+}
+
+/// Run a setup, streaming one event per step, and open the project when it worked.
+///
+/// Like [`run_operation`], this contains no project logic of its own: it calls
+/// [`setup::apply`] and turns the steps into events.
+fn run_setup(
+    gui: &Arc<Gui>,
+    plan: &SetupPlan,
+    dry_run: bool,
+    id: u64,
+    events: &Arc<EventLog>,
+) -> String {
+    let started = Instant::now();
+    let runner = match gui.runner() {
+        Ok(runner) => runner,
+        Err(error) => {
+            events.push(Json::object([
+                ("type", Json::from("failed")),
+                ("id", Json::from(id as i64)),
+                ("message", Json::from(error)),
+                ("configuration", Json::from(true)),
+                ("at", Json::from(elapsed_ms(started))),
+            ]));
+            return Json::object([
+                ("status", Json::from("failed")),
+                ("error", Json::from("git is not available")),
+            ])
+            .to_pretty_string();
+        }
+    };
+
+    // The rows the interface shows before the first step starts: the planned steps, in
+    // execution order, so progress is visible from the beginning.
+    let rows: Vec<Json> = plan
+        .planned_steps()
+        .map(|step| {
+            Json::object([
+                ("id", Json::from(setup_row_id(step.kind, &step.target))),
+                ("path", Json::from(step.path.clone())),
+                ("role", Json::from(setup_step_role(step.kind))),
+                ("detail", Json::from(step.detail.clone())),
+            ])
+        })
+        .collect();
+    events.push(Json::object([
+        ("type", Json::from("started")),
+        ("id", Json::from(id as i64)),
+        ("operation", Json::from("Project setup")),
+        (
+            "sentence",
+            Json::from(format!("Creating the project '{}'", plan.name)),
+        ),
+        ("dryRun", Json::from(dry_run)),
+        ("total", Json::from(rows.len())),
+        ("repositories", Json::array(rows)),
+        ("plan", service::setup_plan_view_json(plan)),
+        ("at", Json::from(elapsed_ms(started))),
+    ]));
+
+    let start_sink = Arc::clone(events);
+    let end_sink = Arc::clone(events);
+    let mut on_step = move |step: &crate::setup::SetupStep| {
+        start_sink.push(Json::object([
+            ("type", Json::from("repository")),
+            ("phase", Json::from("running")),
+            ("id", Json::from(setup_row_id(step.kind, &step.target))),
+            ("path", Json::from(step.path.clone())),
+            ("role", Json::from(setup_step_role(step.kind))),
+            ("detail", Json::from(step.detail.clone())),
+            ("at", Json::from(elapsed_ms(started))),
+        ]));
+    };
+    let mut on_outcome = move |outcome: &crate::setup::SetupStepOutcome| {
+        end_sink.push(Json::object([
+            ("type", Json::from("outcome")),
+            (
+                "id",
+                Json::from(setup_row_id(outcome.kind, &outcome.target)),
+            ),
+            ("path", Json::from(outcome.path.clone())),
+            ("role", Json::from(setup_step_role(outcome.kind))),
+            ("outcome", Json::from(outcome.outcome.label())),
+            ("symbol", Json::from(outcome.symbol())),
+            ("summary", Json::from(outcome.summary.clone())),
+            (
+                "details",
+                Json::array(outcome.details.iter().map(|d| Json::from(d.as_str()))),
+            ),
+            ("at", Json::from(elapsed_ms(started))),
+        ]));
+    };
+    let mut observer = SetupObserver::silent()
+        .on_step(&mut on_step)
+        .on_outcome(&mut on_outcome);
+
+    let result = setup::apply(plan, dry_run, &runner, &mut observer);
+    let setup_json = service::setup_result_view_json(&result);
+
+    // A created project is opened immediately: the user lands in the normal interface
+    // without restarting anything.
+    // A complete setup hands the interface to the project it just created, with no restart.
+    // A partial one stays in the wizard with the failing steps on screen, because adopting a
+    // half-built project would hide what still has to be fixed.
+    let opened = if result.is_success() && result.manifest_path.is_some() && !dry_run {
+        gui.adopt(&plan.root).is_ok()
+    } else {
+        false
+    };
+
+    // The plan's follow-up, if it has one: one commit, one push, through the ordinary
+    // operations and only in the repositories the plan listed.
+    let mut publish_json = Json::Null;
+    if opened {
+        if let Some(publish) = plan.first_publish() {
+            if let Some(session) = gui.session() {
+                publish_json = run_first_publish(&session, &publish, dry_run, events, started);
+            }
+        }
+    }
+
+    let model = gui.model_json();
+    events.push(Json::object([
+        ("type", Json::from("finished")),
+        ("id", Json::from(id as i64)),
+        ("operation", Json::from("Project setup")),
+        ("kind", Json::from(result.kind.label())),
+        ("dryRun", Json::from(result.dry_run)),
+        ("exitCode", Json::from(result.exit_code() as i64)),
+        ("setup", setup_json.clone()),
+        (
+            "summary",
+            Json::object([(
+                "outcome",
+                Json::object([
+                    ("kind", Json::from(result.kind.label())),
+                    ("success", Json::from(result.is_success())),
+                    ("exitCode", Json::from(result.exit_code() as i64)),
+                ]),
+            )]),
+        ),
+        ("opened", Json::from(opened)),
+        ("publish", publish_json.clone()),
+        ("model", model.clone()),
+        ("at", Json::from(elapsed_ms(started))),
+    ]));
+    Json::object([
+        ("status", Json::from("finished")),
+        ("setup", setup_json),
+        ("publish", publish_json),
+        ("opened", Json::from(opened)),
+        ("model", model),
+    ])
+    .to_pretty_string()
+}
+
+/// Row id of one setup step.
+///
+/// Two steps can concern the same target — the metadata directory and the manifest are
+/// both `manifest` — so the kind is part of the id and every row stays its own row.
+fn setup_row_id(kind: SetupStepKind, target: &str) -> String {
+    format!("{}:{target}", kind.label())
+}
+
+/// Short role label of a setup step, the way the interface names the row.
+fn setup_step_role(kind: SetupStepKind) -> &'static str {
+    match kind {
+        SetupStepKind::CreateMetadataDir => "Metadata",
+        SetupStepKind::CreateRepository => "Repository",
+        SetupStepKind::ConfigureRemote => "Remote",
+        SetupStepKind::UntrackFromRoot => "Root index",
+        SetupStepKind::WriteManifest => "Manifest",
+    }
+}
+
+/// Run the plan's first publish: one ordinary commit, then one ordinary push.
+///
+/// Nothing is invented here. The commit and the push go through the same core operations
+/// the buttons in the project view use, restricted to the repositories the plan listed, so
+/// staging rules, the single message, upstream handling, conflict reporting and partial
+/// failures behave exactly as they do everywhere else in GitMesh.
+fn run_first_publish(
+    session: &ProjectSession,
+    publish: &crate::setup::FirstPublish,
+    dry_run: bool,
+    events: &Arc<EventLog>,
+    started: Instant,
+) -> Json {
+    /// Which of the two ordinary operations a round is running.
+    enum Stage {
+        Commit,
+        Push,
+    }
+
+    let selection = RepositorySelection::Ids(publish.repositories.clone());
+    let mut commit_options = CommitOptions::new(publish.message.clone());
+    commit_options.selection = selection.clone();
+    commit_options.dry_run = dry_run;
+    // A repository the first commit does not touch is not reported: after a setup most
+    // repositories are simply clean, and listing them all would bury the useful rows.
+    commit_options.quiet_clean = true;
+    let push_options = PushOptions {
+        selection,
+        dry_run,
+        ..PushOptions::default()
+    };
+
+    let mut sections: Vec<Json> = Vec::new();
+    for (label, prefix, stage) in [
+        ("First commit", "commit", Stage::Commit),
+        ("First push", "push", Stage::Push),
+    ] {
+        let mut on_start = publish_start(events, label, prefix, started);
+        let mut on_end = publish_finish(events, label, prefix, started);
+        let mut observer = OperationObserver::silent()
+            .on_start(&mut on_start)
+            .on_end(&mut on_end);
+        let result = match stage {
+            Stage::Commit => session.commit_observed(&commit_options, &mut observer),
+            Stage::Push => session.push_observed(&push_options, &mut observer),
+        };
+        sections.push(match result {
+            Ok(report) => Json::object([
+                ("operation", Json::from(label)),
+                (
+                    "report",
+                    service::operation_view_json(&report, &session.status()),
+                ),
+            ]),
+            Err(err) => Json::object([
+                ("operation", Json::from(label)),
+                ("error", Json::from(err.to_string())),
+            ]),
+        });
+    }
+    Json::array(sections)
+}
+
+/// Progress hook for the first publish, when a repository starts.
+///
+/// The id is prefixed so these rows stay apart from the setup rows: the same repository
+/// appears in both lists, and the interface keys rows by id.
+fn publish_start(
+    events: &Arc<EventLog>,
+    label: &str,
+    prefix: &str,
+    started: Instant,
+) -> impl Fn(&PhysicalRepository) {
+    let sink = Arc::clone(events);
+    let label = label.to_string();
+    let prefix = prefix.to_string();
+    move |repo: &PhysicalRepository| {
+        sink.push(publish_event(
+            "repository",
+            &prefix,
+            &label,
+            &repo.id,
+            &repo.relative_slash(),
+            started,
+            None,
+        ));
+    }
+}
+
+/// Progress hook for the first publish, when a repository is done.
+fn publish_finish(
+    events: &Arc<EventLog>,
+    label: &str,
+    prefix: &str,
+    started: Instant,
+) -> impl Fn(&RepoOutcome) {
+    let sink = Arc::clone(events);
+    let label = label.to_string();
+    let prefix = prefix.to_string();
+    move |outcome: &RepoOutcome| {
+        sink.push(publish_event(
+            "outcome",
+            &prefix,
+            &label,
+            &outcome.id,
+            &outcome.path,
+            started,
+            Some(outcome),
+        ));
+    }
+}
+
+/// One row of the first-publish progress list.
+fn publish_event(
+    kind: &str,
+    prefix: &str,
+    label: &str,
+    id: &str,
+    path: &str,
+    started: Instant,
+    outcome: Option<&RepoOutcome>,
+) -> Json {
+    let mut fields: Vec<(String, Json)> = vec![
+        ("type".into(), Json::from(kind)),
+        ("id".into(), Json::from(format!("{prefix}:{id}"))),
+        ("path".into(), Json::from(path.to_string())),
+        ("role".into(), Json::from(label.to_string())),
+        ("at".into(), Json::from(elapsed_ms(started))),
+    ];
+    match outcome {
+        None => fields.push(("phase".into(), Json::from("running"))),
+        Some(outcome) => {
+            fields.push(("outcome".into(), Json::from(outcome.kind.label())));
+            fields.push(("symbol".into(), Json::from(outcome.kind.symbol())));
+            fields.push(("summary".into(), Json::from(outcome.summary.clone())));
+            fields.push((
+                "details".into(),
+                Json::array(outcome.details.iter().map(|d| Json::from(d.as_str()))),
+            ));
+        }
+    }
+    Json::object(fields)
 }
 
 /// Map one GUI operation onto the existing core operations.
@@ -817,6 +1267,179 @@ mod tests {
         assert!(fixture
             .git_ok("engine", &["log", "-1", "--pretty=%s"])
             .contains("one logical commit"));
+    }
+
+    /// A plain directory outside the project, with files but no Git: the wizard's input.
+    fn plain_directory(fixture: &RepoFixture, label: &str) -> PathBuf {
+        let path = fixture.outside_path().join(label);
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::create_dir_all(path.join("engine")).unwrap();
+        std::fs::write(path.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(path.join("engine/lib.rs"), "pub fn go() {}\n").unwrap();
+        path
+    }
+
+    fn setup_request(root: &Path) -> SetupRequest {
+        SetupRequest {
+            root: root.to_path_buf(),
+            name: "MyProject".into(),
+            create_root_repository: true,
+            set_git_remote: true,
+            repositories: vec![crate::setup::RepositoryRequest {
+                path: "engine".into(),
+                create: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_wizard_inspects_plans_and_setups_a_project_then_opens_it() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_directory(&fixture, "MyProject");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+
+        // Inspecting a directory that is not a project is read-only and says so.
+        let inspection = gui.inspect_directory(&plain).expect("inspect");
+        assert!(!inspection.is_gitmesh_project);
+        assert_eq!(inspection.suggested_name, "MyProject");
+        assert!(
+            !plain.join(".gitmesh").exists(),
+            "inspecting created nothing"
+        );
+
+        // Planning is read-only too, and refuses to run a plan nobody reviewed.
+        let request = setup_request(&plain);
+        let plan = gui.plan_setup(&request).expect("plan");
+        assert!(plan.is_ready(), "{:?}", plan.blockers);
+        assert!(!plain.join(".gitmesh").exists(), "planning created nothing");
+        match gui.start_setup(request.clone(), Some("some-other-plan")) {
+            Err(SetupRefusal::PlanChanged(reviewed)) => assert!(reviewed.is_ready()),
+            other => panic!("a plan that changed must be refused, got {other:?}"),
+        }
+        assert!(
+            !plain.join(".gitmesh").exists(),
+            "a refused plan created nothing"
+        );
+
+        // The confirmed plan runs, streams its steps, and opens the project.
+        let id = gui
+            .start_setup(request.clone(), Some(&plan.id))
+            .expect("setup starts");
+        let events = collect(&gui, id).join("\n");
+        assert!(
+            events.contains("\"operation\":\"Project setup\""),
+            "{events}"
+        );
+        assert!(events.contains("\"type\":\"outcome\""), "{events}");
+        assert!(
+            events.contains("\"id\":\"create-repository:engine\""),
+            "{events}"
+        );
+        assert!(events.contains("\"role\":\"Manifest\""), "{events}");
+        assert!(events.contains("\"opened\":true"), "{events}");
+
+        let model = gui.model();
+        assert!(model.contains("\"kind\": \"project\""), "{model}");
+        assert!(model.contains("\"name\": \"MyProject\""), "{model}");
+        assert!(plain.join(".gitmesh/project.toml").is_file());
+        assert!(plain.join("engine/.git/HEAD").is_file());
+
+        // A second run reports what already exists instead of redoing it.
+        let again = gui.plan_setup(&request).expect("plan again");
+        assert!(again.created_repositories().count() == 0);
+        assert!(
+            again.already_satisfied().count() >= 2,
+            "{}",
+            again.summary()
+        );
+    }
+
+    #[test]
+    fn a_blocked_setup_is_refused_with_the_plan_that_explains_why() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_directory(&fixture, "Blocked");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+
+        // Two selections that overlap cannot both own the same directory.
+        let mut request = setup_request(&plain);
+        request.repositories = vec![
+            crate::setup::RepositoryRequest {
+                path: "engine".into(),
+                create: true,
+                ..Default::default()
+            },
+            crate::setup::RepositoryRequest {
+                path: "engine/src".into(),
+                create: true,
+                ..Default::default()
+            },
+        ];
+        match gui.start_setup(request, None) {
+            Err(SetupRefusal::Blocked(plan)) => {
+                assert!(!plan.is_ready());
+                assert!(!plan.blockers.is_empty());
+            }
+            other => panic!("expected a blocked plan, got {other:?}"),
+        }
+        assert!(!plain.join(".gitmesh").exists(), "nothing was created");
+    }
+
+    #[test]
+    fn the_first_publish_goes_through_the_ordinary_commit_and_push() {
+        let fixture = RepoFixture::named("demo");
+        let plain = plain_directory(&fixture, "Publish");
+        let remote = fixture.create_bare("publish-engine.git");
+        let gui = Arc::new(Gui::new(plain.clone(), false));
+
+        let mut request = setup_request(&plain);
+        request.repositories = vec![crate::setup::RepositoryRequest {
+            path: "engine".into(),
+            create: true,
+            remote: Some(remote.to_string_lossy().to_string()),
+            ..Default::default()
+        }];
+        request.publish_first_commit = Some("Initial commit".into());
+
+        let plan = gui.plan_setup(&request).expect("plan");
+        let publish = plan
+            .first_publish()
+            .expect("the plan promises a first publish");
+        assert_eq!(publish.repositories, ["engine"]);
+        let id = gui
+            .start_setup(request, Some(&plan.id))
+            .expect("setup starts");
+        let events = collect(&gui, id).join("\n");
+
+        // The follow-up is visible as its own rows, clearly labelled.
+        assert!(events.contains("\"role\":\"First commit\""), "{events}");
+        assert!(events.contains("\"role\":\"First push\""), "{events}");
+        assert!(events.contains("\"id\":\"push:engine\""), "{events}");
+        let stored = gui.stored_report(id).expect("stored report");
+        assert!(stored.contains("\"publish\""), "{stored}");
+
+        // The commit is a real commit with the message the plan promised, and it is on the
+        // remote: the ordinary operations did the work, and they did it from the plan.
+        let engine = plain.join("engine");
+        assert!(engine.join(".git").is_dir());
+        let runner = fixture.runner();
+        let local = runner
+            .repo(&engine)
+            .run_checked(&["log", "-1", "--pretty=%s"])
+            .expect("log in the created repository");
+        assert!(
+            local.contains("Initial commit"),
+            "the first commit carries the planned message: {local}"
+        );
+        let pushed = runner
+            .repo(&remote)
+            .run_checked(&["log", "-1", "--pretty=%s"])
+            .expect("log in the bare remote");
+        assert!(
+            pushed.contains("Initial commit"),
+            "the first commit reached the remote: {pushed}"
+        );
     }
 
     #[test]

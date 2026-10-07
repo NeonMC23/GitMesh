@@ -484,37 +484,7 @@ pub fn check_assignment(
         ));
     }
 
-    // Already assigned?
-    if let Some(existing) = project.repository_for_relative(&relative) {
-        if !existing.is_root() {
-            blockers.push(format!(
-                "directory '{}' is already assigned to repository '{}'",
-                to_slash(&relative),
-                existing.id
-            ));
-        }
-    }
-
-    // Overlaps with an assigned repository?
-    for repo in project.external_repositories() {
-        let assigned = paths::lexical_normalize(&repo.relative_path);
-        if paths::is_strict_ancestor(&assigned, &relative) {
-            blockers.push(format!(
-                "directory '{}' is inside the repository '{}' ('{}'); nested repository \
-                 boundaries are not supported",
-                to_slash(&relative),
-                repo.id,
-                to_slash(&assigned)
-            ));
-        } else if paths::is_strict_ancestor(&relative, &assigned) {
-            blockers.push(format!(
-                "directory '{}' contains the configured repository '{}' ('{}')",
-                to_slash(&relative),
-                repo.id,
-                to_slash(&assigned)
-            ));
-        }
-    }
+    blockers.extend(ownership_conflicts(project, &relative));
 
     let is_repository = exists && is_repository_root(&absolute, true, runner);
     let requires_git_init = exists && !is_repository;
@@ -534,6 +504,65 @@ pub fn check_assignment(
         blockers,
         warnings,
     })
+}
+
+/// Configuration conflicts that stop a directory from becoming an external repository.
+///
+/// This is the *pure* half of [`check_assignment`]: it looks only at the project
+/// configuration and the path, never at the filesystem or at Git. The setup planner runs
+/// exactly these rules on a project it is still assembling, so the wizard and the CLI
+/// cannot disagree about which layouts are legal.
+pub fn assignment_conflicts(project: &GitMeshProject, relative_path: &Path) -> Vec<String> {
+    let relative = paths::lexical_normalize(relative_path);
+    let mut blockers = Vec::new();
+    if paths::is_root_relative(&relative) {
+        blockers.push("the project root is always the root repository".to_string());
+    }
+    blockers.extend(ownership_conflicts(project, &relative));
+    blockers
+}
+
+/// Ownership problems: the path is already assigned, or it overlaps an assigned one.
+fn ownership_conflicts(project: &GitMeshProject, relative: &Path) -> Vec<String> {
+    let mut blockers = Vec::new();
+
+    // Already assigned? (`repository_for_relative` also answers for paths *inside* an
+    // assigned repository, which is a different problem and is reported as an overlap
+    // below, with the accuracy the message needs.)
+    if let Some(existing) = project.repository_for_relative(relative) {
+        let same_path =
+            paths::lexical_normalize(&existing.relative_path) == paths::lexical_normalize(relative);
+        if !existing.is_root() && same_path {
+            blockers.push(format!(
+                "directory '{}' is already assigned to repository '{}'",
+                to_slash(relative),
+                existing.id
+            ));
+        }
+    }
+
+    // Overlaps with an assigned repository?
+    for repo in project.external_repositories() {
+        let assigned = paths::lexical_normalize(&repo.relative_path);
+        if paths::is_strict_ancestor(&assigned, relative) {
+            blockers.push(format!(
+                "directory '{}' is inside the repository '{}' ('{}'); nested repository \
+                 boundaries are not supported",
+                to_slash(relative),
+                repo.id,
+                to_slash(&assigned)
+            ));
+        } else if paths::is_strict_ancestor(relative, &assigned) {
+            blockers.push(format!(
+                "directory '{}' contains the configured repository '{}' ('{}')",
+                to_slash(relative),
+                repo.id,
+                to_slash(&assigned)
+            ));
+        }
+    }
+
+    blockers
 }
 
 /// Options used when a user marks a directory as an external repository.
@@ -574,25 +603,18 @@ pub fn assign_repository(
                 to_slash(&check.relative_path)
             )]));
         }
-        let repo = runner.repo(&absolute);
-        repo.run_checked(&["init", "-q", "-b", "main"])?;
+        initialize_repository(&absolute, runner)?;
     }
 
     if let Some(remote) = options.remote_url.as_deref() {
-        let repo = runner.repo(&absolute);
-        let has_origin = !repo.remotes()?.iter().all(|r| r.name != "origin");
-        if has_origin {
-            repo.run_checked(&["remote", "set-url", "origin", remote])?;
-        } else {
-            repo.run_checked(&["remote", "add", "origin", remote])?;
-        }
+        ensure_origin_remote(&absolute, remote, runner)?;
     }
 
     let id = options
         .id
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default_id(&check.relative_path, project));
+        .unwrap_or_else(|| suggest_id(&check.relative_path, project));
 
     let mut candidate = project.clone();
     candidate.repositories.push(PhysicalRepository {
@@ -679,12 +701,7 @@ pub fn set_repository_remote(
                     path: repo.absolute_path.clone(),
                 });
             }
-            let has_origin = git_repo.remotes()?.iter().any(|r| r.name == "origin");
-            if has_origin {
-                git_repo.run_checked(&["remote", "set-url", "origin", url])?;
-            } else {
-                git_repo.run_checked(&["remote", "add", "origin", url])?;
-            }
+            ensure_origin_remote(&repo.absolute_path, url, runner)?;
         }
     }
 
@@ -696,7 +713,12 @@ pub fn set_repository_remote(
     Ok(candidate)
 }
 
-fn default_id(relative: &Path, project: &GitMeshProject) -> String {
+/// Suggest a logical id for a directory: its lowercased name, made safe for the manifest
+/// and made unique within the project.
+///
+/// Both the CLI (`configure add` without `--id`) and the setup plan use this, so a
+/// repository created by the wizard has the same name the CLI would have chosen.
+pub fn suggest_id(relative: &Path, project: &GitMeshProject) -> String {
     let base = relative
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase().replace(' ', "-"))
@@ -720,6 +742,99 @@ fn default_id(relative: &Path, project: &GitMeshProject) -> String {
         }
     }
     format!("{base}-{}", project.len())
+}
+
+/// What [`ensure_origin_remote`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginChange {
+    /// `origin` did not exist and now points at the URL.
+    Added,
+    /// `origin` existed with a different URL and was updated.
+    Updated,
+    /// `origin` already pointed at that URL; nothing was run.
+    Unchanged,
+}
+
+impl OriginChange {
+    /// Stable machine-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            OriginChange::Added => "added",
+            OriginChange::Updated => "updated",
+            OriginChange::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// Create a Git repository at `path` (`git init -q -b main`).
+///
+/// This is the only place that raises a repository for GitMesh, and it is shared by
+/// `configure add --git-init`, `init --git-init` and the setup wizard so that all of them
+/// create identical repositories. Callers check [`is_repository_root`] first, so an
+/// existing repository is never re-initialised.
+pub fn initialize_repository(path: &Path, runner: &GitRunner) -> Result<()> {
+    let repo = runner.repo(path);
+    repo.run_checked(&["init", "-q", "-b", "main"])?;
+    Ok(())
+}
+
+/// Point `origin` of the repository at `repo_path` to `url`, adding it when missing.
+///
+/// Only the remote itself is touched: no fetch, no push, no branch is created. An
+/// existing `origin` pointing elsewhere is replaced by *this* function, so callers that
+/// must not overwrite a remote (the setup wizard) decide that before calling, and report
+/// the change to the user.
+pub fn ensure_origin_remote(
+    repo_path: &Path,
+    url: &str,
+    runner: &GitRunner,
+) -> Result<OriginChange> {
+    let repo = runner.repo(repo_path);
+    let existing = repo
+        .remotes()?
+        .into_iter()
+        .find(|remote| remote.name == "origin")
+        .and_then(|remote| remote.fetch_url().map(str::to_string));
+    match existing {
+        Some(current) if current == url => Ok(OriginChange::Unchanged),
+        Some(_) => {
+            repo.run_checked(&["remote", "set-url", "origin", url])?;
+            Ok(OriginChange::Updated)
+        }
+        None => {
+            repo.run_checked(&["remote", "add", "origin", url])?;
+            Ok(OriginChange::Added)
+        }
+    }
+}
+
+/// URL currently configured as `origin`, if there is one.
+pub fn origin_url(repo_path: &Path, runner: &GitRunner) -> Result<Option<String>> {
+    Ok(runner
+        .repo(repo_path)
+        .remotes()?
+        .into_iter()
+        .find(|remote| remote.name == "origin")
+        .and_then(|remote| remote.fetch_url().map(str::to_string)))
+}
+
+/// Git repositories nested inside `dir`, as paths relative to `dir`.
+///
+/// Read-only and shallow in intent: it answers "does this directory contain another
+/// repository?" for a directory that is about to become a repository of its own, which
+/// is exactly when GitMesh has to warn instead of guessing. Reuses the project scanner
+/// so nesting is detected the same way everywhere.
+pub fn scan_nested(dir: &Path, runner: &GitRunner) -> Vec<PathBuf> {
+    let options = ScanOptions::default();
+    match scan_project(dir, &options, runner) {
+        Ok(scan) => scan
+            .repositories
+            .into_iter()
+            .filter(|repo| !repo.is_project_root)
+            .map(|repo| repo.relative_path)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// A fresh project for `root`, containing only the root repository.

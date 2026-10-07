@@ -35,6 +35,7 @@ use crate::ops::{
     OutcomeKind, PushOptions, SyncOptions,
 };
 use crate::paths::to_slash;
+use crate::setup;
 
 // ------------------------------------------------------------------- session --
 
@@ -901,6 +902,441 @@ pub fn operation_view_json(report: &OperationReport, status: &ProjectStatus) -> 
         (
             "status",
             Json::array(status.repositories.iter().map(repository_view_json)),
+        ),
+    ])
+}
+
+// ------------------------------------------------------------ setup views --
+
+/// Machine-readable view of a hosted remote GitMesh would configure.
+///
+/// Only a *description*: no repository is created and no credential is involved.
+pub fn github_remote_view_json(plan: &crate::providers::github::GitHubRemotePlan) -> Json {
+    Json::object([
+        ("provider", Json::from("github")),
+        ("owner", Json::from(plan.owner.clone())),
+        ("name", Json::from(plan.name.clone())),
+        ("fullName", Json::from(plan.full_name())),
+        ("url", Json::from(plan.url.clone())),
+        ("sshUrl", Json::from(plan.ssh_url.clone())),
+        ("httpsUrl", Json::from(plan.https_url.clone())),
+        ("webUrl", Json::from(plan.web_url.clone())),
+        ("visibility", Json::from(plan.visibility.label())),
+        ("command", Json::from(plan.create_command())),
+        ("note", Json::from(plan.note())),
+        ("createsRepository", Json::from(false)),
+    ])
+}
+
+/// Machine-readable view of a directory the user is about to turn into a project.
+///
+/// Everything here is a fact found on disk; the wizard changes nothing until the user
+/// confirms a plan.
+pub fn inspection_view_json(inspection: &setup::Inspection, name_hint: Option<&str>) -> Json {
+    // A scratch project, only used to offer the wizard default ids that are unique inside
+    // the selection. It is never written anywhere and never validated as configuration.
+    let mut scratch = crate::discovery::initial_project(
+        &inspection.root,
+        name_hint.map(|name| name.to_string()),
+        None,
+        None,
+    )
+    .unwrap_or_else(|_| {
+        crate::discovery::initial_project(&inspection.root, None, None, None)
+            .expect("a project with no remote is always valid")
+    });
+    let mut next_id = |node: &setup::CandidateDirectory| -> String {
+        let id = setup::suggested_repository_id(&scratch, &node.relative_path);
+        scratch.repositories.push(crate::model::PhysicalRepository {
+            id: id.clone(),
+            role: crate::model::RepositoryRole::External,
+            relative_path: node.relative_path.clone(),
+            remote_url: None,
+            branch: None,
+            absolute_path: inspection.root.join(&node.relative_path),
+        });
+        id
+    };
+    Json::object([
+        ("kind", Json::from("inspection")),
+        ("root", Json::from(to_slash(&inspection.root))),
+        ("exists", Json::from(inspection.exists)),
+        (
+            "suggestedName",
+            Json::from(inspection.suggested_name.clone()),
+        ),
+        (
+            "isGitMeshProject",
+            Json::from(inspection.is_gitmesh_project),
+        ),
+        (
+            "manifest",
+            Json::object([
+                ("path", Json::from(to_slash(&inspection.manifest_path))),
+                ("exists", Json::from(inspection.manifest_path.is_file())),
+                (
+                    "error",
+                    Json::opt(inspection.manifest_error.clone().map(Json::from)),
+                ),
+                (
+                    "text",
+                    Json::opt(inspection.manifest_text.clone().map(Json::from)),
+                ),
+            ]),
+        ),
+        (
+            "rootIsRepository",
+            Json::from(inspection.root_is_repository),
+        ),
+        (
+            "enclosingRepository",
+            Json::opt(
+                inspection
+                    .enclosing_repository
+                    .as_ref()
+                    .map(|path| Json::from(to_slash(path))),
+            ),
+        ),
+        (
+            "repositories",
+            Json::array(inspection.repositories.iter().map(|repo| {
+                Json::object([
+                    ("id", Json::from(to_slash(&repo.relative_path))),
+                    ("path", Json::from(to_slash(&repo.relative_path))),
+                    ("isRoot", Json::from(repo.is_project_root)),
+                    ("hasCommits", Json::from(repo.has_commits)),
+                    ("branch", Json::opt(repo.branch.clone().map(Json::from))),
+                    ("remote", Json::opt(repo.remote_url.clone().map(Json::from))),
+                    ("trackedFiles", Json::from(repo.tracked_files)),
+                    (
+                        "nestedInside",
+                        Json::opt(
+                            repo.nested_inside
+                                .as_ref()
+                                .map(|path| Json::from(to_slash(path))),
+                        ),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "candidates",
+            Json::array(
+                inspection
+                    .candidates
+                    .iter()
+                    .map(|node| candidate_view_json(node, &mut next_id)),
+            ),
+        ),
+        (
+            "notices",
+            Json::array(inspection.notices.iter().map(|n| Json::from(n.as_str()))),
+        ),
+        ("truncated", Json::from(inspection.truncated)),
+    ])
+}
+
+fn candidate_view_json(
+    node: &setup::CandidateDirectory,
+    next_id: &mut impl FnMut(&setup::CandidateDirectory) -> String,
+) -> Json {
+    Json::object([
+        ("name", Json::from(node.name.clone())),
+        ("path", Json::from(to_slash(&node.relative_path))),
+        ("depth", Json::from(node.depth)),
+        ("files", Json::from(node.files)),
+        ("subtreeFiles", Json::from(node.subtree_files)),
+        ("isRepository", Json::from(node.is_repository)),
+        ("hasGitDir", Json::from(node.has_git_dir)),
+        ("hasCommits", Json::from(node.has_commits)),
+        ("branch", Json::opt(node.branch.clone().map(Json::from))),
+        ("remote", Json::opt(node.remote.clone().map(Json::from))),
+        ("trackedByRoot", Json::from(node.tracked_by_root)),
+        (
+            "nestedRepositories",
+            Json::array(
+                node.nested_repositories
+                    .iter()
+                    .map(|path| Json::from(to_slash(path))),
+            ),
+        ),
+        ("suggested", Json::from(node.suggested())),
+        ("suggestedId", Json::from(next_id(node))),
+        (
+            "children",
+            Json::array(
+                node.children
+                    .iter()
+                    .map(|child| candidate_view_json(child, next_id)),
+            ),
+        ),
+    ])
+}
+
+/// Machine-readable view of a setup plan: what the review screen renders, and what the
+/// interface sends back when the user confirms (the `id` must match).
+pub fn setup_plan_view_json(plan: &setup::SetupPlan) -> Json {
+    Json::object([
+        ("kind", Json::from("plan")),
+        ("id", Json::from(plan.id.clone())),
+        ("ready", Json::from(plan.is_ready())),
+        ("noop", Json::from(plan.is_noop())),
+        ("summary", Json::from(plan.summary())),
+        (
+            "project",
+            Json::object([
+                ("name", Json::from(plan.name.clone())),
+                ("root", Json::from(to_slash(&plan.root))),
+                ("manifest", Json::from(to_slash(&plan.manifest_path))),
+            ]),
+        ),
+        ("manifest", Json::from(plan.manifest.clone())),
+        (
+            "repositories",
+            Json::array(plan.repositories.iter().map(|repo| {
+                Json::object([
+                    ("id", Json::from(repo.id.clone())),
+                    ("path", Json::from(repo.path.clone())),
+                    ("role", Json::from(repo.role.label())),
+                    ("remote", Json::opt(repo.remote.clone().map(Json::from))),
+                    ("provider", Json::opt(repo.provider.clone().map(Json::from))),
+                    (
+                        // Everything the review step needs about a hosted remote, built by
+                        // the provider layer: the URLs, the visibility and the exact command
+                        // that creates the repository *on the provider*, which GitMesh does
+                        // not do and does not need a token for.
+                        "hosted",
+                        match &repo.hosted {
+                            Some(hosted) => {
+                                let visibility = repo
+                                    .visibility
+                                    .as_deref()
+                                    .map(crate::providers::github::Visibility::parse)
+                                    .unwrap_or(crate::providers::github::Visibility::Private);
+                                match crate::providers::github::plan_remote(
+                                    &hosted.owner,
+                                    &hosted.name,
+                                    crate::providers::github::RemoteScheme::Ssh,
+                                    visibility,
+                                ) {
+                                    Ok(hosted_plan) => github_remote_view_json(&hosted_plan),
+                                    Err(_) => Json::Null,
+                                }
+                            }
+                            None => Json::Null,
+                        },
+                    ),
+                    (
+                        "visibility",
+                        Json::opt(repo.visibility.clone().map(Json::from)),
+                    ),
+                    ("exists", Json::from(repo.exists)),
+                    ("isRepository", Json::from(repo.is_repository)),
+                    ("hasCommits", Json::from(repo.has_commits)),
+                    ("branch", Json::opt(repo.branch.clone().map(Json::from))),
+                    (
+                        "currentOrigin",
+                        Json::opt(repo.current_origin.clone().map(Json::from)),
+                    ),
+                    ("create", Json::from(repo.create)),
+                    ("remoteAction", Json::from(repo.remote_action.label())),
+                    ("trackedByRoot", Json::from(repo.tracked_by_root)),
+                    ("untrack", Json::from(repo.untrack)),
+                    ("changes", Json::from(repo.will_change())),
+                    ("sentence", Json::from(repo.sentence())),
+                ])
+            })),
+        ),
+        (
+            // The follow-up the caller runs after a successful apply. It is part of the
+            // preview because it is part of the plan: the executor does not invent it.
+            "publish",
+            match plan.first_publish() {
+                Some(publish) => Json::object([
+                    ("message", Json::from(publish.message.clone())),
+                    (
+                        "repositories",
+                        Json::array(
+                            publish
+                                .repositories
+                                .iter()
+                                .map(|id| Json::from(id.as_str())),
+                        ),
+                    ),
+                    ("sentence", Json::from(publish.sentence())),
+                    (
+                        "safety",
+                        Json::from(
+                            "the first commit is made once the manifest exists, with the \
+                             message shown here, and only in the repositories listed above",
+                        ),
+                    ),
+                ]),
+                None => Json::Null,
+            },
+        ),
+        (
+            "steps",
+            Json::array(plan.steps.iter().map(|step| {
+                Json::object([
+                    ("kind", Json::from(step.kind.label())),
+                    ("heading", Json::from(step.kind.heading())),
+                    ("target", Json::from(step.target.clone())),
+                    ("path", Json::from(step.path.clone())),
+                    ("detail", Json::from(step.detail.clone())),
+                    ("state", Json::from(step.state.label())),
+                    ("reason", Json::opt(step.state.reason().map(Json::from))),
+                ])
+            })),
+        ),
+        (
+            "counts",
+            Json::object([
+                ("planned", Json::from(plan.planned_steps().count())),
+                ("already", Json::from(plan.already_satisfied().count())),
+                ("blocked", Json::from(plan.blocked_steps().count())),
+                (
+                    "createRepositories",
+                    Json::from(plan.created_repositories().count()),
+                ),
+            ]),
+        ),
+        (
+            "safety",
+            Json::array(plan.safety.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "blockers",
+            Json::array(plan.blockers.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(plan.warnings.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "notices",
+            Json::array(plan.notices.iter().map(|line| Json::from(line.as_str()))),
+        ),
+    ])
+}
+
+/// Machine-readable view of a setup result, including what still has to be fixed.
+pub fn setup_result_view_json(result: &setup::SetupResult) -> Json {
+    let validation = match &result.validation {
+        Some(report) => validation_view_json(report),
+        None => Json::Null,
+    };
+    Json::object([
+        ("kind", Json::from("setup")),
+        ("planId", Json::from(result.plan_id.clone())),
+        ("status", Json::from(result.kind.label())),
+        ("sentence", Json::from(result.kind.sentence())),
+        ("summary", Json::from(result.summary())),
+        ("dryRun", Json::from(result.dry_run)),
+        ("exitCode", Json::from(result.exit_code() as i64)),
+        (
+            "counts",
+            Json::object([
+                ("succeeded", Json::from(result.succeeded())),
+                ("skipped", Json::from(result.skipped())),
+                ("failed", Json::from(result.failures().count())),
+            ]),
+        ),
+        (
+            "steps",
+            Json::array(result.outcomes.iter().map(|outcome| {
+                Json::object([
+                    ("kind", Json::from(outcome.kind.label())),
+                    ("heading", Json::from(outcome.kind.heading())),
+                    ("target", Json::from(outcome.target.clone())),
+                    ("path", Json::from(outcome.path.clone())),
+                    ("outcome", Json::from(outcome.outcome.label())),
+                    ("symbol", Json::from(outcome.symbol())),
+                    ("summary", Json::from(outcome.summary.clone())),
+                    (
+                        "details",
+                        Json::array(outcome.details.iter().map(|d| Json::from(d.as_str()))),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "outcomes",
+            Json::array(result.outcomes.iter().map(|outcome| {
+                Json::object([
+                    ("id", Json::from(outcome.target.clone())),
+                    ("path", Json::from(outcome.path.clone())),
+                    ("outcome", Json::from(outcome.outcome.label())),
+                    ("symbol", Json::from(outcome.symbol())),
+                    ("summary", Json::from(outcome.summary.clone())),
+                ])
+            })),
+        ),
+        (
+            "manifest",
+            Json::opt(
+                result
+                    .manifest_path
+                    .as_ref()
+                    .map(|path| Json::from(to_slash(path))),
+            ),
+        ),
+        (
+            "project",
+            match &result.project {
+                Some(project) => Json::object([
+                    ("name", Json::from(project.name.clone())),
+                    ("root", Json::from(to_slash(&project.root))),
+                    ("repositories", Json::from(project.len() as i64)),
+                ]),
+                None => Json::Null,
+            },
+        ),
+        ("validation", validation),
+        (
+            "refused",
+            Json::array(result.refused.iter().map(|line| Json::from(line.as_str()))),
+        ),
+    ])
+}
+
+/// Machine-readable view of the validation of a project.
+pub fn validation_view_json(report: &setup::ValidationReport) -> Json {
+    Json::object([
+        ("ok", Json::from(report.ok)),
+        ("root", Json::from(to_slash(&report.root))),
+        ("manifest", Json::from(to_slash(&report.manifest_path))),
+        (
+            "project",
+            Json::opt(report.project_name.clone().map(Json::from)),
+        ),
+        (
+            "repositories",
+            Json::array(report.repositories.iter().map(|check| {
+                Json::object([
+                    ("id", Json::from(check.id.clone())),
+                    ("path", Json::from(check.path.clone())),
+                    ("role", Json::from(check.role.label())),
+                    ("exists", Json::from(check.exists)),
+                    ("isRepository", Json::from(check.is_repository)),
+                    (
+                        "manifestRemote",
+                        Json::opt(check.manifest_remote.clone().map(Json::from)),
+                    ),
+                    ("origin", Json::opt(check.origin.clone().map(Json::from))),
+                    ("remoteOk", Json::from(check.remote_ok)),
+                    ("branch", Json::opt(check.branch.clone().map(Json::from))),
+                    ("ok", Json::from(check.is_ok())),
+                    (
+                        "issues",
+                        Json::array(check.issues.iter().map(|i| Json::from(i.as_str()))),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "issues",
+            Json::array(report.issues.iter().map(|i| Json::from(i.as_str()))),
         ),
     ])
 }

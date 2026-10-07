@@ -158,6 +158,177 @@ pub fn remote_url_for(target: &GitHubTarget, prefer_ssh: bool) -> String {
     }
 }
 
+/// How GitMesh would reach a hosted repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteScheme {
+    /// `git@github.com:owner/name.git`
+    Ssh,
+    /// `https://github.com/owner/name.git`
+    Https,
+}
+
+impl RemoteScheme {
+    /// Stable machine-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            RemoteScheme::Ssh => "ssh",
+            RemoteScheme::Https => "https",
+        }
+    }
+
+    /// Parse the label used by the interface and the command line.
+    pub fn parse(value: &str) -> Option<RemoteScheme> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ssh" => Some(RemoteScheme::Ssh),
+            "https" | "http" => Some(RemoteScheme::Https),
+            _ => None,
+        }
+    }
+}
+
+/// Visibility of a repository on the host.
+///
+/// GitMesh never creates a repository, so this value is only used to phrase the command
+/// the user runs themselves; it defaults to the safest option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// Only the owner and collaborators see it.
+    Private,
+    /// Anyone can read it.
+    Public,
+    /// Visible to the organisation (the GitHub Enterprise/org option).
+    Internal,
+}
+
+impl Visibility {
+    /// Stable machine-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Visibility::Private => "private",
+            Visibility::Public => "public",
+            Visibility::Internal => "internal",
+        }
+    }
+
+    /// Parse a label coming from a front end; unknown values fall back to private.
+    pub fn parse(value: &str) -> Visibility {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "public" => Visibility::Public,
+            "internal" => Visibility::Internal,
+            _ => Visibility::Private,
+        }
+    }
+
+    /// The `gh` flag for this visibility.
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            Visibility::Private => "--private",
+            Visibility::Public => "--public",
+            Visibility::Internal => "--internal",
+        }
+    }
+}
+
+/// What a front end needs to configure (and describe) a GitHub remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRemotePlan {
+    /// Organisation or user.
+    pub owner: String,
+    /// Repository name.
+    pub name: String,
+    /// Remote URL GitMesh would record.
+    pub url: String,
+    /// The same repository over SSH.
+    pub ssh_url: String,
+    /// The same repository over HTTPS.
+    pub https_url: String,
+    /// Web URL for humans.
+    pub web_url: String,
+    /// Visibility the user selected (for the instructions only).
+    pub visibility: Visibility,
+}
+
+impl GitHubRemotePlan {
+    /// `owner/name`.
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    /// The command that creates the repository on GitHub.
+    ///
+    /// GitMesh never runs it: it has no GitHub API client, no tokens and no business
+    /// creating hosted repositories behind the user's back. The command is returned so
+    /// the user can copy it, and the same text is shown in the interface.
+    pub fn create_command(&self) -> String {
+        format!(
+            "gh repo create {}/{} {}",
+            self.owner,
+            self.name,
+            self.visibility.gh_flag()
+        )
+    }
+
+    /// The sentence a front end shows next to the remote.
+    pub fn note(&self) -> String {
+        format!(
+            "GitMesh does not create repositories on GitHub. Create {}/{} ({}) there first \
+             — for example `{}` — then push. No token is needed, and none is stored.",
+            self.owner,
+            self.name,
+            self.visibility.label(),
+            self.create_command()
+        )
+    }
+}
+
+/// Validate an owner/repository pair and describe the remote GitMesh would configure.
+///
+/// Rejects anything that could not be a GitHub path instead of guessing, so a typo
+/// surfaces while the user is still looking at the field.
+pub fn plan_remote(
+    owner: &str,
+    name: &str,
+    scheme: RemoteScheme,
+    visibility: Visibility,
+) -> std::result::Result<GitHubRemotePlan, String> {
+    let owner = owner.trim();
+    let name = name.trim().trim_end_matches(".git");
+    if owner.is_empty() {
+        return Err("the GitHub organisation or user is required".to_string());
+    }
+    if name.is_empty() {
+        return Err("the GitHub repository name is required".to_string());
+    }
+    for (label, value) in [("organisation", owner), ("repository name", name)] {
+        if value.contains('/') || value.contains(char::is_whitespace) {
+            return Err(format!(
+                "the GitHub {label} '{value}' must not contain spaces or '/'"
+            ));
+        }
+        if value.starts_with('.') || value.starts_with('-') {
+            return Err(format!("the GitHub {label} '{value}' is not valid"));
+        }
+    }
+    let repo = GitHubRepo {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        remote_url: String::new(),
+        https: scheme == RemoteScheme::Https,
+    };
+    Ok(GitHubRemotePlan {
+        owner: repo.owner.clone(),
+        name: repo.name.clone(),
+        url: match scheme {
+            RemoteScheme::Ssh => repo.ssh_url(),
+            RemoteScheme::Https => repo.https_url(),
+        },
+        ssh_url: repo.ssh_url(),
+        https_url: repo.https_url(),
+        web_url: repo.web_url(),
+        visibility,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +349,50 @@ mod tests {
             assert_eq!(parsed_owner, owner, "{url}");
             assert_eq!(parsed_name, name, "{url}");
         }
+    }
+
+    #[test]
+    fn plans_a_github_remote_and_never_invents_credentials() {
+        let plan = plan_remote(
+            "acme",
+            "myproject-engine.git",
+            RemoteScheme::Ssh,
+            Visibility::Private,
+        )
+        .unwrap();
+        assert_eq!(plan.url, "git@github.com:acme/myproject-engine.git");
+        assert_eq!(
+            plan.https_url,
+            "https://github.com/acme/myproject-engine.git"
+        );
+        assert_eq!(plan.web_url, "https://github.com/acme/myproject-engine");
+        assert_eq!(plan.full_name(), "acme/myproject-engine");
+        // The private visibility is the safest default and drives the instructions.
+        assert_eq!(plan.visibility, Visibility::Private);
+        assert_eq!(
+            plan.create_command(),
+            "gh repo create acme/myproject-engine --private"
+        );
+        assert!(plan
+            .note()
+            .contains("does not create repositories on GitHub"));
+        assert!(plan
+            .note()
+            .contains("No token is needed, and none is stored."));
+        assert!(!plan.note().contains("token="));
+        assert_eq!(Visibility::parse("PUBLIC"), Visibility::Public);
+        assert_eq!(Visibility::parse("nonsense"), Visibility::Private);
+        assert_eq!(RemoteScheme::parse("HTTPS"), Some(RemoteScheme::Https));
+        assert_eq!(RemoteScheme::parse("ftp"), None);
+    }
+
+    #[test]
+    fn refuses_impossible_github_names() {
+        assert!(plan_remote("", "engine", RemoteScheme::Ssh, Visibility::Private).is_err());
+        assert!(plan_remote("acme", "  ", RemoteScheme::Ssh, Visibility::Private).is_err());
+        assert!(plan_remote("a/b", "engine", RemoteScheme::Ssh, Visibility::Private).is_err());
+        assert!(plan_remote("acme", "my engine", RemoteScheme::Ssh, Visibility::Private).is_err());
+        assert!(plan_remote("acme", "-engine", RemoteScheme::Ssh, Visibility::Private).is_err());
     }
 
     #[test]

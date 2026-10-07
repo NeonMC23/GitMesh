@@ -49,6 +49,47 @@ mod tests {
         assert!(CLIENT_TESTS.contains("assert("));
     }
 
+    /// Every element the script looks up must exist in the page, or be created by the
+    /// script itself — the list below is exactly that second case.
+    #[test]
+    fn every_element_the_script_uses_exists() {
+        const CREATED_BY_THE_SCRIPT: [&str; 4] = [
+            "btn-setup-open-existing",
+            "setup-confirm-remotes",
+            "setup-confirm-remotes-plan",
+            "setup-overwrite",
+        ];
+        let mut checked = 0;
+        let mut rest = APP_JS;
+        while let Some(start) = rest.find("$('") {
+            rest = &rest[start + 3..];
+            let end = rest.find('\'').expect("a closing quote");
+            let id = &rest[..end];
+            rest = &rest[end + 1..];
+            // `$('x' + y)` builds an id at run time: nothing static to check.
+            if rest.starts_with(" + ") || rest.starts_with('+') {
+                continue;
+            }
+            // Skips ids that are built at run time (`$('panel-' + name)`) and literals the
+            // script looks up somewhere else.
+            if id.contains(' ') || id.contains('+') || id.is_empty() {
+                continue;
+            }
+            checked += 1;
+            if CREATED_BY_THE_SCRIPT.contains(&id) {
+                continue;
+            }
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "the script looks up #{id}, which the page does not define"
+            );
+        }
+        assert!(
+            checked > 50,
+            "the check itself must stay meaningful: {checked}"
+        );
+    }
+
     #[test]
     fn the_interface_loads_nothing_from_the_network() {
         // The preview environment and normal use both require self-contained assets.
