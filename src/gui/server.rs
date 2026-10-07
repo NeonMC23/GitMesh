@@ -25,7 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::gui::{asset, Gui, GuiOperation, SetupRefusal};
+use crate::gui::{asset, Gui, GuiOperation, ManagementRefusal, SetupRefusal};
+use crate::manage::{RepositoryIntent, RepositoryManagementRequest};
 use crate::setup::{RepositoryRequest, SetupRequest};
 
 /// Maximum size of a request head, in bytes.
@@ -240,6 +241,16 @@ fn handle(mut stream: TcpStream, gui: &Arc<Gui>, allowed_hosts: &[String]) -> st
         ("POST", "/api/setup/apply") => {
             write_response(&mut stream, setup_apply_response(gui, &request))
         }
+        ("GET", "/api/repositories") => write_response(&mut stream, repositories_response(gui)),
+        ("POST", "/api/repository/inspect") => {
+            write_response(&mut stream, repository_inspect_response(gui, &request))
+        }
+        ("POST", "/api/repository/plan") => {
+            write_response(&mut stream, repository_plan_response(gui, &request))
+        }
+        ("POST", "/api/repository/apply") => {
+            write_response(&mut stream, repository_apply_response(gui, &request))
+        }
         ("POST", "/api/open") => write_response(&mut stream, open_response(gui, &request)),
         ("POST", "/api/dry-run") => write_response(&mut stream, dry_run_response(gui, &request)),
         ("POST", "/api/commit") => write_response(&mut stream, commit_response(gui, &request)),
@@ -400,13 +411,13 @@ fn setup_apply_response(gui: &Arc<Gui>, request: &Request) -> Response {
             409,
             "Conflict",
             "the directory changed since it was reviewed; check the plan again",
-            &plan,
+            crate::service::setup_plan_view_json(&plan),
         ),
         Err(SetupRefusal::Blocked(plan)) => plan_refusal_response(
             422,
             "Unprocessable Entity",
             "this plan cannot be applied as it is",
-            &plan,
+            crate::service::setup_plan_view_json(&plan),
         ),
     }
 }
@@ -415,16 +426,159 @@ fn plan_refusal_response(
     status: u16,
     reason: &'static str,
     message: &str,
-    plan: &crate::setup::SetupPlan,
+    plan: crate::json::Json,
 ) -> Response {
     Response::json(
-        crate::json::Json::object([
-            ("error", crate::json::Json::from(message)),
-            ("plan", crate::service::setup_plan_view_json(plan)),
-        ])
-        .to_pretty_string(),
+        crate::json::Json::object([("error", crate::json::Json::from(message)), ("plan", plan)])
+            .to_pretty_string(),
     )
     .with_status(status, reason)
+}
+
+// ------------------------------------------------------- repository endpoints --
+
+/// The repositories of the open project: configuration, state on disk, and what needs
+/// attention. Read-only, and the same view the CLI and the terminal interface read.
+fn repositories_response(gui: &Arc<Gui>) -> Response {
+    match gui.inspect_repositories() {
+        Ok(inspection) => Response::json(
+            crate::json::Json::object([(
+                "inspection",
+                crate::service::management_inspection_view_json(&inspection),
+            )])
+            .to_pretty_string(),
+        ),
+        Err(message) => Response::error(409, "Conflict", &message),
+    }
+}
+
+/// What would happen to one directory that could become a repository. Read-only.
+fn repository_inspect_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let path = form_value(&request.body, "path").unwrap_or_default();
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Response::error(400, "Bad Request", "the 'path' field is required");
+    }
+    match gui.inspect_repository_candidate(&path) {
+        Ok(candidate) => Response::json(
+            crate::json::Json::object([(
+                "candidate",
+                crate::service::management_candidate_view_json(&candidate),
+            )])
+            .to_pretty_string(),
+        ),
+        Err(message) => Response::error(422, "Unprocessable Entity", &message),
+    }
+}
+
+/// Turn one repository action into a plan. Read-only: a plan configures nothing.
+fn repository_plan_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let management = match repository_request_from_form(&request.body) {
+        Ok(management) => management,
+        Err(message) => return Response::error(400, "Bad Request", &message),
+    };
+    match gui.plan_management(&management) {
+        Ok(plan) => Response::json(
+            crate::json::Json::object([("plan", crate::service::management_plan_view_json(&plan))])
+                .to_pretty_string(),
+        ),
+        Err(message) => Response::error(422, "Unprocessable Entity", &message),
+    }
+}
+
+/// Apply a reviewed plan, in the background, and stream its progress.
+///
+/// The plan id is required for the same reason as in the setup: without it the request
+/// would be a configuration change nobody approved.
+fn repository_apply_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let reviewed = form_value(&request.body, "planId").unwrap_or_default();
+    let reviewed = reviewed.trim().to_string();
+    if reviewed.is_empty() {
+        return Response::error(
+            400,
+            "Bad Request",
+            "the 'planId' field is required: the plan has to be reviewed and confirmed first",
+        );
+    }
+    let management = match repository_request_from_form(&request.body) {
+        Ok(management) => management,
+        Err(message) => return Response::error(400, "Bad Request", &message),
+    };
+    match gui.start_management(management, Some(&reviewed)) {
+        Ok(id) => {
+            let body = crate::json::Json::object([
+                ("id", crate::json::Json::from(id as i64)),
+                (
+                    "events",
+                    crate::json::Json::from(format!("/api/events/{id}")),
+                ),
+            ])
+            .compact();
+            Response::json(body).with_status(202, "Accepted")
+        }
+        Err(ManagementRefusal::Busy(message)) => Response::error(409, "Conflict", &message),
+        Err(ManagementRefusal::Refused(message)) => {
+            Response::error(422, "Unprocessable Entity", &message)
+        }
+        Err(ManagementRefusal::PlanChanged(plan)) => plan_refusal_response(
+            409,
+            "Conflict",
+            "the configuration changed since it was reviewed; check the plan again",
+            crate::service::management_plan_view_json(&plan),
+        ),
+        Err(ManagementRefusal::Blocked(plan)) => plan_refusal_response(
+            422,
+            "Unprocessable Entity",
+            "this plan cannot be applied as it is",
+            crate::service::management_plan_view_json(&plan),
+        ),
+    }
+}
+
+/// Read one repository action out of the panel's form body.
+///
+/// One request is one action, because that is what the interface offers: the review panel
+/// shows exactly one change, and the same request planned elsewhere (the command line, a
+/// script) goes through the same planning and execution code.
+fn repository_request_from_form(
+    body: &str,
+) -> std::result::Result<RepositoryManagementRequest, String> {
+    let intent = form_value(body, "intent").unwrap_or_default();
+    let intent = intent.trim().to_string();
+    let required = |key: &str| -> std::result::Result<String, String> {
+        let value = form_value(body, key).unwrap_or_default().trim().to_string();
+        if value.is_empty() {
+            Err(format!("the '{key}' field is required"))
+        } else {
+            Ok(value)
+        }
+    };
+    let one = match intent.as_str() {
+        "add" => RepositoryIntent::Add {
+            path: required("path")?,
+            id: optional_form(body, "id").unwrap_or_default(),
+            remote: optional_form(body, "remote"),
+            branch: optional_form(body, "branch"),
+            initialize: form_flag(body, "initialize"),
+            configure_remote: form_flag(body, "configureRemote"),
+            untrack_from_root: form_flag(body, "untrack"),
+        },
+        "remove" => RepositoryIntent::Remove {
+            id: required("id")?,
+            confirm_takeover: form_flag(body, "confirmTakeover"),
+        },
+        "rename" => RepositoryIntent::Rename {
+            id: required("id")?,
+            new_id: required("newId")?,
+        },
+        "set-remote" => RepositoryIntent::SetRemote {
+            id: required("id")?,
+            remote: optional_form(body, "remote"),
+            configure: form_flag(body, "configure"),
+        },
+        other => return Err(format!("unknown repository action '{other}'")),
+    };
+    Ok(RepositoryManagementRequest::one(one))
 }
 
 fn operation_response(gui: &Arc<Gui>, operation: GuiOperation) -> Response {
@@ -1305,6 +1459,285 @@ mod tests {
         assert!(setup_request_from_form(&body).is_err());
         assert!(setup_request_from_form("path=&repositories=path=engine").is_err());
         assert!(setup_request_from_form("name=x").is_err());
+    }
+
+    // --------------------------------------------------- repository endpoints --
+
+    /// A project with one repository configured and one directory that is not configured
+    /// yet, so the panel has something to list and something to add.
+    fn project_with_a_candidate() -> RepoFixture {
+        let fixture = RepoFixture::named("panel");
+        fixture.project_with(&[("root", ".")]);
+        fixture.write("engine/lib.rs", "pub fn go() {}\n");
+        // The root repository tracks the file, which is the ownership decision the panel
+        // has to show before the directory becomes a repository of its own.
+        fixture.add_all(".");
+        fixture.commit(".", "root tracks the module");
+        fixture
+    }
+
+    fn open_gui(fixture: &RepoFixture) -> (Arc<Gui>, u16) {
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(Arc::clone(&gui));
+        (gui, port)
+    }
+
+    fn add_body(fields: &[(&str, &str)]) -> String {
+        let mut body = String::from("intent=add");
+        for (key, value) in fields {
+            body.push_str(&format!("&{key}={}", url_encode(value)));
+        }
+        body
+    }
+
+    #[test]
+    fn repository_endpoints_inspect_plan_and_apply_without_a_restart() {
+        let fixture = project_with_a_candidate();
+        let (_gui, port) = open_gui(&fixture);
+
+        // The panel reads the configuration it is going to change.
+        let (status, body) = get(port, "/api/repositories");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"kind\": \"repositories\""), "{body}");
+        assert!(body.contains("\"id\": \"root\""), "{body}");
+        assert!(body.contains("\"needingAttention\": 0"), "{body}");
+        assert!(body.contains("\"path\": \"engine\""), "{body}");
+
+        // Checking a directory answers the questions before the button appears.
+        let (status, body) = post(port, "/api/repository/inspect", "path=engine", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"canAdd\": true"), "{body}");
+        assert!(body.contains("\"isRepository\": false"), "{body}");
+        assert!(body.contains("\"suggestedId\": \"engine\""), "{body}");
+        assert!(
+            body.contains("\"trackedByRoot\": 1"),
+            "the panel is told the root repository owns the file: {body}"
+        );
+        assert!(
+            !fixture.path().join("engine/.git").exists(),
+            "checking created nothing"
+        );
+
+        // A missing path and an empty one are refused, never guessed.
+        let (status, body) = post(port, "/api/repository/inspect", "path=", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("path"), "{body}");
+        let (status, body) = post(port, "/api/repository/inspect", "path=nope", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"exists\": false"), "{body}");
+        assert!(body.contains("\"canAdd\": false"), "{body}");
+
+        // A plan is built from the request, and it is still read-only.
+        let plan_body = add_body(&[
+            ("path", "engine"),
+            ("id", "engine"),
+            ("initialize", "true"),
+            ("untrack", "true"),
+        ]);
+        let (status, body) = post(port, "/api/repository/plan", &plan_body, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"kind\": \"plan\""), "{body}");
+        assert!(body.contains("\"flow\": \"repository\""), "{body}");
+        assert!(body.contains("\"ready\": true"), "{body}");
+        assert!(
+            body.contains("\"kind\": \"initialize-repository\""),
+            "{body}"
+        );
+        assert!(body.contains("\"kind\": \"add-repository\""), "{body}");
+        assert!(body.contains("[[repositories]]"), "{body}");
+        assert!(body.contains("\"safety\""), "{body}");
+        let plan_id = plan_id_from(&body);
+        assert!(
+            !fixture.path().join("engine/.git").exists(),
+            "planning created nothing"
+        );
+        let manifest_before =
+            std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap();
+
+        // Without a reviewed plan id, and with a stale one, nothing runs.
+        let (status, body) = post(port, "/api/repository/apply", &plan_body, None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("reviewed"), "{body}");
+        let stale = format!("{plan_body}&planId=0000000000000000");
+        let (status, body) = post(port, "/api/repository/apply", &stale, None);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("changed since it was reviewed"), "{body}");
+        assert!(
+            body.contains("\"kind\": \"plan\""),
+            "the fresh plan is sent back: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap(),
+            manifest_before,
+            "a refused apply changed nothing"
+        );
+
+        // The confirmed plan runs in the background and streams its steps.
+        let confirmed = format!("{plan_body}&planId={}", url_encode(&plan_id));
+        let (status, body) = post(port, "/api/repository/apply", &confirmed, None);
+        assert_eq!(status, 202, "{body}");
+        let id = id_from(&body);
+        let (status, events) = get(port, &format!("/api/events/{id}"));
+        assert_eq!(status, 200);
+        assert!(events.contains("\"type\":\"started\""), "{events}");
+        assert!(
+            events.contains("\"operation\":\"Repositories\""),
+            "{events}"
+        );
+        assert!(events.contains("\"type\":\"outcome\""), "{events}");
+        assert!(events.contains("\"kind\":\"complete\""), "{events}");
+        assert!(events.contains("\"opened\":true"), "{events}");
+
+        // The project on disk really changed, and the interface shows it: no restart.
+        assert!(fixture.path().join("engine/.git/HEAD").is_file());
+        let manifest =
+            std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap();
+        assert!(manifest.contains("id = \"engine\""), "{manifest}");
+        let (status, model) = get(port, "/api/model");
+        assert_eq!(status, 200);
+        assert!(model.contains("\"id\": \"engine\""), "{model}");
+        let (status, report) = get(port, &format!("/api/report/{id}"));
+        assert_eq!(status, 200);
+        assert!(report.contains("\"flow\": \"repository\""), "{report}");
+        assert!(
+            report.contains("the manifest now lists 'engine' at 'engine'"),
+            "the result carries the evidence that the change happened: {report}"
+        );
+        assert!(
+            report.contains("the directory 'engine' exists"),
+            "and the proof for the directory itself: {report}"
+        );
+
+        // Reading the configuration again reports the repository that is now there.
+        let (status, body) = get(port, "/api/repositories");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"id\": \"engine\""), "{body}");
+        assert!(body.contains("\"repositories\": 2"), "{body}");
+    }
+
+    #[test]
+    fn repository_endpoints_refuse_unknown_actions_and_unconfirmed_removals() {
+        let fixture = project_with_a_candidate();
+        let (_gui, port) = open_gui(&fixture);
+
+        let (status, body) = post(port, "/api/repository/plan", "intent=explode", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("unknown repository action"), "{body}");
+        let (status, body) = post(port, "/api/repository/plan", "intent=add", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("'path' field is required"), "{body}");
+        let (status, body) = post(port, "/api/repository/plan", "intent=rename&id=root", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("'newId' field is required"), "{body}");
+
+        // Removing the repository that owns the project itself is refused by the service.
+        let (status, body) = post(port, "/api/repository/plan", "intent=remove&id=root", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": false"), "{body}");
+        assert!(body.contains("\"kind\": \"plan\""), "{body}");
+
+        // Adopting the directory first, without untracking, leaves the root repository
+        // owning its files: removing it then needs the ownership confirmed.
+        let plan_body = add_body(&[
+            ("path", "engine"),
+            ("id", "engine"),
+            ("initialize", "true"),
+            ("configureRemote", "false"),
+            ("untrack", "false"),
+        ]);
+        let (status, body) = post(port, "/api/repository/plan", &plan_body, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": true"), "{body}");
+        assert!(
+            body.contains("belong to two repositories"),
+            "the ownership warning is in the plan: {body}"
+        );
+        let plan_id = plan_id_from(&body);
+        let confirmed = format!("{plan_body}&planId={}", url_encode(&plan_id));
+        let (status, body) = post(port, "/api/repository/apply", &confirmed, None);
+        assert_eq!(status, 202, "{body}");
+        let id = id_from(&body);
+        let (status, _events) = get(port, &format!("/api/events/{id}"));
+        assert_eq!(status, 200);
+
+        let (status, body) = post(
+            port,
+            "/api/repository/plan",
+            "intent=remove&id=engine",
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": false"), "{body}");
+        assert!(
+            body.contains("hands those files back to the root repository"),
+            "the consequence is stated before anything is written: {body}"
+        );
+        assert!(
+            body.contains("has to be confirmed"),
+            "and the interface is told which confirmation is missing: {body}"
+        );
+        assert!(
+            body.contains("\"state\": \"blocked\""),
+            "the blocked change is a row of the review: {body}"
+        );
+        let (status, body) = post(
+            port,
+            "/api/repository/plan",
+            "intent=remove&id=engine&confirmTakeover=true",
+            None,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": true"), "{body}");
+        assert!(body.contains("\"kind\": \"remove-repository\""), "{body}");
+        assert!(
+            body.contains("its .git, its history and its remote are kept"),
+            "{body}"
+        );
+        assert!(body.contains("\"removals\""), "{body}");
+    }
+
+    #[test]
+    fn a_reviewed_plan_is_refused_when_the_configuration_moved_on() {
+        let fixture = project_with_a_candidate();
+        let (_gui, port) = open_gui(&fixture);
+
+        let plan_body = add_body(&[
+            ("path", "engine"),
+            ("id", "engine"),
+            ("initialize", "true"),
+            ("untrack", "true"),
+        ]);
+        let (status, body) = post(port, "/api/repository/plan", &plan_body, None);
+        assert_eq!(status, 200, "{body}");
+        let plan_id = plan_id_from(&body);
+
+        // Something else changes the project — another tool, a checkout, a hand edit.
+        fixture.write("other.txt", "x\n");
+        let manifest_path = fixture.path().join(".gitmesh/project.toml");
+        let edited = std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("version = 1", "version = 1\n# edited by hand");
+        std::fs::write(&manifest_path, edited).unwrap();
+
+        let confirmed = format!("{plan_body}&planId={}", url_encode(&plan_id));
+        let (status, body) = post(port, "/api/repository/apply", &confirmed, None);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("changed since it was reviewed"), "{body}");
+        assert!(
+            !fixture.path().join("engine/.git").exists(),
+            "nothing was created behind the refusal"
+        );
+    }
+
+    #[test]
+    fn repository_endpoints_are_not_available_without_an_open_project() {
+        let fixture = RepoFixture::named("empty");
+        let (_gui, port) = open_gui(&fixture);
+        let (status, body) = get(port, "/api/repositories");
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("no GitMesh project is open"), "{body}");
+        let (status, body) = post(port, "/api/repository/plan", "intent=add&path=engine", None);
+        assert_eq!(status, 422, "{body}");
     }
 
     #[test]

@@ -42,6 +42,7 @@ offline and deterministically.
 | Unit | `#[cfg(test)]` in each module | Parsing (`status --porcelain=v2`, remotes), path normalisation, manifest validation, ownership, outcome classification, JSON encoding |
 | Library integration | `tests/workflows.rs` | Complete multi-repository workflows: init-free configuration, status/ownership, commit, branch/checkout/merge, pull/push, conflicts, partial failures, idempotency, restart |
 | Application layer | `src/service.rs` | Project opening, unified status, change ownership, operation aggregation, partial failures, JSON view models — the surface every front end consumes |
+| Repository management | `src/manage.rs` | The plan-driven counterpart of `setup` for an existing project: inspection and candidate analysis, duplicate/overlap/path refusals, add / adopt / initialize / untrack / rename / remote / remove, idempotency, partial failures, post-operation evidence |
 | CLI process | `tests/cli.rs` | The real binary: argument parsing, exit codes, rendered output, JSON output, the `gui` command served over a real socket, `ui` fallback without a TTY |
 | UI state machine | `src/ui/app.rs`, `src/ui/mod.rs` | Key-driven flows (commit, branch, setup/assignment, dry-run, input handling) without a terminal |
 | GUI model + HTTP | `src/gui/{mod,editor,server}.rs` | The model the interface renders, request routing, origin/host guards, operation lifecycle (start → SSE events → stored report), asset completeness |
@@ -110,6 +111,32 @@ verify the `.git` directories, the generated manifest, the configured remotes an
 publish on disk, commit and push normally, break a bare remote on purpose to see the
 partial failure reported precisely, rerun the setup to prove it changes nothing, and
 restart the interface. It prints one line per check and exits non-zero on failure.
+
+### Validating repository management by hand
+
+Managing the repositories of an existing project has its own script, because it is the one
+flow that changes the project's layout while the project is open:
+
+```console
+$ cargo build --release && ./tools/repository-workflow.py
+```
+
+It builds `/tmp/gitmesh-repositories-e2e`: a root repository, an existing `renderer`
+repository with its own history and its own bare remote, plain directories, and a fourth
+directory that is deliberately made unwritable. It then walks 20 steps over the real HTTP
+interface and the release binary: inspect a candidate directory, review the plan (including
+the exact manifest it would write and the safety statements), refuse to apply a plan that
+was not reviewed, apply it and read the per-step progress and the evidence per change,
+check on disk that the `.git` exists, the root repository stopped tracking the files and
+nothing else moved, repeat the request to prove it is a no-op, adopt an existing repository
+and prove its history, reflog and remote are untouched, refuse a duplicate id, record and
+then configure and replace a remote (refusing the replacement without explicit intent),
+rename a logical id, remove a repository and prove the directory, `.git`, history and remote
+are still there, confirm a removal that hands files back to the root repository, watch a
+deliberately failing repository produce a partial result with Git's own error, and finally
+check that `gitmesh status`, `configure list --json` and `status --json` see exactly the
+same project (including from a nested directory and with no project at all).
+It uses ports 7414/7415 so it can run alongside the other two scripts.
 
 Debugging a failing scenario: set `GITMESH_TEST_KEEP=1`-style caching is not needed —
 `TempDir` removes its directory on drop, so add a `println!("{}", fixture.path().display())`
@@ -200,6 +227,7 @@ gitmesh/
 │   ├── git/                       Git CLI execution and output parsing
 │   ├── service.rs                 application layer shared by all front ends
 │   ├── setup.rs                   project creation: inspect, plan, apply, verify (plan-driven)
+│   ├── manage.rs                  repository management after creation (plan-driven)
 │   ├── ui/                        terminal interface (state machine + rendering)
 │   ├── gui/                       graphical interface: model, HTTP/SSE server, assets
 │   │   └── static/                index.html, app.css, app.js (embedded at build time)
@@ -207,7 +235,8 @@ gitmesh/
 ├── tools/
 │   ├── rust-env.sh                reproducible local toolchain bootstrap
 │   ├── gui-workflow.py            end-to-end validation of the graphical interface
-│   └── setup-workflow.py          end-to-end validation of project creation (the wizard)
+│   ├── setup-workflow.py          end-to-end validation of project creation (the wizard)
+│   └── repository-workflow.py     end-to-end validation of repository management
 └── tests/
     ├── workflows.rs               library-level multi-repository workflows
     ├── cli.rs                     process-level CLI tests

@@ -42,6 +42,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::git::GitRunner;
 use crate::json::Json;
+use crate::manage::{self, RepositoryManagementRequest, RepositoryPlan};
 use crate::model::{PhysicalRepository, RepositoryRole};
 use crate::ops::RepositorySelection;
 use crate::ops::{
@@ -436,6 +437,106 @@ impl Gui {
         setup::plan(request, &runner).map_err(|err| err.to_string())
     }
 
+    /// Inspect the repositories of the open project. Read-only.
+    ///
+    /// This is the row source of the repositories panel and of the settings screen: what is
+    /// configured, what is on disk, and what deserves attention.
+    pub fn inspect_repositories(
+        &self,
+    ) -> std::result::Result<manage::RepositoryInspection, String> {
+        let session = self
+            .session()
+            .ok_or_else(|| "no GitMesh project is open".to_string())?;
+        let runner = self.runner()?;
+        manage::inspect(session.project(), &runner).map_err(|err| err.to_string())
+    }
+
+    /// Inspect one directory as a candidate repository. Read-only.
+    pub fn inspect_repository_candidate(
+        &self,
+        path: &str,
+    ) -> std::result::Result<manage::CandidateInspection, String> {
+        let session = self
+            .session()
+            .ok_or_else(|| "no GitMesh project is open".to_string())?;
+        let runner = self.runner()?;
+        manage::inspect_candidate(session.project(), path, &runner).map_err(|err| err.to_string())
+    }
+
+    /// Turn a management request into a plan. Read-only: nothing is configured yet.
+    ///
+    /// The open project is the configuration the plan is made from: this is the same kind
+    /// of plan the CLI builds, including the manifest preview it will write.
+    pub fn plan_management(
+        &self,
+        request: &RepositoryManagementRequest,
+    ) -> std::result::Result<RepositoryPlan, String> {
+        let session = self
+            .session()
+            .ok_or_else(|| "no GitMesh project is open".to_string())?;
+        let runner = self.runner()?;
+        manage::plan(session.project(), request, &runner).map_err(|err| err.to_string())
+    }
+
+    /// Apply a management plan in the background and return its id.
+    ///
+    /// The request is planned again here and the identifier is compared with the plan the
+    /// user reviewed, exactly like the setup: if the configuration changed in between, the
+    /// plan differs and the operation is refused instead of touching something nobody saw.
+    pub fn start_management(
+        self: &Arc<Self>,
+        request: RepositoryManagementRequest,
+        reviewed_plan: Option<&str>,
+    ) -> std::result::Result<u64, ManagementRefusal> {
+        if self.is_busy() {
+            let running = self.running_label().unwrap_or_default();
+            return Err(ManagementRefusal::Busy(format!(
+                "'{running}' is still running; wait for it to finish"
+            )));
+        }
+        let session = self
+            .session()
+            .ok_or_else(|| ManagementRefusal::Refused("no GitMesh project is open".to_string()))?;
+        let runner = self.runner().map_err(ManagementRefusal::Refused)?;
+        let plan = manage::plan(session.project(), &request, &runner)
+            .map_err(|err| ManagementRefusal::Refused(err.to_string()))?;
+
+        if let Some(reviewed) = reviewed_plan {
+            if reviewed != plan.id {
+                return Err(ManagementRefusal::PlanChanged(Box::new(plan)));
+            }
+        }
+        if !plan.is_ready() {
+            return Err(ManagementRefusal::Blocked(Box::new(plan)));
+        }
+
+        let dry_run = self.dry_run();
+        let (id, events) = {
+            let mut operations = self.operations.lock().expect("operations lock");
+            operations.sequence += 1;
+            let id = operations.sequence;
+            let events = Arc::new(EventLog::default());
+            operations.current = Some(OperationEntry {
+                id,
+                label: "Repositories".to_string(),
+                events: Arc::clone(&events),
+                result: String::new(),
+            });
+            (id, events)
+        };
+
+        let gui = Arc::clone(self);
+        std::thread::spawn(move || {
+            let result = run_management(&gui, &plan, dry_run, id, &events);
+            events.finish();
+            let mut operations = gui.operations.lock().expect("operations lock");
+            if let Some(current) = operations.current.as_mut().filter(|entry| entry.id == id) {
+                current.result = result;
+            }
+        });
+        Ok(id)
+    }
+
     /// Apply a setup in the background and return its id.
     ///
     /// The request is planned again here and the identifier is compared with the plan
@@ -736,6 +837,154 @@ pub enum SetupRefusal {
     PlanChanged(Box<SetupPlan>),
     /// The plan cannot be applied as it is.
     Blocked(Box<SetupPlan>),
+}
+
+/// Why a repository-management plan was not started.
+///
+/// The same four answers as [`SetupRefusal`], for the same reasons: another operation is
+/// running, the plan cannot be built, the plan changed under the user's eyes, or the plan
+/// has blockers.
+#[derive(Debug)]
+pub enum ManagementRefusal {
+    /// Another operation is running.
+    Busy(String),
+    /// Something went wrong before planning (no project open, no Git, ...).
+    Refused(String),
+    /// The plan differs from the one the user reviewed: review it again.
+    PlanChanged(Box<RepositoryPlan>),
+    /// The plan cannot be applied as it is.
+    Blocked(Box<RepositoryPlan>),
+}
+
+/// Run a repository-management plan, streaming one event per unit of work.
+///
+/// Like [`run_setup`], this holds no project logic: it calls [`manage::apply`], which
+/// verifies every change afterwards, and reopens the project so the interface shows the
+/// configuration that was just written.
+fn run_management(
+    gui: &Arc<Gui>,
+    plan: &RepositoryPlan,
+    dry_run: bool,
+    id: u64,
+    events: &Arc<EventLog>,
+) -> String {
+    let started = Instant::now();
+    let runner = match gui.runner() {
+        Ok(runner) => runner,
+        Err(error) => {
+            events.push(Json::object([
+                ("type", Json::from("failed")),
+                ("id", Json::from(id as i64)),
+                ("message", Json::from(error)),
+                ("configuration", Json::from(true)),
+                ("at", Json::from(elapsed_ms(started))),
+            ]));
+            return Json::object([
+                ("status", Json::from("failed")),
+                ("error", Json::from("git is not available")),
+            ])
+            .to_pretty_string();
+        }
+    };
+
+    // The rows the interface shows before the first action starts: the planned units of
+    // work, in execution order, so progress is visible from the beginning.
+    let rows: Vec<Json> = plan
+        .planned_actions()
+        .map(|action| {
+            Json::object([
+                ("id", Json::from(action.row_id())),
+                ("path", Json::from(action.path.clone())),
+                ("role", Json::from(action.kind.role())),
+                ("detail", Json::from(action.detail.clone())),
+            ])
+        })
+        .collect();
+    events.push(Json::object([
+        ("type", Json::from("started")),
+        ("id", Json::from(id as i64)),
+        ("operation", Json::from("Repositories")),
+        ("sentence", Json::from(plan.summary())),
+        ("dryRun", Json::from(dry_run)),
+        ("total", Json::from(rows.len())),
+        ("repositories", Json::array(rows)),
+        ("plan", service::management_plan_view_json(plan)),
+        ("at", Json::from(elapsed_ms(started))),
+    ]));
+
+    let start_sink = Arc::clone(events);
+    let end_sink = Arc::clone(events);
+    let mut on_action = move |action: &crate::manage::RepositoryAction| {
+        start_sink.push(Json::object([
+            ("type", Json::from("repository")),
+            ("phase", Json::from("running")),
+            ("id", Json::from(action.row_id())),
+            ("path", Json::from(action.path.clone())),
+            ("role", Json::from(action.kind.role())),
+            ("detail", Json::from(action.detail.clone())),
+            ("at", Json::from(elapsed_ms(started))),
+        ]));
+    };
+    let mut on_outcome = move |outcome: &crate::manage::RepositoryActionOutcome| {
+        end_sink.push(Json::object([
+            ("type", Json::from("outcome")),
+            ("id", Json::from(outcome.row_id())),
+            ("path", Json::from(outcome.path.clone())),
+            ("role", Json::from(outcome.kind.role())),
+            ("outcome", Json::from(outcome.outcome.label())),
+            ("symbol", Json::from(outcome.symbol())),
+            ("summary", Json::from(outcome.summary.clone())),
+            (
+                "details",
+                Json::array(outcome.details.iter().map(|d| Json::from(d.as_str()))),
+            ),
+            ("at", Json::from(elapsed_ms(started))),
+        ]));
+    };
+    let mut observer = manage::RepositoryObserver::silent()
+        .on_action(&mut on_action)
+        .on_outcome(&mut on_outcome);
+
+    let result = manage::apply(plan, dry_run, &runner, &mut observer);
+    let result_json = service::management_result_view_json(&result);
+
+    // The configuration changed, so the open project is reloaded: like every other
+    // operation, the interface must show the project as it is now, not as it was.
+    let mut opened = false;
+    if !dry_run && result.is_success() {
+        opened = gui.adopt(&plan.root).is_ok();
+    }
+    let model = gui.model_json();
+    events.push(Json::object([
+        ("type", Json::from("finished")),
+        ("id", Json::from(id as i64)),
+        ("operation", Json::from("Repositories")),
+        ("kind", Json::from(result.kind.label())),
+        ("dryRun", Json::from(result.dry_run)),
+        ("exitCode", Json::from(result.exit_code() as i64)),
+        ("repository", result_json.clone()),
+        (
+            "summary",
+            Json::object([(
+                "outcome",
+                Json::object([
+                    ("kind", Json::from(result.kind.label())),
+                    ("success", Json::from(result.is_success())),
+                    ("exitCode", Json::from(result.exit_code() as i64)),
+                ]),
+            )]),
+        ),
+        ("opened", Json::from(opened)),
+        ("model", model.clone()),
+        ("at", Json::from(elapsed_ms(started))),
+    ]));
+    Json::object([
+        ("status", Json::from("finished")),
+        ("repository", result_json),
+        ("opened", Json::from(opened)),
+        ("model", model),
+    ])
+    .to_pretty_string()
 }
 
 /// Run a setup, streaming one event per step, and open the project when it worked.

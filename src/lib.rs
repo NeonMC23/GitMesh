@@ -32,6 +32,7 @@ pub mod error;
 pub mod git;
 pub mod gui;
 pub mod json;
+pub mod manage;
 pub mod manifest;
 pub mod model;
 pub mod ops;

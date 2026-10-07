@@ -218,3 +218,29 @@ dialog::backdrop { background: rgba(0,0,0,.55); }
 .result-section h3 { font-size: 13px; margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .result-ok { color: var(--ok); }
 .result-bad { color: var(--bad); }
+
+/* Repositories panel: the configuration surface. */
+#repos-table table { width: 100%; border-collapse: collapse; }
+#repos-table th { text-align: left; font-size: 0.78rem; color: var(--muted); font-weight: 600;
+  padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); }
+#repos-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+#repos-table tr.attention td { background: rgba(255, 176, 32, 0.06); }
+#repos-table tr.problem td { background: rgba(255, 90, 90, 0.07); }
+.repo-flag { display: block; font-size: 0.8rem; color: var(--warn, #ffb020); }
+.repo-flag.problem { color: var(--bad, #ff5a5a); }
+
+#repo-candidate .candidate { border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.7rem; }
+#repo-candidate ul { margin: 0.3rem 0 0.3rem 1.1rem; padding: 0; }
+#repo-candidate li { margin: 0.15rem 0; }
+
+#repo-plan .plan-head { font-weight: 600; margin-bottom: 0.4rem; }
+#repo-plan .plan-block { margin-top: 0.6rem; }
+#repo-plan .plan-block h3 { font-size: 0.85rem; margin: 0 0 0.25rem; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em; }
+#repo-plan ul { margin: 0.2rem 0 0.2rem 1.1rem; padding: 0; }
+#repo-plan li { margin: 0.15rem 0; }
+#repo-plan details { margin-top: 0.5rem; }
+#repo-plan pre { max-height: 18rem; overflow: auto; background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem; font-size: 0.78rem; }
+#repo-plan .blocker { color: var(--bad, #ff5a5a); }
+#repo-plan .notice { color: var(--muted); }

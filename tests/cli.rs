@@ -559,3 +559,101 @@ fn init_refuses_to_run_a_plan_it_cannot_satisfy() {
         "git@github.com:acme/demo.git"
     );
 }
+
+#[test]
+fn configure_add_plans_before_it_changes_anything() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    fixture.write("new-module/main.rs", "fn main() {}\n");
+    let manifest_path = fixture.path().join(".gitmesh/project.toml");
+    let manifest_before = std::fs::read_to_string(&manifest_path).unwrap();
+    let cli = Cli::new(fixture.path());
+
+    // A dry run prints the plan the same service builds for the interface, and writes
+    // nothing at all.
+    let stdout = cli.ok(&["configure", "add", "new-module", "--git-init", "--dry-run"]);
+    assert!(stdout.contains("changes to the configuration"), "{stdout}");
+    assert!(
+        stdout.contains("create a Git repository in 'new-module'"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("add 'new-module' to GitMesh"), "{stdout}");
+    assert!(stdout.contains("Dry run: nothing was changed"), "{stdout}");
+    assert!(!fixture.path().join("new-module/.git").exists());
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        manifest_before
+    );
+
+    // A directory that is not a repository and was not asked to become one is refused
+    // before anything runs, with the reasons the plan collected.
+    let (_, stderr, code) = cli.out(&["configure", "add", "new-module"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("is not a Git repository"), "{stderr}");
+    assert!(!fixture.path().join("new-module/.git").exists());
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        manifest_before
+    );
+
+    // The real thing: initialised, added, and tracked by exactly one repository.
+    let stdout = cli.ok(&[
+        "configure",
+        "add",
+        "new-module",
+        "--git-init",
+        "--untrack-from-root",
+    ]);
+    assert!(stdout.contains("Added repository 'new-module'"), "{stdout}");
+    assert!(fixture.path().join("new-module/.git").is_dir());
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("id = \"new-module\""), "{manifest}");
+
+    // Repeating the same command changes nothing and succeeds: an operation that is
+    // already done is not an error, and the command line does not claim it added a
+    // repository a second time either.
+    let stdout = cli.ok(&[
+        "configure",
+        "add",
+        "new-module",
+        "--git-init",
+        "--untrack-from-root",
+    ]);
+    assert!(stdout.contains("Nothing to do"), "{stdout}");
+    assert!(!stdout.contains("Added repository"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), manifest);
+}
+
+#[test]
+fn configure_remove_and_remote_go_through_the_same_plan() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    // The root repository tracks the files of the new directory, and the directory becomes
+    // a repository of its own *without* untracking: the files then belong to two
+    // repositories, which is exactly the state a removal has to warn about.
+    fixture.write("engine/lib.rs", "pub fn go() {}\n");
+    fixture.add_all(".");
+    fixture.commit(".", "root tracks engine/lib.rs");
+    let cli = Cli::new(fixture.path());
+    cli.ok(&["configure", "add", "engine", "--git-init"]);
+    assert!(fixture.path().join("engine/.git").is_dir());
+    assert_eq!(
+        fixture.git_ok(".", &["ls-files", "--", "engine"]).trim(),
+        "engine/lib.rs"
+    );
+
+    // Renaming changes the name and never the directory.
+    let stdout = cli.ok(&["configure", "rename", "root", "root-repository"]);
+    assert!(
+        stdout.contains("Renamed repository 'root' to 'root-repository'"),
+        "{stdout}"
+    );
+    assert!(fixture
+        .load_project()
+        .repository("root-repository")
+        .is_some());
+    assert_eq!(
+        fixture.load_project().root_repository().relative_slash(),
+        "."
+    );
+}

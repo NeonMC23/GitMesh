@@ -558,6 +558,190 @@ function sampleInspection() {
   equal(GitMesh.outcomeSymbol('success'), '✓', 'the symbol vocabulary is unchanged');
 })();
 
+// ------------------------------------------------------------ repositories --
+
+(function repositoryPanelTests() {
+  var inspection = {
+    kind: 'repositories',
+    project: { name: 'demo', root: '/tmp/demo', manifest: '/tmp/demo/.gitmesh/project.toml' },
+    repositories: [
+      { id: 'root', role: 'root', path: '.', state: { key: 'ready', label: 'ready' },
+        branch: 'main', remoteLabel: 'local only', usable: true, trackedByRoot: 0,
+        issues: [], warnings: [] },
+      { id: 'engine', role: 'external', path: 'engine', state: { key: 'ready', label: 'ready' },
+        branch: 'main', remote: 'git@example.com:acme/engine.git',
+        remoteLabel: 'git@example.com:acme/engine.git', usable: true, trackedByRoot: 2,
+        issues: ['there is no Git repository here yet'], warnings: ['2 file(s) belong to two repositories'] }
+    ],
+    counts: { repositories: 2, usable: 2, needingAttention: 1 }
+  };
+  var summary = GitMesh.repositorySummary(inspection);
+  equal(summary.count, 2, 'every configured repository is a row');
+  equal(summary.problems, 1, 'a repository with issues needs attention');
+  equal(summary.rows[0].roleLabel, 'project root', 'the root repository says so');
+  equal(summary.rows[1].roleLabel, 'repository', 'the others are repositories');
+  equal(summary.rows[1].attention.length, 2, 'issues and warnings are both surfaced');
+  contains(summary.sentence, '2 repositories', 'the headline counts the repositories');
+  contains(summary.sentence, 'need attention', 'and says when one needs attention');
+  equal(GitMesh.repositorySummary({ repositories: [] }).sentence,
+    'No repository is configured yet.', 'an empty project says so plainly');
+  equal(GitMesh.repositoryStateLabel('no-repository'), 'no Git repository here yet',
+    'the state vocabulary comes from the service');
+})();
+
+(function candidateTests() {
+  var plain = GitMesh.candidateSummary({
+    path: 'new-module', exists: true, isRepository: false, hasCommits: false, branch: null,
+    origin: null, trackedByRoot: 3, nestedRepositories: [], suggestedId: 'demo-new-module',
+    managedAs: null, canAdd: true, blockers: [], warnings: []
+  });
+  contains(plain.headline, 'created', 'a plain directory would be initialised');
+  contains(plain.steps.join(' | '), 'git init', 'and the step says what runs');
+  contains(plain.steps.join(' | '), 'demo-new-module', 'the suggested name is shown');
+  contains(plain.steps.join(' | '), '3 files', 'the parent ownership is spelled out');
+  equal(plain.canAdd, true, 'the directory can be added');
+
+  var adopted = GitMesh.candidateSummary({
+    path: 'engine', exists: true, isRepository: true, hasCommits: true, branch: 'main',
+    origin: 'git@example.com:acme/engine.git', trackedByRoot: 0, nestedRepositories: ['engine/thirdparty'],
+    suggestedId: 'engine', managedAs: null, canAdd: true, blockers: [], warnings: []
+  });
+  contains(adopted.headline, 'adopted', 'an existing repository is adopted, not re-initialised');
+  contains(adopted.steps.join(' | '), 'thirdparty', 'a nested repository is pointed out');
+  contains(adopted.steps.join(' | '), 'git@example.com', 'the remote it already has is shown');
+
+  var missing = GitMesh.candidateSummary({
+    path: 'nope', exists: false, isRepository: false, hasCommits: false, trackedByRoot: 0,
+    nestedRepositories: [], suggestedId: '', managedAs: null, canAdd: false,
+    blockers: ['the directory does not exist in this project'], warnings: []
+  });
+  equal(missing.canAdd, false, 'a missing directory cannot be added');
+  contains(missing.headline, 'no directory', 'and the interface says why');
+  equal(missing.blockers.length, 1, 'the blocker comes from the inspection');
+
+  var managed = GitMesh.candidateSummary({
+    path: 'engine', exists: true, isRepository: true, hasCommits: true, trackedByRoot: 0,
+    nestedRepositories: [], suggestedId: 'demo-engine', managedAs: 'engine', canAdd: false,
+    blockers: [], warnings: []
+  });
+  contains(managed.headline, 'already is the repository', 'an already managed directory says so');
+  contains(managed.steps.join(' | '), 'nothing is re-initialised', 'and promises not to touch it');
+  equal(GitMesh.candidateSummary(null), null, 'nothing checked, nothing to say');
+})();
+
+(function requestFieldsTests() {
+  var add = GitMesh.repositoryRequestFields({
+    intent: 'add', path: ' engine ', id: ' engine ', remote: 'git@x:y.git ', branch: ' main ',
+    initialize: true, configureRemote: false, untrack: true
+  });
+  equal(add.intent, 'add', 'the intent is sent');
+  equal(add.path, 'engine', 'the path is trimmed');
+  equal(add.initialize, 'true', 'a checked box is sent as the server reads it');
+  equal(add.configureRemote, 'false', 'an unchecked one too');
+  equal(add.untrack, 'true', 'and the untrack choice');
+  equal(add.planId, undefined, 'no plan id before the review');
+
+  var rename = GitMesh.repositoryRequestFields({ intent: 'rename', id: 'engine', newId: 'engine-core' });
+  equal(rename.newId, 'engine-core', 'renaming sends the new name');
+  var remove = GitMesh.repositoryRequestFields({ intent: 'remove', id: 'engine', takeover: true });
+  equal(remove.confirmTakeover, 'true', 'removing sends the ownership confirmation');
+  var remote = GitMesh.repositoryRequestFields({ intent: 'set-remote', id: 'engine', remote: '', configureGit: true });
+  equal(remote.remote, '', 'an empty remote means "clear the recorded one"');
+  equal(remote.configure, 'true', 'and Git is only touched when asked');
+})();
+
+(function managementPlanTests() {
+  var plan = {
+    kind: 'plan', flow: 'repository', id: 'abc123', ready: true, noop: false,
+    summary: '2 changes to the configuration, 3 steps to run',
+    manifest: { before: 'version = 1\n', after: 'version = 1\n# new\n', changes: true },
+    changes: [
+      { kind: 'initialize-repository', id: 'new-module', path: 'new-module', symbol: '…',
+        state: 'planned', reason: null, detail: "create a Git repository in 'new-module'",
+        configuration: true },
+      { kind: 'add-repository', id: 'new-module', path: 'new-module', symbol: '…',
+        state: 'planned', reason: null, detail: "add 'new-module' to GitMesh", configuration: true }
+    ],
+    actions: [
+      { kind: 'initialize-repository', role: 'Repository', target: 'new-module', path: 'new-module',
+        symbol: '…', state: 'planned', reason: null, detail: 'git init' },
+      { kind: 'update-manifest', role: 'Manifest', target: 'manifest', path: '.gitmesh/project.toml',
+        symbol: '…', state: 'planned', reason: null, detail: 'write the manifest' }
+    ],
+    counts: { changes: 2, plannedChanges: 2, satisfiedChanges: 0, blockedChanges: 0,
+      actions: 2, plannedActions: 2, satisfiedActions: 0, blockedActions: 0 },
+    safety: ['no file is moved, renamed or deleted'], blockers: [], warnings: [], notices: [],
+    expectedOrigins: []
+  };
+  var summary = GitMesh.managementPlanSummary(plan);
+  equal(summary.ready, true, 'a ready plan can be applied');
+  equal(summary.state, 'ready', 'and says so');
+  equal(summary.changes.length, 2, 'every change is a row');
+  equal(summary.actions.length, 2, 'every step is a row');
+  equal(summary.manifestChanges, true, 'the manifest preview is shown when it changes');
+  contains(summary.manifestAfter, '# new', 'the preview is the text the service will write');
+  equal(summary.touched.join(','), 'new-module', 'the review names what is touched');
+
+  var repeat = GitMesh.managementPlanSummary({
+    id: 'def456', ready: true, noop: true,
+    summary: 'nothing to do: the project is already configured as requested',
+    manifest: { after: 'version = 1\n', changes: false }, changes: [], actions: [],
+    counts: {}, safety: [], blockers: [], warnings: [], notices: []
+  });
+  equal(repeat.state, 'nothing to do', 'an already satisfied request says so');
+  equal(repeat.manifestChanges, false, 'and shows no manifest preview');
+
+  var blocked = GitMesh.managementPlanSummary({
+    id: 'ghi789', ready: false, noop: false, summary: '1 problem(s) must be fixed',
+    manifest: { after: '', changes: false }, changes: [], actions: [], counts: {},
+    safety: [], blockers: ['the directory does not exist in this project'],
+    warnings: [], notices: []
+  });
+  equal(blocked.state, 'blocked', 'a blocked plan is not applied');
+  equal(blocked.blockers.length, 1, 'the reason is on screen');
+})();
+
+(function managementResultTests() {
+  var result = {
+    kind: 'result', flow: 'repository', planId: 'abc123', dryRun: false, status: 'complete',
+    sentence: '2 changes applied, nothing failed', exitCode: 0, success: true,
+    counts: { succeeded: 3, skipped: 0, failed: 0, applied: 2, notApplied: 0 },
+    changes: [
+      { kind: 'add-repository', id: 'new-module', path: 'new-module', symbol: '✓',
+        outcome: 'applied', detail: "add 'new-module' to GitMesh",
+        evidence: ['the manifest lists it'] }
+    ],
+    actions: [
+      { kind: 'initialize-repository', target: 'new-module', path: 'new-module',
+        outcome: 'success', symbol: '✓', summary: 'created a Git repository', details: [] },
+      { kind: 'update-manifest', target: 'manifest', path: '.gitmesh/project.toml',
+        outcome: 'success', symbol: '✓', summary: 'wrote the manifest', details: [] }
+    ],
+    refused: [], warnings: [], validation: { ok: true }
+  };
+  var text = GitMesh.managementResultText(result);
+  contains(text.sentence, '2 changes applied', 'the sentence says what happened');
+  contains(text.summary, '2 changes applied', 'and the summary repeats it');
+  equal(text.changes[0].evidence.length, 1, 'the evidence for each change is kept');
+  equal(text.failures.length, 0, 'nothing failed');
+  equal(text.success, true, 'the result is a success');
+
+  var partial = GitMesh.managementResultText({
+    planId: 'abc', status: 'partial', sentence: '1 change applied, 1 step failed', success: false,
+    counts: { applied: 1, failed: 1, succeeded: 1, skipped: 0, notApplied: 0 },
+    changes: [{ id: 'blocked', symbol: '✗', outcome: 'not-applied', detail: 'add a repository',
+      evidence: [] }],
+    actions: [{ kind: 'initialize-repository', target: 'blocked', path: 'blocked',
+      outcome: 'failed', symbol: '✗', summary: 'git init failed', details: ['Permission denied'] }],
+    refused: [], warnings: []
+  });
+  equal(partial.failures.length, 1, 'the failure is listed');
+  contains(partial.failures[0].detail, 'git init failed', 'with the Git error');
+  contains(partial.failures[0].details[0], 'Permission denied', 'and its detail');
+  equal(partial.success, false, 'a partial change is not reported as a success');
+  equal(GitMesh.managementResultText(null), null, 'no result, nothing to show');
+})();
+
 // ----------------------------------------------------------------- result --
 
 if (failures.length) {

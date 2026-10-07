@@ -69,6 +69,9 @@ MyProject                          branch  main        modified
   ahead/behind state of every repository.
 * **Project** — read-only project information: name, root, manifest, repositories, paths,
   remotes, and any notices GitMesh produced.
+* **Repositories** — the project's physical boundaries, and the place where they are
+  edited after creation: inspect a directory, review the change as a plan, confirm it,
+  watch it run, read the evidence that it happened.
 
 ## Opening a project
 
@@ -158,8 +161,77 @@ received a remote here. Concretely:
 * Creating the hosted repository itself (GitHub, GitLab, …): GitMesh prints the command
   and records the URL; it never talks to a provider API.
 * Resolving conflicts: normal Git tooling, as everywhere else in GitMesh.
-* Editing the configuration afterwards (assigning, renaming, changing remotes): still
-  `gitmesh configure` or `gitmesh ui`, exactly as before.
+* Creating the hosted repository for a repository you add later: the same rule as in the
+  wizard — GitMesh records the URL, and the repository itself is created on the provider.
+* Editing the configuration afterwards works in three places and means the same thing in
+  all of them: the **Repositories** tab (below), `gitmesh configure`, and `gitmesh ui`.
+
+## Managing repositories after creation
+
+The **Repositories** tab is where the project's physical boundaries are edited. It runs the
+same operations as `gitmesh configure`, through the same service, on the same reviewed
+plan, so the interface cannot produce an outcome the command line would not.
+
+The tab opens on a read-only inspection: one row per configured repository (id, role, path,
+the remote recorded in the manifest, the remote Git really uses, branch, state on disk,
+whether the root repository also tracks files inside it, and anything worth flagging), plus
+the directories that could still become repositories.
+
+Every change follows the same four steps, and nothing is written before the last one:
+
+1. **Check the directory** (adds only) — say which directory, and read what GitMesh found:
+   whether it exists, whether it is already a Git repository, whether it has commits, its
+   `origin`, how many of its files the root repository tracks, and what adding it would
+   mean. Nested Git repositories inside it are reported, never touched. This step creates
+   nothing.
+2. **Review the change** — the plan lists every change (created, adopted, initialised,
+   tracked or untracked, renamed, recorded, removed), every step that will run, the exact
+   `.gitmesh/project.toml` it would write, the safety guarantees ("no existing `.git`
+   directory is deleted or re-initialised", "no file is moved, renamed or deleted", …), the
+   warnings, and the blockers. A plan with blockers cannot be applied: the blockers *are*
+   the refusal, on screen, and nothing runs.
+3. **Confirm** — the plan carries a fingerprint that the interface sends back. A plan that
+   no longer matches the project on disk (you edited the manifest, or ran a `gitmesh`
+   command in another window) is refused, and a fresh plan is shown instead; applying
+   without having reviewed a plan is refused as well.
+4. **Apply and read the result** — per-step progress while Git runs (✓ done, – already in
+   place, ! skipped, ✗ failed), then the result: what was applied and *the evidence* for
+   each change ("the manifest now lists 'engine' at 'engine'", "the directory 'engine'
+   exists", "the root repository no longer tracks these files"). The project is re-read
+   from disk when the operation ends, so the other tabs show the new layout immediately.
+
+The four actions:
+
+* **Add a directory as a repository** — with an optional remote URL (recorded in the
+  manifest, and configured in Git only when that box is ticked), an optional branch,
+  *initialise the repository* when the directory is not one yet, and *stop tracking these
+  files in the root repository* so that a file belongs to exactly one repository. A
+  directory that is already a Git repository is **adopted**: its commits, its remote and
+  its working tree are left exactly as they are. Adding what is already configured, or
+  untracking a directory the root does not track, is reported as *nothing to do* — not as
+  an error, and never as a change that did not happen.
+* **Give it another name** — the logical id changes, and only that: the directory and the
+  Git repositories keep their names.
+* **Record another remote** — record a URL, clear one, or also point `origin` at it
+  (*configure in Git*). Replacing an `origin` that already exists requires that box: without
+  it the plan refuses and says why. Recording a remote without the box never runs a Git
+  command.
+* **Remove it from the project** — a configuration change and nothing else. The directory,
+  its `.git`, its history and its remote stay where they are, as the plan states. When the
+  root repository tracks files inside it, the removal needs the takeover box: those files
+  go back to the root repository, and the plan says so before anything happens.
+
+**When something fails**, the unrelated steps have already run. The result is *partial* (and
+`gitmesh configure` exits `1`): every failure carries Git's own message, the changes that
+were applied stay applied, and the validation of the resulting project is shown. A
+repository whose creation failed has its follow-up steps skipped; the manifest is still
+written when it can be, exactly as the setup wizard does, so the project remains honest
+about itself. `gitmesh status` and this tab then name the one repository that is not usable
+and what to do about it (`git init` in its directory, or remove it from the project).
+
+**What this tab never does:** create a repository on GitHub or GitLab, resolve a conflict,
+delete a `.git` directory, or move a file. Configuration editing lives here, in
+`gitmesh configure` and in `gitmesh ui`; the **Project** tab stays read-only.
 
 ## How status and changes work
 
@@ -259,6 +331,10 @@ The page talks only to the server it was served from.
 | `POST /api/setup/inspect` | scan a directory as a candidate project root (`path`, optional `name`) |
 | `POST /api/setup/plan` | generate the plan for the wizard's answers — creates nothing |
 | `POST /api/setup/apply` | execute a reviewed plan; the reviewed plan id is required, and the work runs in the background on the same event stream |
+| `GET /api/repositories` | the repositories of the open project: configuration, state on disk, what needs attention |
+| `POST /api/repository/inspect` | what one directory would mean as a repository (`path`, required) — creates nothing |
+| `POST /api/repository/plan` | the plan for one repository change (`intent` = `add`, `remove`, `rename`, `set-remote`) — creates nothing |
+| `POST /api/repository/apply` | execute a reviewed repository plan; the reviewed plan id is required, on the same event stream |
 | `GET /api/health` | liveness (start-up check, workflow scripts) |
 
 ## Safety
@@ -279,14 +355,17 @@ The page talks only to the server it was served from.
   with the same safety rules: no forced checkout, no destructive reset, conflicts left in
   place, local work never overwritten.
 * **Dry-run** simulates every operation and is visible in the status bar.
-* **No silent configuration changes.** The GUI cannot redraw your project layout: marking
-  directories as repositories, renaming ids and changing remote URLs stay in
-  `gitmesh configure` and `gitmesh ui`.
+* **No silent configuration changes.** The GUI can change the project's configuration,
+  but never silently: a change is planned first, the plan shows every change, every step
+  and the exact manifest it would write, and it runs only after it is confirmed. A plan
+  that is not the one that was reviewed is refused.
 
 ## What is not supported yet
 
-* Editing an existing project's configuration (assign/rename/remote) — deliberate for this
-  version: the wizard *creates* a project, `gitmesh configure` and `gitmesh ui` edit one.
+* Editing the configuration *as a batch* (several adds in one confirmation): the panel
+  plans one change at a time, like the command line does.
+* Choosing a provider (GitHub/GitLab) for a repository added later: the panel records the
+  URL you give it, and never contacts a provider.
 * Cloning a project that does not exist locally yet (create it here, or `git clone` and
   then open it).
 * Resolving conflicts inside the interface; they are resolved with Git, as documented.
@@ -302,12 +381,23 @@ $ cargo test                       # includes the service layer and the GUI test
 $ cargo test --test client         # runs the interface's client logic under Node (if installed)
 $ ./tools/gui-workflow.py          # full manual workflow over the real HTTP interface
 $ ./tools/setup-workflow.py        # the setup wizard end to end, from a blank directory
+$ ./tools/repository-workflow.py   # creating a project, then managing its repositories
 ```
 
 `tools/gui-workflow.py` builds a temporary multi-repository project with local bare
 remotes and walks the whole workflow — open, status, changes, commit, branch, pull,
 conflict, resolve, push, reopen — printing one line per check. It is the script used
 during development to validate the interface end to end.
+
+`tools/repository-workflow.py` (ports 7414/7415) opens a project, adds a subdirectory of
+the root as a repository without touching the files, adopts an existing repository whose
+history and remote stay unchanged, refuses a name clash, records and then configures a
+remote, renames, removes a repository (and shows the directory, the `.git` and the remote
+still there afterwards), refuses a removal that would hand files back to the root until it
+is confirmed, breaks one repository on purpose to check the partial result and the message
+that goes with it, and finally checks that the command line sees exactly the same project —
+from the project root, from a nested directory and from nowhere at all. It leaves the
+project in `/tmp/gitmesh-repositories-e2e` for inspection.
 
 `tools/setup-workflow.py` starts from an ordinary directory (`/tmp/gitmesh-setup-e2e`,
 which it leaves behind for inspection), scans it, reviews a plan that creates two

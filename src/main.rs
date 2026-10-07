@@ -13,6 +13,10 @@ use gitmesh::cli::{Cli, Command, ConfigureCommand, GlobalOptions};
 use gitmesh::discovery::{self, ScanOptions};
 use gitmesh::git::GitRunner;
 use gitmesh::json::Json;
+use gitmesh::manage::{
+    self, RepositoryChangeKind, RepositoryIntent, RepositoryManagementRequest,
+    RepositoryManagementResult, RepositoryPlan,
+};
 use gitmesh::manifest;
 use gitmesh::model::{GitMeshProject, RepositoryState};
 use gitmesh::ops::{
@@ -506,43 +510,60 @@ fn cmd_configure(
         }
         ConfigureCommand::Add(args) => {
             let project = load_project(global, runner)?;
-            let check = discovery::check_assignment(&project, &args.path, runner)?;
-            for warning in &check.warnings {
-                eprintln!("gitmesh: note: {warning}");
-            }
-            let options = discovery::AssignOptions {
-                id: args.id.clone(),
-                remote_url: args.remote.clone(),
-                init_git: args.git_init,
+            let intent = RepositoryIntent::Add {
+                path: to_slash(&args.path),
+                id: args.id.clone().unwrap_or_default(),
+                remote: args.remote.clone(),
                 branch: args.branch.clone(),
+                initialize: args.git_init,
+                // The command line has always configured `origin` when a remote is given.
+                configure_remote: args.remote.is_some(),
+                untrack_from_root: args.untrack_from_root,
             };
+            let (plan, result) = run_repository_intent(runner, &project, intent, args.dry_run)?;
             if args.dry_run {
-                let id = args.id.clone().unwrap_or_else(|| "auto".to_string());
-                println!(
-                    "would add repository '{id}' at '{}'{}",
-                    to_slash(&check.relative_path),
-                    if check.is_repository {
-                        ""
-                    } else if args.git_init {
-                        " (creating a Git repository there)"
-                    } else {
-                        " (not a Git repository yet)"
-                    }
-                );
                 return Ok(EXIT_OK);
             }
-            let updated = discovery::assign_repository(&project, &args.path, &options, runner)?;
-            let path = manifest::save_project(&updated)?;
-            let added = updated
-                .repository_for_relative(&check.relative_path)
-                .map(|r| r.id.clone())
+            let result = result.expect("a plan that ran has a result");
+            if result.exit_code() != EXIT_OK {
+                return Ok(report_management(&result));
+            }
+            let path = plan
+                .changes
+                .iter()
+                .find(|change| change.kind == RepositoryChangeKind::AddRepository)
+                .map(|change| change.path.clone())
+                .unwrap_or_else(|| to_slash(&args.path));
+            let added = result
+                .project
+                .as_ref()
+                .and_then(|project| {
+                    project
+                        .sorted_repositories()
+                        .iter()
+                        .find(|repo| repo.relative_slash() == path)
+                        .map(|repo| repo.id.clone())
+                })
                 .unwrap_or_default();
-            println!(
-                "Added repository '{added}' at '{}' (saved to {})",
-                to_slash(&check.relative_path),
-                path.display()
-            );
-            if !check.is_repository {
+            if result
+                .applied()
+                .any(|row| row.change.kind == RepositoryChangeKind::AddRepository)
+            {
+                println!(
+                    "Added repository '{added}' at '{path}' (saved to {})",
+                    plan.manifest_path.display()
+                );
+            } else {
+                // Repeating a change that is already in place changes nothing, and the
+                // command line never claims otherwise.
+                println!("{}", as_cli_sentence(&plan.summary()));
+            }
+            let hosted = result.project.as_ref().is_some_and(|project| {
+                project
+                    .repository(&added)
+                    .is_some_and(|repo| repo.remote_url.is_some())
+            });
+            if !added.is_empty() && !hosted {
                 println!();
                 println!("Note: '{added}' is not hosted anywhere yet. Add a remote with:");
                 println!("  gitmesh configure remote {added} --url <url> --set-git-remote");
@@ -551,39 +572,71 @@ fn cmd_configure(
         }
         ConfigureCommand::Remove(args) => {
             let project = load_project(global, runner)?;
+            // A typo stays an error for scripts, even though the service treats repeating a
+            // removal as nothing to do.
             let repo = project
                 .repository(&args.id)
+                .cloned()
                 .ok_or_else(|| Error::UnknownRepository(args.id.clone()))?;
+            let intent = RepositoryIntent::Remove {
+                id: args.id.clone(),
+                confirm_takeover: args.confirm_takeover,
+            };
+            let (plan, result) = run_repository_intent(runner, &project, intent, args.dry_run)?;
             if args.dry_run {
-                println!(
-                    "would remove repository '{}' from the configuration (its files and Git history are untouched)",
-                    args.id
-                );
                 return Ok(EXIT_OK);
             }
-            let updated = discovery::unassign_repository(&project, &args.id)?;
-            manifest::save_project(&updated)?;
-            println!(
-                "Removed repository '{}' at '{}' from the configuration.",
-                args.id,
-                repo.relative_slash()
-            );
-            println!("Its directory and Git history were not touched.");
+            let result = result.expect("a plan that ran has a result");
+            if result.exit_code() != EXIT_OK {
+                return Ok(report_management(&result));
+            }
+            if result
+                .applied()
+                .any(|row| row.change.kind == RepositoryChangeKind::RemoveRepositoryFromManifest)
+            {
+                println!(
+                    "Removed repository '{}' at '{}' from the configuration.",
+                    args.id,
+                    repo.relative_slash()
+                );
+                println!("Its directory and Git history were not touched.");
+            } else {
+                println!("{}", as_cli_sentence(&plan.summary()));
+            }
             Ok(EXIT_OK)
         }
         ConfigureCommand::Rename(args) => {
             let project = load_project(global, runner)?;
+            if project.repository(&args.id).is_none() {
+                return Err(Error::UnknownRepository(args.id.clone()));
+            }
+            let intent = RepositoryIntent::Rename {
+                id: args.id.clone(),
+                new_id: args.new_id.clone(),
+            };
+            let (plan, result) = run_repository_intent(runner, &project, intent, args.dry_run)?;
             if args.dry_run {
-                println!("would rename repository '{}' to '{}'", args.id, args.new_id);
                 return Ok(EXIT_OK);
             }
-            let updated = discovery::rename_repository(&project, &args.id, &args.new_id)?;
-            manifest::save_project(&updated)?;
+            let result = result.expect("a plan that ran has a result");
+            if result.exit_code() != EXIT_OK {
+                return Ok(report_management(&result));
+            }
+            if plan.is_noop() {
+                println!(
+                    "Nothing to do: the repository is already called '{}'",
+                    args.id
+                );
+                return Ok(EXIT_OK);
+            }
             println!("Renamed repository '{}' to '{}'", args.id, args.new_id);
             Ok(EXIT_OK)
         }
         ConfigureCommand::Remote(args) => {
             let project = load_project(global, runner)?;
+            if project.repository(&args.id).is_none() {
+                return Err(Error::UnknownRepository(args.id.clone()));
+            }
             let url = if args.clear {
                 None
             } else if args.url.trim().is_empty() {
@@ -593,28 +646,100 @@ fn cmd_configure(
             } else {
                 Some(args.url.trim().to_string())
             };
+            let intent = RepositoryIntent::SetRemote {
+                id: args.id.clone(),
+                remote: url.clone(),
+                configure: args.set_git_remote,
+            };
+            let (plan, result) = run_repository_intent(runner, &project, intent, args.dry_run)?;
             if args.dry_run {
-                match &url {
-                    Some(url) => println!("would set the remote of '{}' to {url}", args.id),
-                    None => println!("would clear the remote of '{}'", args.id),
-                }
                 return Ok(EXIT_OK);
             }
-            let updated = discovery::set_repository_remote(
-                &project,
-                &args.id,
-                url.clone(),
-                args.set_git_remote,
-                runner,
-            )?;
-            manifest::save_project(&updated)?;
-            match url {
-                Some(url) => println!("Set the remote of '{}' to {url}", args.id),
-                None => println!("Cleared the remote of '{}'", args.id),
+            let result = result.expect("a plan that ran has a result");
+            if result.exit_code() != EXIT_OK {
+                return Ok(report_management(&result));
+            }
+            if result.applied().next().is_some() {
+                match url {
+                    Some(url) => println!("Set the remote of '{}' to {url}", args.id),
+                    None => println!("Cleared the remote of '{}'", args.id),
+                }
+            } else {
+                println!("{}", as_cli_sentence(&plan.summary()));
             }
             Ok(EXIT_OK)
         }
     }
+}
+
+// --------------------------------------------------- repository management --
+
+/// Plan one repository change and, unless this is a dry run, apply it.
+///
+/// The command line goes through the very service the graphical interface uses, so an add,
+/// a removal, a rename and a remote change mean exactly the same thing everywhere. A plan
+/// that cannot be applied is a configuration problem: it is reported like one, with the
+/// reasons the plan collected.
+fn run_repository_intent(
+    runner: &GitRunner,
+    project: &GitMeshProject,
+    intent: RepositoryIntent,
+    dry_run: bool,
+) -> Result<(RepositoryPlan, Option<RepositoryManagementResult>)> {
+    let plan = manage::plan(project, &RepositoryManagementRequest::one(intent), runner)?;
+    for warning in &plan.warnings {
+        eprintln!("gitmesh: note: {warning}");
+    }
+    if !plan.is_ready() {
+        return Err(Error::InvalidConfiguration(plan.blockers.clone()));
+    }
+    if dry_run {
+        println!("{}", as_cli_sentence(&plan.summary()));
+        for change in plan.planned_changes() {
+            println!("  · {}", change.detail);
+        }
+        for action in plan.planned_actions() {
+            println!("  → {}", action.detail);
+        }
+        println!("Dry run: nothing was changed.");
+        return Ok((plan, None));
+    }
+    let mut observer = manage::RepositoryObserver::silent();
+    let result = manage::apply(&plan, false, runner, &mut observer);
+    Ok((plan, Some(result)))
+}
+
+/// A plan summary as a sentence the CLI can print: capitalised and closed, so it reads
+/// like the hand-written messages around it.
+fn as_cli_sentence(line: &str) -> String {
+    let mut text: String = match line.chars().next() {
+        Some(first) => first.to_uppercase().chain(line.chars().skip(1)).collect(),
+        None => return String::new(),
+    };
+    if !text.ends_with('.') {
+        text.push('.');
+    }
+    text
+}
+
+/// Report what a finished operation did, and return the exit code that goes with it.
+fn report_management(result: &RepositoryManagementResult) -> u8 {
+    for reason in &result.refused {
+        eprintln!("gitmesh: {reason}");
+    }
+    for outcome in result.failures() {
+        eprintln!("gitmesh: error: {}: {}", outcome.target, outcome.summary);
+        for detail in &outcome.details {
+            eprintln!("  {detail}");
+        }
+    }
+    for notice in &result.warnings {
+        eprintln!("gitmesh: note: {notice}");
+    }
+    if result.failures().count() > 0 || !result.refused.is_empty() {
+        eprintln!("gitmesh: {}", result.sentence());
+    }
+    result.exit_code()
 }
 
 fn project_json(project: &GitMeshProject) -> Json {

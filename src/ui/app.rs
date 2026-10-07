@@ -388,6 +388,24 @@ impl App {
             self.log("select a configured repository to remove it");
             return Ok(());
         };
+        // Removing a repository from the configuration never touches it, but files the root
+        // repository tracks inside it do come back to the root repository: say so. (The
+        // command line and the graphical interface make the same consequence explicit
+        // before the change runs.)
+        if let Some(entry) = project.repository(&repo) {
+            let tracked = discovery::count_files_tracked_under(
+                &project.root,
+                &entry.relative_path,
+                &self.runner,
+            );
+            if tracked > 0 {
+                self.log(format!(
+                    "note: the root repository still tracks {tracked} file(s) inside '{}'; \
+                     they go back to it, and nothing is deleted",
+                    entry.relative_slash()
+                ));
+            }
+        }
         let updated = discovery::unassign_repository(&project, &repo)?;
         manifest::save_project(&updated)?;
         self.log(format!(
@@ -646,6 +664,56 @@ mod tests {
         assert!(
             fixture.path().join("engine/.git").exists(),
             "files untouched"
+        );
+    }
+
+    #[test]
+    fn unassigning_says_which_files_go_back_to_the_root_repository() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        // The root repository starts by tracking a file that later belongs to the external
+        // repository (the order a real project grows in), so removing the external entry
+        // hands that file back — which the interface has to say out loud.
+        fixture.write("engine/lib.rs", "pub fn go() {}\n");
+        fixture.add_all(".");
+        fixture.commit(".", "root tracks engine/lib.rs");
+        fixture.init_repo("engine");
+        let project = fixture.load_project();
+        let options = discovery::AssignOptions {
+            id: None,
+            remote_url: None,
+            init_git: false,
+            branch: None,
+        };
+        let updated =
+            discovery::assign_repository(&project, Path::new("engine"), &options, fixture.runner())
+                .unwrap();
+        manifest::save_project(&updated).unwrap();
+
+        let mut app = app_for(&fixture);
+        let index = app
+            .rows
+            .iter()
+            .position(|row| row.relative_path == Path::new("engine"))
+            .unwrap();
+        app.selected = index;
+        app.unassign_selected().unwrap();
+        assert!(app.project.as_ref().unwrap().repository("engine").is_none());
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("still tracks 1 file(s) inside 'engine'")),
+            "{:?}",
+            app.log
+        );
+        assert!(
+            fixture.path().join("engine/.git").exists(),
+            "files untouched"
+        );
+        assert_eq!(
+            fixture.git_ok(".", &["ls-files", "--", "engine"]).trim(),
+            "engine/lib.rs",
+            "and the root repository still owns it"
         );
     }
 

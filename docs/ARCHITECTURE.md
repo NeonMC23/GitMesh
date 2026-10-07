@@ -50,10 +50,10 @@ orchestrates them at operation time.
 └───────────────┬────────────────────────────────┬───────────────┘
                 │                                │
 ┌───────────────▼────────────────────────────────▼───────────────┐
-│ service (src/service.rs) · setup (src/setup.rs)  application    │
+│ service · setup · manage                     application        │
 │ open a project · status/changes · operations · view models      │
 │ progress events · presentation vocabulary shared by front ends  │
-│ project creation: inspect → plan → apply → verify               │
+│ plan-driven changes: create a project · edit its repositories   │
 └───────────────┬────────────────────────────────────────────────┘
                 │
 ┌───────────────▼────────────────────────────────────────────────┐
@@ -83,8 +83,9 @@ Rules that keep the layering honest:
   Git invocation.
 * **`model` is pure data.** No I/O, no Git: it is the vocabulary shared by every layer.
 * **`ops` is the only module that changes repositories** (apart from `discovery`, which
-  can `git init` when explicitly asked, and `setup`, which drives `discovery` for exactly
-  that). Everything else is read-only.
+  can `git init`, replace or add a remote and untrack files when explicitly asked, and
+  `setup` / `manage`, which drive `discovery` for exactly that, always on a reviewed plan).
+  Everything else is read-only.
 * **`setup` is front-end neutral and plan-driven.** `inspect` reports facts, `plan`
   produces the complete list of steps plus the exact manifest text, `apply` replays that
   same plan and nothing else, `verify` re-opens the result through `ProjectSession`.
@@ -95,6 +96,13 @@ Rules that keep the layering honest:
   configuration editing, `discovery`), so the front ends cannot drift apart. The GUI
   additionally goes through `service` exclusively: it has no direct `ops` call for
   anything but the observer-aware operation methods, and no direct `git` call at all.
+* **`manage` is the counterpart of `setup` for an existing project.** `inspect` reports
+  what the configuration says and what is on disk, `plan` produces every change, every
+  step, the exact manifest it would write and the reasons it refuses, `apply` replays that
+  same plan and nothing else, `verify` re-opens the result through the normal discovery and
+  manifest mechanisms. `gitmesh configure …` and the GUI's Repositories tab are two front
+  ends of it: the plan id reviewed by the user is checked again before execution, and the
+  changes that were actually applied are proven by evidence, never assumed.
 * **`service` is front-end neutral.** It holds the vocabulary shared by every front end
   (`ChangeState`, `RepositoryStateKind`, `PendingWork`, the JSON view models) and the
   `*_observed` operation entry points. It adds no Git behaviour of its own.
@@ -119,6 +127,7 @@ Rules that keep the layering honest:
 | `src/json.rs` | Minimal JSON writer used by `--json` output (no serialisation dependency) |
 | `src/providers/` | Hosting provider abstraction; `github.rs` parses GitHub URLs and coordinates |
 | `src/setup.rs` | Project creation service: `inspect` (facts about a directory), `SetupRequest` → `SetupPlan` → `SetupResult` → `ValidationReport`, `FirstPublish` (a plan entry the caller runs through the ordinary commit/push), `SetupObserver` for progress |
+| `src/manage.rs` | Repository management after creation: `inspect` (configuration + state on disk + candidates), `RepositoryIntent` (`add` / `remove` / `rename` / `set-remote`) → `RepositoryPlan` → `RepositoryManagementResult`, `RepositoryObserver` for progress, and the safety rules (never delete a `.git`, never move a file, never replace a remote or the manifest silently) |
 | `src/service.rs` | Application layer: `ProjectSession` (open, status, changes, operations), shared presentation vocabulary (`ChangeState`, `RepositoryStateKind`, `ProjectStateKind`, `PendingWork`, `ProjectBranch`), JSON view models (`status_view_json`, `operation_view_json`), `*_observed` operation entry points |
 | `src/ui/` | `app.rs` state machine (terminal-independent), `render.rs` ratatui drawing, `mod.rs` event loop |
 | `src/gui/` | `editor.rs` builds the model the interface renders from the service layer, `server.rs` is a minimal HTTP/SSE transport, `asset.rs` embeds the three front-end files, `static/` holds them (page, stylesheet, script, and the script's pure-logic tests) |
@@ -203,6 +212,15 @@ local paths and bare repositories (which is exactly how its own tests work). Pro
 code is limited to parsing URLs and exposing coordinates; no HTTP client exists, and
 nothing in the local core can fail because GitHub is unreachable.
 
+**One plan drives both the preview and the execution.** `setup` and `manage` build a
+typed plan (`SetupPlan`, `RepositoryPlan`) that contains every change, every step and the
+exact manifest that would be written; the preview a front end shows *is* that plan, and
+executing it replays the same list — there is no second, independently generated summary
+that could disagree with what runs. The plan carries a fingerprint of the configuration it
+was built from and of the changes it promises, so a plan reviewed before the project moved
+on is refused instead of executed, and the result is checked afterwards against the plan
+(change by change, with evidence).
+
 **No framework bloat.** Dependencies: `clap` (CLI), `serde` + `toml` (manifest),
 `thiserror` (errors), `ratatui` + `crossterm` (terminal UI). JSON output is written by
 ~130 lines of code in `src/json.rs` rather than adding a serialisation dependency.
@@ -221,10 +239,11 @@ operations must keep working with no network at all.
 * A directory cannot be split into two repositories, and repositories cannot nest inside
   one another. Validation rejects overlapping boundaries; the constraint is what makes
   ownership unambiguous.
-* GitMesh does not move files between repositories. If the root repository already tracks
-  files inside an external repository's directory, GitMesh reports the situation (status
-  notices) rather than rewriting history; fixing it is a deliberate, manual
-  `git rm -r --cached <dir>` in the root repository.
+* GitMesh never moves files between directories, and never rewrites history. What it can
+  do is stop *tracking* files that now belong to another repository
+  (`configure add --untrack-from-root`, the *stop tracking these files* box in the
+  interface, or `git rm -r --cached <dir>` by hand): the files stay on disk, the root
+  repository stops owning them, and nothing is deleted.
 * `.gitmesh/project.toml` is a normal project file and shows up as a change until it is
   committed; GitMesh does not commit it implicitly.
 * Repository-specific history operations (rebase, cherry-pick, submodule handling) are

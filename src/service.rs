@@ -28,6 +28,7 @@ use crate::error::Result;
 use crate::git::status::{ChangeKind, Head, StatusEntry};
 use crate::git::GitRunner;
 use crate::json::Json;
+use crate::manage;
 use crate::manifest;
 use crate::model::{GitMeshProject, RepositoryState};
 use crate::ops::{
@@ -35,7 +36,7 @@ use crate::ops::{
     OutcomeKind, PushOptions, SyncOptions,
 };
 use crate::paths::to_slash;
-use crate::setup;
+use crate::setup::{self, StepState};
 
 // ------------------------------------------------------------------- session --
 
@@ -1300,6 +1301,434 @@ pub fn setup_result_view_json(result: &setup::SetupResult) -> Json {
     ])
 }
 
+// ------------------------------------------------------ repository management --
+
+/// Machine-readable view of the repositories of an opened project: the configuration, the
+/// state found on disk, and everything the interface has to point out.
+///
+/// This is the read-only half of the management feature: the *changes* are described by
+/// [`management_plan_view_json`] and [`management_result_view_json`], never guessed by a
+/// front end.
+pub fn management_inspection_view_json(inspection: &manage::RepositoryInspection) -> Json {
+    let usable = inspection
+        .repositories
+        .iter()
+        .filter(|repo| repo.is_usable())
+        .count();
+    let attention = inspection
+        .repositories
+        .iter()
+        .filter(|repo| !repo.issues.is_empty())
+        .count();
+    Json::object([
+        ("kind", Json::from("repositories")),
+        (
+            "project",
+            Json::object([
+                ("name", Json::from(inspection.project_name.clone())),
+                ("root", Json::from(to_slash(&inspection.root))),
+                ("manifest", Json::from(to_slash(&inspection.manifest_path))),
+            ]),
+        ),
+        (
+            "repositories",
+            Json::array(
+                inspection
+                    .repositories
+                    .iter()
+                    .map(managed_repository_view_json),
+            ),
+        ),
+        (
+            "candidates",
+            Json::array(management_candidates_json(inspection)),
+        ),
+        (
+            "counts",
+            Json::object([
+                ("repositories", Json::from(inspection.repositories.len())),
+                ("usable", Json::from(usable)),
+                ("needingAttention", Json::from(attention)),
+            ]),
+        ),
+        (
+            "notices",
+            Json::array(inspection.notices.iter().map(|n| Json::from(n.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(inspection.warnings.iter().map(|w| Json::from(w.as_str()))),
+        ),
+    ])
+}
+
+/// Machine-readable view of one configured repository.
+pub fn managed_repository_view_json(repo: &manage::ManagedRepository) -> Json {
+    Json::object([
+        ("id", Json::from(repo.id.clone())),
+        ("role", Json::from(repo.role.label())),
+        ("path", Json::from(repo.path.clone())),
+        (
+            "remote",
+            Json::opt(repo.manifest_remote.clone().map(Json::from)),
+        ),
+        ("origin", Json::opt(repo.origin.clone().map(Json::from))),
+        ("remoteLabel", Json::from(repo.remote_label())),
+        ("provider", Json::opt(repo.provider.clone().map(Json::from))),
+        (
+            "branchHint",
+            Json::opt(repo.branch_hint.clone().map(Json::from)),
+        ),
+        (
+            "state",
+            Json::object([
+                ("key", Json::from(repo.state.label())),
+                ("label", Json::from(repo.state.sentence())),
+            ]),
+        ),
+        ("exists", Json::from(repo.exists)),
+        ("isRepository", Json::from(repo.is_repository)),
+        ("hasCommits", Json::from(repo.has_commits)),
+        ("branch", Json::opt(repo.branch.clone().map(Json::from))),
+        ("head", Json::opt(repo.head.clone().map(Json::from))),
+        ("clean", Json::from(repo.clean)),
+        ("changes", Json::from(repo.changes)),
+        ("ahead", Json::from(repo.ahead.map(i64::from).unwrap_or(0))),
+        (
+            "behind",
+            Json::from(repo.behind.map(i64::from).unwrap_or(0)),
+        ),
+        ("trackedByRoot", Json::from(repo.tracked_by_root)),
+        ("usable", Json::from(repo.is_usable())),
+        (
+            "issues",
+            Json::array(repo.issues.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(repo.warnings.iter().map(|line| Json::from(line.as_str()))),
+        ),
+    ])
+}
+
+/// Candidate directories of a project inspection, with the id each one would get.
+fn management_candidates_json(inspection: &manage::RepositoryInspection) -> Vec<Json> {
+    let mut scratch = GitMeshProject {
+        name: inspection.project_name.clone(),
+        root: inspection.root.clone(),
+        repositories: Vec::new(),
+    };
+    let mut next_id = |node: &setup::CandidateDirectory| -> String {
+        let id = setup::suggested_repository_id(&scratch, &node.relative_path);
+        scratch.repositories.push(crate::model::PhysicalRepository {
+            id: id.clone(),
+            role: crate::model::RepositoryRole::External,
+            relative_path: node.relative_path.clone(),
+            remote_url: None,
+            branch: None,
+            absolute_path: inspection.root.join(&node.relative_path),
+        });
+        id
+    };
+    inspection
+        .candidates
+        .iter()
+        .map(|node| candidate_view_json(node, &mut next_id))
+        .collect()
+}
+
+/// Machine-readable view of what would happen to one directory that could become a
+/// repository: the answers the interface asks for before offering the button.
+pub fn management_candidate_view_json(candidate: &manage::CandidateInspection) -> Json {
+    Json::object([
+        ("path", Json::from(candidate.path.clone())),
+        ("absolutePath", Json::from(to_slash(&candidate.absolute))),
+        ("exists", Json::from(candidate.exists)),
+        ("isRepository", Json::from(candidate.is_repository)),
+        ("hasCommits", Json::from(candidate.has_commits)),
+        (
+            "branch",
+            Json::opt(candidate.branch.clone().map(Json::from)),
+        ),
+        (
+            "origin",
+            Json::opt(candidate.origin.clone().map(Json::from)),
+        ),
+        ("trackedByRoot", Json::from(candidate.tracked_by_root)),
+        (
+            "nestedRepositories",
+            Json::array(
+                candidate
+                    .nested_repositories
+                    .iter()
+                    .map(|path| Json::from(path.clone())),
+            ),
+        ),
+        ("suggestedId", Json::from(candidate.suggested_id.clone())),
+        (
+            "managedAs",
+            Json::opt(candidate.managed_as.clone().map(Json::from)),
+        ),
+        ("canAdd", Json::from(candidate.can_add())),
+        ("consequence", Json::from(candidate.consequence())),
+        (
+            "blockers",
+            Json::array(candidate.blockers.iter().map(|b| Json::from(b.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(candidate.warnings.iter().map(|w| Json::from(w.as_str()))),
+        ),
+    ])
+}
+
+/// Machine-readable view of a management plan: what the review panel shows, and what the
+/// interface sends back when the user confirms (the `id` must match).
+///
+/// The plan is the single source of truth for both the preview and the execution: the
+/// manifest preview here *is* the manifest the execution writes.
+pub fn management_plan_view_json(plan: &manage::RepositoryPlan) -> Json {
+    Json::object([
+        ("kind", Json::from("plan")),
+        ("flow", Json::from("repository")),
+        ("id", Json::from(plan.id.clone())),
+        ("ready", Json::from(plan.is_ready())),
+        ("noop", Json::from(plan.is_noop())),
+        ("summary", Json::from(plan.summary())),
+        (
+            "project",
+            Json::object([
+                ("name", Json::from(plan.name.clone())),
+                ("root", Json::from(to_slash(&plan.root))),
+                ("manifest", Json::from(to_slash(&plan.manifest_path))),
+            ]),
+        ),
+        (
+            "manifest",
+            Json::object([
+                (
+                    "before",
+                    Json::opt(plan.manifest_before.clone().map(Json::from)),
+                ),
+                ("after", Json::from(plan.manifest_after.clone())),
+                ("changes", Json::from(plan.manifest_changes)),
+            ]),
+        ),
+        (
+            "changes",
+            Json::array(plan.changes.iter().map(|change| {
+                Json::object([
+                    ("kind", Json::from(change.kind.label())),
+                    ("heading", Json::from(change.kind.heading())),
+                    (
+                        "configuration",
+                        Json::from(change.kind.changes_configuration()),
+                    ),
+                    ("id", Json::from(change.id.clone())),
+                    ("path", Json::from(change.path.clone())),
+                    ("before", Json::opt(change.before.clone().map(Json::from))),
+                    ("after", Json::opt(change.after.clone().map(Json::from))),
+                    ("detail", Json::from(change.detail.clone())),
+                    ("state", Json::from(change.state.label())),
+                    ("symbol", Json::from(plan_state_symbol(&change.state))),
+                    ("reason", Json::opt(change.state.reason().map(Json::from))),
+                ])
+            })),
+        ),
+        (
+            "actions",
+            Json::array(plan.actions.iter().map(|action| {
+                Json::object([
+                    ("kind", Json::from(action.kind.label())),
+                    ("heading", Json::from(action.kind.heading())),
+                    ("role", Json::from(action.kind.role())),
+                    ("target", Json::from(action.target.clone())),
+                    ("path", Json::from(action.path.clone())),
+                    ("detail", Json::from(action.detail.clone())),
+                    ("state", Json::from(action.state.label())),
+                    ("symbol", Json::from(plan_state_symbol(&action.state))),
+                    ("reason", Json::opt(action.state.reason().map(Json::from))),
+                ])
+            })),
+        ),
+        (
+            // What a removal does *not* touch, recorded while the directory is still
+            // there, so the result can prove nothing of it was deleted.
+            "removals",
+            Json::array(plan.removals.iter().map(|removal| {
+                Json::object([
+                    ("id", Json::from(removal.id.clone())),
+                    ("path", Json::from(removal.path.clone())),
+                    ("isRepository", Json::from(removal.is_repository)),
+                    ("head", Json::opt(removal.head.clone().map(Json::from))),
+                    ("origin", Json::opt(removal.origin.clone().map(Json::from))),
+                    ("trackedByRoot", Json::from(removal.tracked_by_root)),
+                ])
+            })),
+        ),
+        (
+            "counts",
+            Json::object([
+                ("changes", Json::from(plan.changes.len())),
+                ("plannedChanges", Json::from(plan.planned_changes().count())),
+                (
+                    "satisfiedChanges",
+                    Json::from(plan.satisfied_changes().count()),
+                ),
+                ("blockedChanges", Json::from(plan.blocked_changes().count())),
+                ("actions", Json::from(plan.actions.len())),
+                ("plannedActions", Json::from(plan.planned_actions().count())),
+                (
+                    "satisfiedActions",
+                    Json::from(plan.satisfied_actions().count()),
+                ),
+                ("blockedActions", Json::from(plan.blocked_actions().count())),
+            ]),
+        ),
+        (
+            "safety",
+            Json::array(plan.safety.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "blockers",
+            Json::array(plan.blockers.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(plan.warnings.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "notices",
+            Json::array(plan.notices.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "expectedOrigins",
+            Json::array(
+                plan.expected_origins
+                    .iter()
+                    .map(|line| Json::from(line.as_str())),
+            ),
+        ),
+    ])
+}
+
+/// Symbol of a plan row: what will run, what is already there, what is blocked.
+fn plan_state_symbol(state: &StepState) -> &'static str {
+    match state {
+        StepState::Planned => "…",
+        StepState::AlreadySatisfied(_) => "–",
+        StepState::Blocked(_) => "✗",
+    }
+}
+
+/// Machine-readable view of a management result: what each unit of work did, and the
+/// evidence that each change really happened.
+pub fn management_result_view_json(result: &manage::RepositoryManagementResult) -> Json {
+    let validation = match &result.validation {
+        Some(report) => validation_view_json(report),
+        None => Json::Null,
+    };
+    Json::object([
+        ("kind", Json::from("result")),
+        ("flow", Json::from("repository")),
+        ("planId", Json::from(result.plan_id.clone())),
+        ("dryRun", Json::from(result.dry_run)),
+        ("status", Json::from(result.kind.label())),
+        ("sentence", Json::from(result.sentence())),
+        ("summary", Json::from(result.kind.sentence())),
+        ("exitCode", Json::from(result.exit_code() as i64)),
+        ("success", Json::from(result.is_success())),
+        (
+            "counts",
+            Json::object([
+                ("succeeded", Json::from(result.succeeded())),
+                ("skipped", Json::from(result.skipped())),
+                ("failed", Json::from(result.failures().count())),
+                ("applied", Json::from(result.applied().count())),
+                ("notApplied", Json::from(result.not_applied().count())),
+            ]),
+        ),
+        (
+            "changes",
+            Json::array(result.changes.iter().map(|outcome| {
+                let change = &outcome.change;
+                Json::object([
+                    ("kind", Json::from(change.kind.label())),
+                    ("heading", Json::from(change.kind.heading())),
+                    ("id", Json::from(change.id.clone())),
+                    ("path", Json::from(change.path.clone())),
+                    ("before", Json::opt(change.before.clone().map(Json::from))),
+                    ("after", Json::opt(change.after.clone().map(Json::from))),
+                    ("detail", Json::from(change.detail.clone())),
+                    ("outcome", Json::from(outcome.outcome.label())),
+                    ("symbol", Json::from(outcome.outcome.symbol())),
+                    (
+                        "evidence",
+                        Json::array(outcome.evidence.iter().map(|e| Json::from(e.as_str()))),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "actions",
+            Json::array(result.actions.iter().map(|outcome| {
+                Json::object([
+                    ("kind", Json::from(outcome.kind.label())),
+                    ("heading", Json::from(outcome.kind.heading())),
+                    ("row", Json::from(outcome.row_id())),
+                    ("target", Json::from(outcome.target.clone())),
+                    ("path", Json::from(outcome.path.clone())),
+                    ("outcome", Json::from(outcome.outcome.label())),
+                    ("symbol", Json::from(outcome.symbol())),
+                    ("summary", Json::from(outcome.summary.clone())),
+                    (
+                        "details",
+                        Json::array(outcome.details.iter().map(|d| Json::from(d.as_str()))),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "manifest",
+            Json::opt(
+                result
+                    .manifest_path
+                    .as_ref()
+                    .map(|path| Json::from(to_slash(path))),
+            ),
+        ),
+        (
+            "project",
+            match &result.project {
+                Some(project) => Json::object([
+                    ("name", Json::from(project.name.clone())),
+                    ("root", Json::from(to_slash(&project.root))),
+                    (
+                        "repositories",
+                        Json::array(project.sorted_repositories().iter().map(|repo| {
+                            Json::object([
+                                ("id", Json::from(repo.id.clone())),
+                                ("path", Json::from(repo.relative_slash())),
+                                ("role", Json::from(repo.role.label())),
+                            ])
+                        })),
+                    ),
+                ]),
+                None => Json::Null,
+            },
+        ),
+        ("validation", validation),
+        (
+            "refused",
+            Json::array(result.refused.iter().map(|line| Json::from(line.as_str()))),
+        ),
+        (
+            "warnings",
+            Json::array(result.warnings.iter().map(|line| Json::from(line.as_str()))),
+        ),
+    ])
+}
+
 /// Machine-readable view of the validation of a project.
 pub fn validation_view_json(report: &setup::ValidationReport) -> Json {
     Json::object([
@@ -1935,6 +2364,278 @@ mod tests {
         assert!(json.contains("\"detailLines\""));
         assert!(json.contains("\"succeeded\":1"));
         assert!(json.contains("\"status\":["));
+    }
+
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn add_intent(path: &str, id: &str) -> manage::RepositoryIntent {
+        manage::RepositoryIntent::Add {
+            path: path.to_string(),
+            id: id.to_string(),
+            remote: None,
+            branch: None,
+            initialize: true,
+            configure_remote: false,
+            untrack_from_root: true,
+        }
+    }
+
+    fn plan_management(
+        session: &ProjectSession,
+        fixture: &RepoFixture,
+        intent: manage::RepositoryIntent,
+    ) -> manage::RepositoryPlan {
+        manage::plan(
+            session.project(),
+            &manage::RepositoryManagementRequest::one(intent),
+            fixture.runner(),
+        )
+        .expect("the plan is built")
+    }
+
+    #[test]
+    fn the_management_inspection_view_lists_repositories_candidates_and_state() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        fixture.write("engine/lib.rs", "pub fn go() {}\n");
+        let session = open_session(&fixture);
+        let inspection = manage::inspect(session.project(), fixture.runner()).unwrap();
+        let json = management_inspection_view_json(&inspection).to_string();
+
+        assert!(json.contains("\"kind\":\"repositories\""), "{json}");
+        assert!(
+            json.contains("\"project\":{\"name\":\"project\""),
+            "the project is named: {json}"
+        );
+        assert!(json.contains("\"id\":\"root\",\"role\":\"root\""), "{json}");
+        assert!(json.contains("\"state\":{\"key\":\"ready\""), "{json}");
+        assert!(json.contains("\"usable\":true"), "{json}");
+        // The directory that is not configured yet is offered as a candidate, with the id
+        // it would get, because that is what the interface shows before the button.
+        assert!(
+            json.contains("\"candidates\":[{\"name\":\"engine\""),
+            "{json}"
+        );
+        assert!(json.contains("\"path\":\"engine\""), "{json}");
+        assert!(json.contains("\"needingAttention\":0"), "{json}");
+    }
+
+    #[test]
+    fn the_management_plan_view_describes_the_change_before_it_runs() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        fixture.write("new-module/lib.rs", "pub fn go() {}\n");
+        // The root repository already tracks the file: bringing the directory in as a
+        // repository of its own has to say what happens to that ownership.
+        fixture.add_all(".");
+        fixture.commit(".", "root tracks the module");
+        let session = open_session(&fixture);
+        let plan = plan_management(&session, &fixture, add_intent("new-module", ""));
+        let json = management_plan_view_json(&plan).to_string();
+
+        assert!(json.contains("\"kind\":\"plan\""), "{json}");
+        assert!(json.contains("\"flow\":\"repository\""), "{json}");
+        assert!(
+            json.contains(&format!("\"id\":\"{}\"", plan.id)),
+            "the plan id is what the interface reviews: {json}"
+        );
+        assert!(json.contains("\"ready\":true"), "{json}");
+        assert!(json.contains("\"noop\":false"), "{json}");
+        assert!(json.contains("changes to the configuration"), "{json}");
+        // The preview is the manifest the execution writes, not a second rendering.
+        assert!(
+            json.contains(&format!(
+                "\"manifest\":{{\"before\":{},\"after\":",
+                Json::from(plan.manifest_before.clone().unwrap_or_default()).compact()
+            )),
+            "{json}"
+        );
+        for kind in [
+            "add-repository",
+            "initialize-repository",
+            "untrack-from-root",
+        ] {
+            assert!(
+                json.contains(&format!("\"kind\":\"{kind}\"")),
+                "{kind} in {json}"
+            );
+        }
+        assert!(json.contains("\"kind\":\"update-manifest\""), "{json}");
+        assert!(
+            !json.contains("\"symbol\":\"✗\""),
+            "nothing is blocked here: {json}"
+        );
+        assert!(
+            json.matches("\"symbol\":\"…\"").count() > 0,
+            "planned rows say what will run: {json}"
+        );
+    }
+
+    #[test]
+    fn the_management_result_view_proves_every_change_and_reports_failures() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        fixture.write("new-module/lib.rs", "pub fn go() {}\n");
+        let session = open_session(&fixture);
+        let plan = plan_management(&session, &fixture, add_intent("new-module", ""));
+        let result = manage::apply(
+            &plan,
+            false,
+            fixture.runner(),
+            &mut manage::RepositoryObserver::silent(),
+        );
+        let json = management_result_view_json(&result).to_string();
+
+        assert!(json.contains("\"kind\":\"result\""), "{json}");
+        assert!(json.contains("\"success\":true"), "{json}");
+        assert!(json.contains("\"exitCode\":0"), "{json}");
+        assert!(json.contains("\"failed\":0"), "{json}");
+        assert!(json.contains("\"notApplied\":0"), "{json}");
+        assert!(json.contains("\"sentence\":\""), "{json}");
+        assert!(
+            json.contains("\"outcome\":\"applied\""),
+            "the changes are reported as applied: {json}"
+        );
+        assert!(
+            json.contains("\"symbol\":\"✓\""),
+            "the actions carry the shared symbols: {json}"
+        );
+        assert!(
+            json.contains("\"evidence\":[\""),
+            "every change carries the proof it happened: {json}"
+        );
+        assert!(
+            json.contains("\"repositories\":[{\"id\":\"root\""),
+            "the result carries the resulting project: {json}"
+        );
+        assert!(json.contains("\"validation\":{\"ok\":true"), "{json}");
+
+        // Repeating the operation: the interface must be able to say "nothing to do"
+        // rather than showing a change that did not happen. The project is reopened first,
+        // exactly as the interface does when an operation finishes.
+        let session = open_session(&fixture);
+        let again = plan_management(&session, &fixture, add_intent("new-module", ""));
+        let again_json = management_plan_view_json(&again).to_string();
+        assert!(again_json.contains("\"noop\":true"), "{again_json}");
+        assert!(again_json.contains("nothing to do"), "{again_json}");
+
+        let replay = manage::apply(
+            &plan,
+            true,
+            fixture.runner(),
+            &mut manage::RepositoryObserver::silent(),
+        );
+        let replay_json = management_result_view_json(&replay).to_string();
+        assert!(replay_json.contains("\"dryRun\":true"), "{replay_json}");
+        assert!(replay_json.contains("Dry run"), "{replay_json}");
+        assert!(replay_json.contains("\"applied\":0"), "{replay_json}");
+        assert!(replay_json.contains("\"validation\":null"), "{replay_json}");
+    }
+
+    #[test]
+    fn the_management_result_view_reports_a_failure_without_hiding_the_rest() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        // The directory exists but cannot be initialised: a real failure the interface has
+        // to show as such, next to the repositories that were configured fine.
+        fixture.write("good/lib.rs", "fn main() {}\n");
+        fixture.write("blocked/lib.rs", "fn main() {}\n");
+        fixture.write("new-module/lib.rs", "fn main() {}\n");
+        let blocked = fixture.path().join("blocked");
+        set_mode(&blocked, 0o500);
+
+        let session = open_session(&fixture);
+        let plan = manage::plan(
+            session.project(),
+            &manage::RepositoryManagementRequest {
+                intents: vec![
+                    add_intent("good", ""),
+                    add_intent("blocked", ""),
+                    add_intent("new-module", ""),
+                ],
+            },
+            fixture.runner(),
+        )
+        .unwrap();
+        let result = manage::apply(
+            &plan,
+            false,
+            fixture.runner(),
+            &mut manage::RepositoryObserver::silent(),
+        );
+        let json = management_result_view_json(&result).to_string();
+
+        assert!(json.contains("\"success\":false"), "{json}");
+        assert!(json.contains("\"exitCode\":1"), "{json}");
+        assert!(json.contains("\"outcome\":\"failed\""), "{json}");
+        assert!(json.contains("\"symbol\":\"✗\""), "{json}");
+        assert!(
+            json.contains("\"kind\":\"verify-project\""),
+            "the verification says the project is not what the plan promised: {json}"
+        );
+        // The repositories that were configured are reported as succeeding: one failure
+        // never hides the rest.
+        assert!(json.contains("\"target\":\"good\""), "{json}");
+        assert!(json.contains("\"target\":\"new-module\""), "{json}");
+        assert!(json.contains("\"outcome\":\"success\""), "{json}");
+        // And the failed one keeps the real Git error for the detail panel.
+        assert!(json.contains("Permission denied"), "{json}");
+
+        // Restore the permissions so the temporary directory can be cleaned up.
+        set_mode(&blocked, 0o700);
+    }
+
+    #[test]
+    fn the_management_candidate_view_answers_the_questions_before_adding() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", ".")]);
+        fixture.write("plain/lib.rs", "pub fn go() {}\n");
+        fixture.init_repo("already");
+        let session = open_session(&fixture);
+
+        let plain =
+            manage::inspect_candidate(session.project(), "plain", fixture.runner()).unwrap();
+        let plain_json = management_candidate_view_json(&plain).to_string();
+        assert!(
+            plain_json.contains("\"isRepository\":false"),
+            "{plain_json}"
+        );
+        assert!(plain_json.contains("\"canAdd\":true"), "{plain_json}");
+        assert!(
+            plain_json.contains("\"suggestedId\":\"plain\""),
+            "{plain_json}"
+        );
+        assert!(plain_json.contains("git init"), "{plain_json}");
+        assert!(plain_json.contains("\"blockers\":[]"), "{plain_json}");
+
+        let existing =
+            manage::inspect_candidate(session.project(), "already", fixture.runner()).unwrap();
+        let existing_json = management_candidate_view_json(&existing).to_string();
+        assert!(
+            existing_json.contains("\"isRepository\":true"),
+            "{existing_json}"
+        );
+        assert!(
+            existing_json.contains("adopt") || existing_json.contains("already a Git repository"),
+            "{existing_json}"
+        );
+
+        // A path that is not there is refused before anything is offered, never after
+        // something was created.
+        let missing =
+            manage::inspect_candidate(session.project(), "nope", fixture.runner()).unwrap();
+        let missing_json = management_candidate_view_json(&missing).to_string();
+        assert!(missing_json.contains("\"exists\":false"), "{missing_json}");
+        assert!(missing_json.contains("\"canAdd\":false"), "{missing_json}");
+        assert!(
+            !missing_json.contains("\"blockers\":[]"),
+            "the reason is given: {missing_json}"
+        );
     }
 
     #[test]

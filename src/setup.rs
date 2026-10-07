@@ -740,6 +740,12 @@ pub struct SetupPlan {
     pub manifest: String,
     /// Human-readable safety statements, computed from the steps.
     pub safety: Vec<String>,
+    /// Ids whose recorded remote the plan guarantees is configured as `origin` when it is
+    /// done (the ones it adds, updates, or finds already pointing where the manifest says).
+    ///
+    /// A remote that is only recorded is not an expectation for Git, so validation never
+    /// turns "the user asked for no Git configuration" into a failure.
+    pub expected_origins: Vec<String>,
 }
 
 impl SetupPlan {
@@ -1428,6 +1434,19 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
     }
 
     let safety = safety_statements(&steps, &repositories, &existing_manifest, &manifest);
+    // Remotes the setup is responsible for: the ones it configures, and the ones that
+    // already point where the manifest says. A record-only remote is not one of them.
+    let expected_origins: Vec<String> = repositories
+        .iter()
+        .filter(|repo| {
+            repo.remote.is_some()
+                && matches!(
+                    repo.remote_action,
+                    RemoteAction::Add | RemoteAction::Update | RemoteAction::Keep
+                )
+        })
+        .map(|repo| repo.id.clone())
+        .collect();
     let mut plan = SetupPlan {
         id: String::new(),
         request: request.clone(),
@@ -1442,6 +1461,7 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
         notices,
         manifest,
         safety,
+        expected_origins,
     };
     plan.id = plan.fingerprint();
     Ok(plan)
@@ -1966,7 +1986,7 @@ pub fn apply(
         None
     };
     let validation = if manifest_on_disk && !dry_run {
-        Some(verify_with(&plan.root, runner, plan.request.set_git_remote))
+        Some(verify_expecting(&plan.root, runner, &plan.expected_origins))
     } else {
         None
     };
@@ -2002,6 +2022,33 @@ pub fn verify(root: &Path, runner: &GitRunner) -> ValidationReport {
 /// because Git has no `origin`: the user asked for exactly that, and `verify_with` reports
 /// it as the honest state instead of an error.
 pub fn verify_with(root: &Path, runner: &GitRunner, expect_origins: bool) -> ValidationReport {
+    let expectation = |_repo: &PhysicalRepository| expect_origins;
+    verify_project(root, runner, &expectation)
+}
+
+/// Same check, told *which* repositories must have their recorded remote configured.
+///
+/// Repository management uses this: an operation may configure the remote of one
+/// repository while another one only records its URL in the manifest, or is left alone
+/// with an `origin` that drifted. Only the repositories the operation is responsible for
+/// are expectations; the others are reported as they are, without turning into failures
+/// of an operation that never touched them.
+pub fn verify_expecting(
+    root: &Path,
+    runner: &GitRunner,
+    expected_origins: &[String],
+) -> ValidationReport {
+    let expectation = |repo: &PhysicalRepository| expected_origins.iter().any(|id| id == &repo.id);
+    verify_project(root, runner, &expectation)
+}
+
+/// The one implementation of "can GitMesh open what is on disk", parameterised by which
+/// repositories must have their recorded remote configured as `origin`.
+fn verify_project(
+    root: &Path,
+    runner: &GitRunner,
+    expect_origin: &dyn Fn(&PhysicalRepository) -> bool,
+) -> ValidationReport {
     let root =
         paths::lexical_normalize(&paths::absolute(root).unwrap_or_else(|_| root.to_path_buf()));
     let manifest_path = manifest::manifest_path(&root);
@@ -2071,7 +2118,7 @@ pub fn verify_with(root: &Path, runner: &GitRunner, expect_origins: bool) -> Val
                 );
                 remote_ok = false;
             } else if let Some(remote) = &repo.remote_url {
-                if !expect_origins {
+                if !expect_origin(repo) {
                     // Record-only: the manifest is the only place the remote has to be.
                 } else {
                     match &origin {

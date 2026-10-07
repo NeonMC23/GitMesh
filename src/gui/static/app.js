@@ -641,8 +641,257 @@ var GitMesh = (function () {
     return folded;
   }
 
+  // ------------------------------------------------------------ repositories --
+
+  var REPOSITORY_STATE_LABEL = {
+    'ready': 'ready',
+    'no-repository': 'no Git repository here yet',
+    'missing': 'the directory is missing'
+  };
+
+  function repositoryStateLabel(key) {
+    return REPOSITORY_STATE_LABEL[key] || key || 'unknown';
+  }
+
+  /// One row per configured repository. Every fact comes from the inspection the Rust side
+  /// built: the interface words it, it never inspects a `.git` directory itself.
+  function repositoryRows(inspection) {
+    var repositories = (inspection && inspection.repositories) || [];
+    return repositories.map(function (repo) {
+      var issues = repo.issues || [];
+      var warnings = repo.warnings || [];
+      return {
+        id: repo.id,
+        role: repo.role,
+        roleLabel: repo.role === 'root' ? 'project root' : 'repository',
+        path: repo.path,
+        state: repo.state ? repo.state.key : 'unknown',
+        stateLabel: repo.state ? repo.state.label : 'unknown',
+        branch: repo.branch || '',
+        head: repo.head || '',
+        remote: repo.remote || '',
+        origin: repo.origin || '',
+        remoteLabel: repo.remoteLabel || 'local only',
+        trackedByRoot: repo.trackedByRoot || 0,
+        usable: !!repo.usable,
+        attention: issues.concat(warnings),
+        problem: issues.length > 0
+      };
+    });
+  }
+
+  /// The headline of the panel: how many repositories, and how many need attention.
+  function repositorySummary(inspection) {
+    var rows = repositoryRows(inspection);
+    var problems = rows.filter(function (row) { return row.problem; }).length;
+    var unavailable = rows.filter(function (row) { return !row.usable; }).length;
+    var sentence;
+    if (!rows.length) {
+      sentence = 'No repository is configured yet.';
+    } else {
+      sentence = countLabel(rows.length, 'repository', 'repositories') + ' in this project';
+      if (problems) {
+        sentence += ' · ' + countLabel(problems, 'repository', 'repositories') + ' need attention';
+      }
+      if (unavailable) {
+        sentence += ' · ' + countLabel(unavailable, 'repository', 'repositories') +
+          ' cannot be used as they are';
+      }
+    }
+    return { count: rows.length, rows: rows, problems: problems, unavailable: unavailable,
+      sentence: sentence };
+  }
+
+  /// What GitMesh would do with one directory, in the order it would happen. The facts and
+  /// the blockers come from the inspection; this only writes them as a sentence a user can
+  /// disagree with before anything is created.
+  function candidateSummary(candidate) {
+    if (!candidate) { return null; }
+    var steps = [];
+    var headline;
+    if (!candidate.exists) {
+      headline = 'There is no directory \'' + candidate.path + '\' in this project.';
+      return { path: candidate.path, headline: headline, steps: [], blockers: candidate.blockers || [],
+        warnings: candidate.warnings || [], canAdd: false, isRepository: false, trackedByRoot: 0,
+        nestedRepositories: [], suggestedId: '', remote: '', branch: '' };
+    }
+    if (candidate.managedAs) {
+      headline = '\'' + candidate.path + '\' already is the repository \'' + candidate.managedAs + '\'.';
+      steps.push('nothing is added and nothing is re-initialised');
+      steps.push('use "give it another name" or "record another remote" below to change it');
+    } else if (candidate.isRepository) {
+      headline = 'An existing Git repository would be adopted.';
+      steps.push('use the repository as it is; it is never re-initialised');
+      steps.push('add it to the project as \'' + (candidate.suggestedId || candidate.path) + '\'');
+    } else {
+      headline = 'A Git repository would be created there.';
+      steps.push('run git init in \'' + candidate.path + '\'');
+      steps.push('add it to the project as \'' + (candidate.suggestedId || candidate.path) + '\'');
+    }
+    if (candidate.trackedByRoot > 0) {
+      steps.push(countLabel(candidate.trackedByRoot, 'file', 'files') +
+        ' of it are tracked by the root repository: they would belong to two repositories unless ' +
+        'you stop tracking them there');
+    }
+    (candidate.nestedRepositories || []).forEach(function (path) {
+      steps.push('leave the nested repository \'' + path + '\' alone');
+    });
+    if (candidate.branch) { steps.push('keep the branch \'' + candidate.branch + '\''); }
+    if (candidate.origin) { steps.push('record the remote it already has: ' + candidate.origin); }
+    return {
+      path: candidate.path,
+      headline: headline,
+      steps: steps,
+      blockers: candidate.blockers || [],
+      warnings: candidate.warnings || [],
+      canAdd: !!candidate.canAdd,
+      isRepository: !!candidate.isRepository,
+      trackedByRoot: candidate.trackedByRoot || 0,
+      nestedRepositories: candidate.nestedRepositories || [],
+      suggestedId: candidate.suggestedId || '',
+      remote: candidate.origin || '',
+      branch: candidate.branch || ''
+    };
+  }
+
+  /// The fields one repository action sends. The names are the ones the server reads, so
+  /// there is exactly one spelling of an add, a rename, a remote change and a removal.
+  function repositoryRequestFields(form) {
+    var fields = { intent: form.intent };
+    if (form.intent === 'add') {
+      fields.path = (form.path || '').trim();
+      fields.id = (form.id || '').trim();
+      fields.remote = (form.remote || '').trim();
+      fields.branch = (form.branch || '').trim();
+      fields.initialize = form.initialize ? 'true' : 'false';
+      fields.configureRemote = form.configureRemote ? 'true' : 'false';
+      fields.untrack = form.untrack ? 'true' : 'false';
+    } else if (form.intent === 'rename') {
+      fields.id = (form.id || '').trim();
+      fields.newId = (form.newId || '').trim();
+    } else if (form.intent === 'set-remote') {
+      fields.id = (form.id || '').trim();
+      fields.remote = (form.remote || '').trim();
+      fields.configure = form.configureGit ? 'true' : 'false';
+    } else if (form.intent === 'remove') {
+      fields.id = (form.id || '').trim();
+      fields.confirmTakeover = form.takeover ? 'true' : 'false';
+    }
+    return fields;
+  }
+
+  /// A plan, in the words of the review screen. Nothing is decided here: the changes, the
+  /// steps, the safety statements and the manifest text are the plan the service built, so
+  /// the preview and the execution cannot disagree.
+  function managementPlanSummary(plan) {
+    if (!plan) { return null; }
+    var counts = plan.counts || {};
+    var manifest = plan.manifest || {};
+    var changes = (plan.changes || []).map(function (change) {
+      return {
+        id: change.id,
+        kind: change.kind,
+        path: change.path,
+        symbol: change.symbol || '',
+        state: change.state,
+        reason: change.reason || '',
+        sentence: change.detail,
+        configuration: !!change.configuration,
+        before: change.before,
+        after: change.after
+      };
+    });
+    var actions = (plan.actions || []).map(function (action) {
+      return {
+        kind: action.kind,
+        target: action.target,
+        path: action.path,
+        role: action.role || '',
+        symbol: action.symbol || '',
+        state: action.state,
+        reason: action.reason || '',
+        detail: action.detail
+      };
+    });
+    var touched = [];
+    changes.forEach(function (change) {
+      if (change.id && touched.indexOf(change.id) === -1) { touched.push(change.id); }
+    });
+    return {
+      id: plan.id,
+      ready: !!plan.ready,
+      noop: !!plan.noop,
+      summary: plan.summary || '',
+      changes: changes,
+      actions: actions,
+      planned: counts.plannedChanges || 0,
+      steps: counts.plannedActions || 0,
+      alreadyInPlace: (counts.satisfiedChanges || 0) + (counts.satisfiedActions || 0),
+      blocked: counts.blockedChanges || 0,
+      touched: touched,
+      safety: plan.safety || [],
+      blockers: plan.blockers || [],
+      warnings: plan.warnings || [],
+      notices: plan.notices || [],
+      manifestChanges: !!manifest.changes,
+      manifestAfter: manifest.after || '',
+      manifestBefore: manifest.before || '',
+      state: !plan.ready ? 'blocked' : (plan.noop ? 'nothing to do' : 'ready')
+    };
+  }
+
+  /// What happened, in the words of the result panel: every change with the evidence that
+  /// it really happened, and every failure with the Git error behind it.
+  function managementResultText(result) {
+    if (!result) { return null; }
+    var counts = result.counts || {};
+    var changes = (result.changes || []).map(function (change) {
+      return {
+        id: change.id,
+        path: change.path,
+        kind: change.kind,
+        symbol: change.symbol || '',
+        outcome: change.outcome,
+        sentence: change.detail,
+        evidence: change.evidence || []
+      };
+    });
+    var failures = (result.actions || []).filter(function (action) {
+      return action.outcome === 'failed';
+    }).map(function (action) {
+      return {
+        id: action.target,
+        path: action.path,
+        kind: action.kind,
+        detail: action.summary,
+        details: action.details || []
+      };
+    });
+    var summary = result.sentence || '';
+    if (counts.applied !== undefined) {
+      summary += ' (' + countLabel(counts.applied || 0, 'change', 'changes') + ' applied, ' +
+        countLabel(counts.failed || 0, 'step', 'steps') + ' failed)';
+    }
+    return {
+      status: result.status,
+      success: !!result.success,
+      dryRun: !!result.dryRun,
+      sentence: result.sentence || '',
+      summary: summary,
+      planId: result.planId,
+      applied: counts.applied || 0,
+      notApplied: counts.notApplied || 0,
+      succeeded: counts.succeeded || 0,
+      skipped: counts.skipped || 0,
+      failed: counts.failed || 0,
+      changes: changes,
+      failures: failures,
+      refused: result.refused || [],
+      validation: result.validation
+    };
+  }
+
   return {
-    stateLabel: stateLabel,
     changeLabel: changeLabel,
     countLabel: countLabel,
     projectSummary: projectSummary,
@@ -671,7 +920,14 @@ var GitMesh = (function () {
     hostedCommands: hostedCommands,
     setupResultText: setupResultText,
     publishResultText: publishResultText,
-    setupProgressRows: setupProgressRows
+    setupProgressRows: setupProgressRows,
+    repositoryStateLabel: repositoryStateLabel,
+    repositoryRows: repositoryRows,
+    repositorySummary: repositorySummary,
+    candidateSummary: candidateSummary,
+    repositoryRequestFields: repositoryRequestFields,
+    managementPlanSummary: managementPlanSummary,
+    managementResultText: managementResultText
   };
 })();
 
@@ -734,6 +990,12 @@ if (typeof document !== 'undefined') {
         $('welcome-path').value = model.directory || '';
         $('welcome-error').hidden = true;
         $('status-line').textContent = 'no project open';
+        repositories = null;
+        repoCandidate = null;
+        invalidateRepoPlan();
+        $('repos-table').innerHTML = '';
+        $('repos-summary').textContent = '';
+        $('repo-result-card').hidden = true;
         return;
       }
 
@@ -1006,7 +1268,7 @@ if (typeof document !== 'undefined') {
       box.innerHTML = html;
     }
 
-    function startOperation(path, body, sentence) {
+    function startOperation(path, body, sentence, onFinished) {
       if (activeOperation) { return; }
       $('operation').hidden = false;
       $('operation-title').textContent = sentence || 'Working…';
@@ -1033,6 +1295,7 @@ if (typeof document !== 'undefined') {
           var rows = state.rows;
           showOperation(rows, state);
           showResult({ operation: state.operation, rows: rows, dryRun: state.dryRun, failed: state.failed }, payload);
+          if (onFinished) { onFinished(payload || {}, rows, state); }
           if (payload && payload.model) {
             model = payload.model;
             render();
@@ -2009,6 +2272,297 @@ if (typeof document !== 'undefined') {
       }
     }
 
+    // ---------------------------------------------------------- repositories --
+
+    var repositories = null;   // the last inspection of /api/repositories
+    var repoCandidate = null;  // the last directory that was checked
+    var repoRequest = null;    // the request behind the plan on screen
+    var repoPlan = null;       // the reviewed plan
+
+    function repoMessage(text) {
+      $('repos-message').hidden = !text;
+      $('repos-message').textContent = text || '';
+    }
+
+    function loadRepositories() {
+      if (!(model && model.opened)) { return Promise.resolve(null); }
+      return api('/api/repositories').then(function (data) {
+        repositories = data.inspection;
+        renderRepositories();
+        repoMessage('');
+        return repositories;
+      }).catch(function (error) {
+        repoMessage(error.message);
+        return null;
+      });
+    }
+
+    function renderRepositories() {
+      if (!repositories) { return; }
+      var summary = GitMesh.repositorySummary(repositories);
+      $('repos-summary').textContent = summary.sentence;
+
+      if (!summary.rows.length) {
+        $('repos-table').innerHTML = '<p class="hint">No repository is configured yet. Add one ' +
+          'below: GitMesh shows you the plan before it writes anything.</p>';
+      } else {
+        var html = '<table><thead><tr><th>Repository</th><th>Path</th><th>Branch</th>' +
+          '<th>State</th><th>Remote</th><th>Needs attention</th></tr></thead><tbody>';
+        summary.rows.forEach(function (row) {
+          var cls = row.problem ? 'problem' : (row.attention.length ? 'attention' : '');
+          html += '<tr class="' + cls + '">' +
+            '<td><strong>' + escapeHtml(row.id) + '</strong><br><span class="tag">' +
+            escapeHtml(row.roleLabel) + '</span></td>' +
+            '<td class="owner mono">' + escapeHtml(row.path) + '</td>' +
+            '<td class="mono">' + escapeHtml(row.branch || '—') + '</td>' +
+            '<td>' + escapeHtml(row.stateLabel) + '</td>' +
+            '<td class="mono">' + escapeHtml(row.remoteLabel) + '</td>' +
+            '<td>' + (row.attention.length
+              ? row.attention.map(function (line) {
+                  return '<span class="repo-flag' + (row.problem ? ' problem' : '') + '">' +
+                    escapeHtml(line) + '</span>';
+                }).join('')
+              : '—') + '</td>' +
+            '</tr>';
+        });
+        html += '</tbody></table>';
+        $('repos-table').innerHTML = html;
+      }
+
+      var select = $('repo-target');
+      var previous = select.value;
+      select.innerHTML = '';
+      summary.rows.forEach(function (row) {
+        var option = document.createElement('option');
+        option.value = row.id;
+        option.textContent = row.id + '  (' + row.path + ')';
+        select.appendChild(option);
+      });
+      if (previous) { select.value = previous; }
+      renderRepoIntent();
+    }
+
+    /// The three shapes of the "change one repository" card: only the fields of the chosen
+    /// action are offered, so nothing is typed that the plan would ignore.
+    function renderRepoIntent() {
+      var intent = $('repo-intent').value;
+      $('repo-new-id-field').hidden = intent !== 'rename';
+      $('repo-edit-remote-field').hidden = intent !== 'set-remote';
+      $('repo-configure-git-field').hidden = intent !== 'set-remote';
+      $('repo-takeover-field').hidden = intent !== 'remove';
+    }
+
+    function checkRepoDirectory() {
+      var path = ($('repo-path').value || '').trim();
+      if (!path) {
+        repoMessage('type the directory of the repository, relative to the project root');
+        return;
+      }
+      api('/api/repository/inspect', { path: path }).then(function (data) {
+        repoCandidate = data.candidate;
+        renderCandidate(GitMesh.candidateSummary(repoCandidate));
+        repoMessage('');
+      }).catch(function (error) {
+        repoCandidate = null;
+        renderCandidate(null);
+        repoMessage(error.message);
+      });
+    }
+
+    function renderCandidate(summary) {
+      if (!summary) {
+        $('repo-candidate').hidden = true;
+        $('repo-add-form').hidden = true;
+        return;
+      }
+      var html = '<div class="candidate"><p><strong>' + escapeHtml(summary.headline) + '</strong></p>';
+      if (summary.steps.length) {
+        html += '<ul>' + summary.steps.map(function (step) {
+          return '<li>' + escapeHtml(step) + '</li>';
+        }).join('') + '</ul>';
+      }
+      summary.blockers.forEach(function (line) {
+        html += '<p class="repo-flag problem">' + escapeHtml(line) + '</p>';
+      });
+      summary.warnings.forEach(function (line) {
+        html += '<p class="repo-flag">' + escapeHtml(line) + '</p>';
+      });
+      html += '</div>';
+      $('repo-candidate').innerHTML = html;
+      $('repo-candidate').hidden = false;
+
+      $('repo-add-form').hidden = !summary.canAdd;
+      if (summary.canAdd) {
+        $('repo-id').value = summary.suggestedId;
+        $('repo-remote-url').value = summary.remote;
+        $('repo-branch').value = summary.branch;
+        $('repo-initialize').checked = !summary.isRepository;
+        $('repo-configure-remote').checked = !!summary.remote;
+        $('repo-untrack').checked = summary.trackedByRoot > 0;
+      }
+      invalidateRepoPlan();
+    }
+
+    function repoAddRequest() {
+      return GitMesh.repositoryRequestFields({
+        intent: 'add',
+        path: ($('repo-path').value || '').trim(),
+        id: $('repo-id').value,
+        remote: $('repo-remote-url').value,
+        branch: $('repo-branch').value,
+        initialize: $('repo-initialize').checked,
+        configureRemote: $('repo-configure-remote').checked,
+        untrack: $('repo-untrack').checked
+      });
+    }
+
+    function repoEditRequest() {
+      return GitMesh.repositoryRequestFields({
+        intent: $('repo-intent').value,
+        id: $('repo-target').value,
+        newId: $('repo-new-id').value,
+        remote: $('repo-edit-remote').value,
+        configureGit: $('repo-configure-git').checked,
+        takeover: $('repo-takeover').checked
+      });
+    }
+
+    /// Ask the service what the change would do, and show that plan. The interface never
+    /// computes a preview of its own: the plan on screen is the plan that will run.
+    function reviewRepoChange(request) {
+      if (!request.intent) {
+        repoMessage('choose what to do first');
+        return;
+      }
+      api('/api/repository/plan', request).then(function (data) {
+        repoRequest = request;
+        repoPlan = data.plan;
+        renderRepoPlan(repoPlan);
+        repoMessage('');
+      }).catch(function (error) {
+        if (error.data && error.data.plan) {
+          repoRequest = request;
+          repoPlan = error.data.plan;
+          renderRepoPlan(repoPlan);
+          repoMessage('');
+          return;
+        }
+        invalidateRepoPlan();
+        repoMessage(error.message);
+      });
+    }
+
+    function renderRepoPlan(plan) {
+      var summary = GitMesh.managementPlanSummary(plan);
+      if (!summary) { return; }
+      var html = '<p class="plan-head">' + escapeHtml(summary.summary) + '</p>';
+      html += '<p class="hint mono">plan ' + escapeHtml(summary.id) + ' · ' +
+        escapeHtml(summary.state) + '</p>';
+
+      html += '<div class="plan-block"><h3>What changes</h3><ul>';
+      if (!summary.changes.length) {
+        html += '<li class="notice">nothing in the configuration</li>';
+      }
+      summary.changes.forEach(function (change) {
+        html += '<li><span class="symbol">' + escapeHtml(change.symbol) + '</span> ' +
+          escapeHtml(change.sentence) +
+          (change.reason ? ' <span class="notice">(' + escapeHtml(change.reason) + ')</span>' : '') +
+          '</li>';
+      });
+      html += '</ul></div>';
+
+      html += '<div class="plan-block"><h3>What runs</h3><ul>';
+      summary.actions.forEach(function (action) {
+        html += '<li><span class="symbol">' + escapeHtml(action.symbol) + '</span> ' +
+          escapeHtml(action.role) + ' · ' + escapeHtml(action.target) + ': ' +
+          escapeHtml(action.detail) + '</li>';
+      });
+      html += '</ul></div>';
+
+      if (summary.safety.length) {
+        html += '<div class="plan-block"><h3>What GitMesh guarantees</h3><ul>';
+        summary.safety.forEach(function (line) {
+          html += '<li>' + escapeHtml(line) + '</li>';
+        });
+        html += '</ul></div>';
+      }
+
+      if (summary.manifestChanges) {
+        html += '<details><summary>the manifest GitMesh will write</summary><pre class="mono">' +
+          escapeHtml(summary.manifestAfter) + '</pre></details>';
+      }
+
+      summary.blockers.forEach(function (line) {
+        html += '<p class="blocker">' + escapeHtml('✗ ' + line) + '</p>';
+      });
+      summary.warnings.forEach(function (line) {
+        html += '<p class="repo-flag">' + escapeHtml('! ' + line) + '</p>';
+      });
+      summary.notices.forEach(function (line) {
+        html += '<p class="notice">' + escapeHtml(line) + '</p>';
+      });
+
+      $('repo-plan').innerHTML = html;
+      $('repo-review').hidden = false;
+      $('repo-confirm').checked = false;
+      $('btn-repo-apply').disabled = !summary.ready;
+    }
+
+    /// A plan belongs to the configuration it was made from: typing in a field drops it, so
+    /// nobody can apply a change they edited after reviewing it.
+    function invalidateRepoPlan() {
+      repoPlan = null;
+      repoRequest = null;
+      $('repo-review').hidden = true;
+      $('repo-plan').innerHTML = '';
+    }
+
+    function applyRepoChange() {
+      if (!repoPlan || !repoRequest) {
+        repoMessage('review the change first');
+        return;
+      }
+      if (!$('repo-confirm').checked) {
+        repoMessage('confirm that you reviewed this change and the manifest it writes');
+        return;
+      }
+      var body = {};
+      Object.keys(repoRequest).forEach(function (key) { body[key] = repoRequest[key]; });
+      body.planId = repoPlan.id;
+      startOperation('/api/repository/apply', body, 'Configuring the repositories…',
+        function (payload) {
+          if (payload && payload.repository) { showRepoResult(payload.repository); }
+          repoCandidate = null;
+          renderCandidate(null);
+          $('repo-path').value = '';
+          invalidateRepoPlan();
+          loadRepositories();
+        });
+    }
+
+    function showRepoResult(result) {
+      var text = GitMesh.managementResultText(result);
+      if (!text) { return; }
+      var html = '<p class="summary">' + escapeHtml(text.summary) + '</p>';
+      text.changes.forEach(function (change) {
+        html += '<p class="owner">' + escapeHtml(change.symbol + ' ' + change.sentence) + '</p>';
+        if (change.evidence.length) {
+          html += '<p class="hint">' + escapeHtml(change.evidence.join(' · ')) + '</p>';
+        }
+      });
+      text.failures.forEach(function (failure) {
+        html += '<p class="resolve">' + escapeHtml('✗ ' + failure.id + ': ' + failure.detail) + '</p>';
+        failure.details.forEach(function (detail) {
+          html += '<p class="owner mono">' + escapeHtml(detail) + '</p>';
+        });
+      });
+      text.refused.forEach(function (line) {
+        html += '<p class="resolve">' + escapeHtml(line) + '</p>';
+      });
+      $('repo-result').innerHTML = html;
+      $('repo-result-card').hidden = false;
+    }
+
     // --------------------------------------------------------------- wiring --
 
     document.querySelectorAll('.tab').forEach(function (tab) {
@@ -2016,14 +2570,39 @@ if (typeof document !== 'undefined') {
         document.querySelectorAll('.tab').forEach(function (other) {
           other.classList.toggle('active', other === tab);
         });
-        ['status', 'changes', 'commit', 'branches', 'sync', 'settings'].forEach(function (name) {
+        ['status', 'changes', 'commit', 'branches', 'sync', 'repos', 'settings'].forEach(function (name) {
           var panel = $('panel-' + name);
           if (panel) { panel.hidden = name !== tab.dataset.tab; }
         });
+        // The repositories panel is the only one that changes configuration, so it reads
+        // its state when it is opened rather than on every refresh.
+        if (tab.dataset.tab === 'repos') { loadRepositories(); }
       });
     });
 
     $('btn-refresh').addEventListener('click', refresh);
+    $('btn-repos-refresh').addEventListener('click', loadRepositories);
+    $('btn-repo-check').addEventListener('click', checkRepoDirectory);
+    $('repo-path').addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); checkRepoDirectory(); }
+    });
+    $('btn-repo-review').addEventListener('click', function () { reviewRepoChange(repoAddRequest()); });
+    $('btn-repo-change').addEventListener('click', function () { reviewRepoChange(repoEditRequest()); });
+    $('repo-intent').addEventListener('change', function () {
+      renderRepoIntent();
+      invalidateRepoPlan();
+    });
+    $('btn-repo-apply').addEventListener('click', applyRepoChange);
+    $('btn-repo-discard').addEventListener('click', function () {
+      invalidateRepoPlan();
+      repoMessage('');
+    });
+    ['repo-id', 'repo-remote-url', 'repo-branch', 'repo-new-id', 'repo-edit-remote'].forEach(
+      function (id) { $(id).addEventListener('change', invalidateRepoPlan); });
+    ['repo-initialize', 'repo-configure-remote', 'repo-untrack', 'repo-configure-git',
+      'repo-takeover'].forEach(function (id) {
+      $(id).addEventListener('change', invalidateRepoPlan);
+    });
     $('btn-setup').addEventListener('click', openWizard);
     $('btn-welcome-setup').addEventListener('click', function () {
       $('setup-root').value = (model && model.directory) || $('welcome-path').value || '';
@@ -2142,7 +2721,7 @@ if (typeof document !== 'undefined') {
           model = data; render();
         });
       }
-      var index = ['1', '2', '3', '4', '5', '6'].indexOf(event.key);
+      var index = ['1', '2', '3', '4', '5', '6', '7'].indexOf(event.key);
       if (index >= 0) {
         var tabs = document.querySelectorAll('.tab');
         if (tabs[index]) { tabs[index].click(); }

@@ -181,6 +181,10 @@ pub struct ConfigureAddArgs {
     /// Branch hint recorded in the manifest.
     #[arg(long)]
     pub branch: Option<String>,
+    /// Stop tracking the directory's files in the root repository, so one file belongs to
+    /// exactly one repository.
+    #[arg(long)]
+    pub untrack_from_root: bool,
     /// Report what would change without writing the manifest.
     #[arg(long)]
     pub dry_run: bool,
@@ -190,6 +194,10 @@ pub struct ConfigureAddArgs {
 pub struct ConfigureRemoveArgs {
     /// Logical identifier of the repository.
     pub id: String,
+    /// Confirm that the files the root repository tracks inside it go back to the root
+    /// repository.
+    #[arg(long)]
+    pub confirm_takeover: bool,
     /// Report what would change without writing the manifest.
     #[arg(long)]
     pub dry_run: bool,

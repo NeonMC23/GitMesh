@@ -51,6 +51,7 @@
       <button class="tab" data-tab="commit" role="tab">Commit</button>
       <button class="tab" data-tab="branches" role="tab">Branches</button>
       <button class="tab" data-tab="sync" role="tab">Pull / Push</button>
+      <button class="tab" data-tab="repos" role="tab">Repositories</button>
       <button class="tab" data-tab="settings" role="tab">Project</button>
     </nav>
 
@@ -139,12 +140,106 @@
       </div>
     </section>
 
+    <section id="panel-repos" class="panel" hidden>
+      <div class="card">
+        <div class="row-between">
+          <h2>Repositories of this project</h2>
+          <button id="btn-repos-refresh" class="ghost">Refresh</button>
+        </div>
+        <p class="hint">A repository boundary is configuration. GitMesh changes one only after
+          you reviewed the plan and the manifest text it writes; files, <code>.git</code>
+          directories, history and remotes are never touched by a configuration change.</p>
+        <p id="repos-summary" class="hint"></p>
+        <div id="repos-table"></div>
+        <p id="repos-message" class="hint inline" hidden></p>
+      </div>
+
+      <div class="card">
+        <h2>Add a directory as a repository</h2>
+        <p class="hint">GitMesh checks the directory first and tells you exactly what it would
+          do: adopt an existing repository, create one, record a remote, or refuse.</p>
+        <div class="grid-actions">
+          <label class="field"><span>Directory, relative to the project root</span>
+            <input id="repo-path" type="text" placeholder="engine" autocomplete="off"></label>
+          <div class="row actions">
+            <button id="btn-repo-check" class="ghost">Check the directory</button>
+          </div>
+        </div>
+        <div id="repo-candidate" hidden></div>
+        <div id="repo-add-form" hidden>
+          <div class="grid-actions">
+            <label class="field"><span>Repository name</span>
+              <input id="repo-id" type="text" autocomplete="off"></label>
+            <label class="field"><span>Remote URL (optional)</span>
+              <input id="repo-remote-url" type="text" placeholder="git@example.com:acme/engine.git" autocomplete="off"></label>
+            <label class="field"><span>Branch</span>
+              <input id="repo-branch" type="text" placeholder="main" autocomplete="off"></label>
+          </div>
+          <label class="check"><input type="checkbox" id="repo-initialize"> create a Git
+            repository there when there is none (<code>git init</code>)</label>
+          <label class="check"><input type="checkbox" id="repo-configure-remote"> also configure
+            <code>origin</code> in Git, not just record it</label>
+          <label class="check"><input type="checkbox" id="repo-untrack"> stop tracking these files
+            in the root repository</label>
+          <div class="row actions">
+            <button id="btn-repo-review" class="primary">Review the change</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Change one repository</h2>
+        <div class="grid-actions">
+          <label class="field"><span>Repository</span>
+            <select id="repo-target"></select></label>
+          <label class="field"><span>What to do</span>
+            <select id="repo-intent">
+              <option value="rename">give it another name</option>
+              <option value="set-remote">record another remote</option>
+              <option value="remove">remove it from the project</option>
+            </select></label>
+          <label class="field" id="repo-new-id-field"><span>New name</span>
+            <input id="repo-new-id" type="text" autocomplete="off"></label>
+          <label class="field" id="repo-edit-remote-field" hidden><span>Remote URL (empty clears it)</span>
+            <input id="repo-edit-remote" type="text" autocomplete="off"></label>
+        </div>
+        <div class="row actions">
+          <label class="check" id="repo-configure-git-field" hidden><input type="checkbox" id="repo-configure-git">
+            also configure <code>origin</code> in Git</label>
+          <label class="check" id="repo-takeover-field" hidden><input type="checkbox" id="repo-takeover">
+            the root repository takes those files back</label>
+        </div>
+        <div class="row actions">
+          <button id="btn-repo-change" class="ghost">Review the change</button>
+        </div>
+        <p class="hint">Removing a repository is a configuration change: its directory, its
+          <code>.git</code>, its history and its remote stay exactly where they are.
+          Renaming changes the name in GitMesh, never the directory.</p>
+      </div>
+
+      <div class="card" id="repo-review" hidden>
+        <h2>Review the change</h2>
+        <div id="repo-plan"></div>
+        <label class="check"><input type="checkbox" id="repo-confirm"> I reviewed this change and
+          the manifest it writes</label>
+        <div class="row actions">
+          <button id="btn-repo-apply" class="primary">Apply the change</button>
+          <button id="btn-repo-discard" class="ghost">Discard</button>
+        </div>
+      </div>
+
+      <div class="card" id="repo-result-card" hidden>
+        <h2>Result</h2>
+        <div id="repo-result" class="result"></div>
+      </div>
+    </section>
+
     <section id="panel-settings" class="panel" hidden>
       <div class="card">
         <h2>Project information</h2>
-        <p class="hint">This view is read-only. Repository boundaries are configuration and are
-          changed with <code>gitmesh configure</code> or in the terminal interface, so a click
-          never silently redraws your project layout.</p>
+        <p class="hint">This view is read-only. Repository boundaries are configuration: change
+          them in the <strong>Repositories</strong> tab (reviewed as a plan before anything is
+          written), or with <code>gitmesh configure</code> from a terminal.</p>
         <div id="settings-table"></div>
       </div>
     </section>

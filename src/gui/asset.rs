@@ -46,6 +46,14 @@ mod tests {
         assert!(APP_CSS.contains("--accent"));
         assert!(APP_JS.contains("clientLogic:start"));
         assert!(client_logic().contains("function progressRows"));
+        assert!(
+            client_logic().contains("function managementPlanSummary"),
+            "the repositories panel reads the plan the service built"
+        );
+        assert!(
+            client_logic().contains("function repositoryRows"),
+            "the repositories panel words the inspection it is given"
+        );
         assert!(CLIENT_TESTS.contains("assert("));
     }
 
@@ -136,6 +144,10 @@ mod tests {
             "/api/setup/inspect",
             "/api/setup/plan",
             "/api/setup/apply",
+            "/api/repositories",
+            "/api/repository/inspect",
+            "/api/repository/plan",
+            "/api/repository/apply",
         ] {
             assert!(
                 APP_JS.contains(endpoint),

@@ -112,12 +112,20 @@ $ gitmesh configure add engine --remote git@github.com:acme/engine.git
 $ gitmesh configure add renderer --git-init --remote git@github.com:acme/renderer.git
 $ gitmesh configure list
 
-# 3. Work normally
+# 3. Work normally — and keep the layout alive while you develop
+$ mkdir new-module                          # an ordinary directory appears
+$ gitmesh configure add new-module --git-init --untrack-from-root --dry-run
+$ gitmesh configure add new-module --git-init --untrack-from-root
 $ gitmesh status --changes
 $ gitmesh commit -m "implement the new backend"
 $ gitmesh pull
 $ gitmesh push
 ```
+
+Every configuration change is planned before it is made: `--dry-run` prints exactly the
+changes and the steps that would run, and nothing is written. `--untrack-from-root` stops
+the root repository from tracking the files that now belong to the new repository (the
+files stay on disk — nothing is ever deleted or moved).
 
 Prefer an interface? GitMesh ships two, and both drive the same core as the CLI:
 
@@ -141,9 +149,16 @@ Nothing is created before you confirm, an existing repository or manifest is nev
 replaced silently, and remotes are optional: a fully local project is a first-class
 project. See [docs/GUI.md](docs/GUI.md).
 
-`gitmesh ui` is the terminal equivalent and additionally supports editing the project
-configuration (marking directories as repositories, renaming ids, setting remote URLs)
-from inside the interface.
+The same interface **manages** the project afterwards, in the *Repositories* tab: check a
+directory, review the complete plan (including the exact `.gitmesh/project.toml` it would
+write), confirm it, watch the steps run, and read the evidence for every change. A new
+directory can be turned into a managed repository while the project is open; an existing
+Git repository is *adopted* with its history and remote left exactly as they are; a
+repository's logical id or recorded remote can be changed; and a repository can be
+**removed from GitMesh without its directory, its `.git`, its history or its remote being
+touched** — a removal that hands files back to the root repository says so and asks for
+confirmation first. `gitmesh ui` offers the same operations in the terminal, and
+`gitmesh configure` on the command line — all three drive one service and one plan.
 
 To see the whole workflow run end to end against real repositories and local bare remotes
 (including a genuine cross-repository conflict), use the demo script:
@@ -158,8 +173,9 @@ $ ./examples/demo.sh /tmp/gitmesh-demo
 | --- | --- |
 | `gitmesh init [path] [--name N] [--remote URL] [--add-git-remote] [--git-init] [--branch B] [--force]` | Create the manifest for a project (does not touch your files). `--remote` only *records* the URL; `--add-git-remote` also points `origin` at it, and is what allows replacing an existing one |
 | `gitmesh discover [--depth N] [--hidden] [--deep]` | Scan the tree, list the Git repositories in it |
-| `gitmesh configure add <dir> [--id I] [--remote URL] [--git-init]` | Make a directory an independent repository |
-| `gitmesh configure remove <id>` / `rename <id> <new>` / `remote <id> --url U [--set-git-remote]` | Edit the configuration |
+| `gitmesh configure add <dir> [--id I] [--remote URL] [--git-init] [--branch B] [--untrack-from-root] [--dry-run]` | Make a directory an independent repository (planned first; `--untrack-from-root` stops the root repository from tracking its files) |
+| `gitmesh configure remove <id> [--confirm-takeover] [--dry-run]` | Remove a repository from the configuration: its directory, `.git`, history and remote are kept. `--confirm-takeover` confirms that files tracked by the root repository go back to it |
+| `gitmesh configure rename <id> <new>` / `remote <id> --url U [--set-git-remote] [--clear]` | Change the logical identity, or record / configure / clear a remote |
 | `gitmesh configure list` | List configured repositories |
 | `gitmesh status [--changes] [--short] [--json]` | Unified project status with change ownership |
 | `gitmesh commit -m MSG [--repo ID] [--path PATH] [--dry-run]` | Stage and commit in every affected repository |
@@ -205,6 +221,7 @@ problems in their output but exit `0` as long as the project itself could be rea
 | [`reports/DEVELOPMENT_REPORT.md`](reports/DEVELOPMENT_REPORT.md) | What was built, milestone by milestone, and why |
 | [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) | Hardening audit, limitations, technical debt, readiness assessment |
 | [`reports/GUI_REPORT.md`](reports/GUI_REPORT.md) | The graphical interface: audit, architecture, technology choice, tests, manual end-to-end validation, readiness |
+| [`reports/REPOSITORY_REPORT.md`](reports/REPOSITORY_REPORT.md) | Managing repositories after creation: audit findings, the reuse of the plan-driven architecture, the management service, safety decisions, tests, end-to-end validation, limitations |
 | [`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md) | Integrated project creation and repository setup: audit findings, the plan-driven setup service, the wizard, first publish, tests, end-to-end validation, limitations |
 
 ## Status
@@ -217,9 +234,19 @@ Creating a project from an ordinary folder is part of the flow now: `gitmesh ini
 graphical wizard are two front ends of the same plan-driven setup service, which previews
 every change, writes the manifest, and can hand over to a first commit and push.
 
+The project's repository layout is no longer fixed at creation time. `gitmesh configure`
+and the GUI's *Repositories* tab manage it afterwards through one plan-driven service
+(`src/manage.rs`): a directory becomes a repository (initialised or adopted), a remote is
+recorded, configured or replaced only when that is explicitly asked for, a logical id is
+renamed without touching a directory, and a repository leaves the configuration while its
+directory, `.git`, history and remote stay exactly where they are. Everything is
+inspected, planned, reviewed and confirmed before it runs, and every applied change is
+proven afterwards by evidence and a validation of the reopened project.
+
 It is usable by a small team on a real multi-repository project today, with the
-limitations listed in [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) and
-[`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md).
+limitations listed in [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md),
+[`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md) and
+[`reports/REPOSITORY_REPORT.md`](reports/REPOSITORY_REPORT.md).
 
 ## Licence
 

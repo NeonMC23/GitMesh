@@ -808,6 +808,44 @@ pub fn ensure_origin_remote(
     }
 }
 
+/// Stop tracking `relative` in the repository rooted at `repo_root`.
+///
+/// Only the index changes: the files stay on disk, and if they also live in a repository
+/// of their own nothing about that repository is touched. This is the one implementation
+/// of "the parent repository must stop owning these files", used by the setup wizard and
+/// by repository management.
+pub fn untrack_from_root(repo_root: &Path, relative: &Path, runner: &GitRunner) -> Result<()> {
+    let repo = runner.repo(repo_root);
+    if !is_repository_root(repo_root, true, runner) {
+        return Err(Error::NotARepository {
+            path: repo_root.to_path_buf(),
+        });
+    }
+    repo.run_checked(&[
+        "rm".into(),
+        "-r".into(),
+        "--cached".into(),
+        "-q".into(),
+        "--".into(),
+        relative.as_os_str().to_os_string(),
+    ])?;
+    Ok(())
+}
+
+/// Files the repository at `repo_root` tracks inside `relative`.
+///
+/// Zero means the parent repository owns nothing there, which is the state a boundary
+/// change has to reach; non-zero means two repositories claim the same files.
+pub fn count_files_tracked_under(repo_root: &Path, relative: &Path, runner: &GitRunner) -> usize {
+    let repo = runner.repo(repo_root);
+    if !is_repository_root(repo_root, true, runner) {
+        return 0;
+    }
+    repo.tracked_files_under(relative)
+        .map(|files| files.len())
+        .unwrap_or(0)
+}
+
 /// URL currently configured as `origin`, if there is one.
 pub fn origin_url(repo_path: &Path, runner: &GitRunner) -> Result<Option<String>> {
     Ok(runner
