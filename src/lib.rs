@@ -8,7 +8,9 @@
 //! # Layering
 //!
 //! ```text
-//!   cli / ui          <- user interface, contains no Git logic
+//!   cli / ui / gui    <- user interface, contains no Git logic
+//!        |
+//!   service           <- application layer: one API for every front end
 //!        |
 //!   ops               <- orchestration: one logical operation -> many physical repos
 //!        |
@@ -28,12 +30,14 @@ pub mod cli;
 pub mod discovery;
 pub mod error;
 pub mod git;
+pub mod gui;
 pub mod json;
 pub mod manifest;
 pub mod model;
 pub mod ops;
 pub mod paths;
 pub mod providers;
+pub mod service;
 pub mod testkit;
 pub mod ui;
 

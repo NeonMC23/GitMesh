@@ -41,8 +41,11 @@ offline and deterministically.
 | --- | --- | --- |
 | Unit | `#[cfg(test)]` in each module | Parsing (`status --porcelain=v2`, remotes), path normalisation, manifest validation, ownership, outcome classification, JSON encoding |
 | Library integration | `tests/workflows.rs` | Complete multi-repository workflows: init-free configuration, status/ownership, commit, branch/checkout/merge, pull/push, conflicts, partial failures, idempotency, restart |
-| CLI process | `tests/cli.rs` | The real binary: argument parsing, exit codes, rendered output, JSON output, `ui` fallback without a TTY |
+| Application layer | `src/service.rs` | Project opening, unified status, change ownership, operation aggregation, partial failures, JSON view models — the surface every front end consumes |
+| CLI process | `tests/cli.rs` | The real binary: argument parsing, exit codes, rendered output, JSON output, the `gui` command served over a real socket, `ui` fallback without a TTY |
 | UI state machine | `src/ui/app.rs`, `src/ui/mod.rs` | Key-driven flows (commit, branch, setup/assignment, dry-run, input handling) without a terminal |
+| GUI model + HTTP | `src/gui/{mod,editor,server}.rs` | The model the interface renders, request routing, origin/host guards, operation lifecycle (start → SSE events → stored report), asset completeness |
+| GUI client logic | `src/gui/static/app.js` (region markers) + `tests/client.rs` | The interface's own pure logic (labels, counts, commit plan, progress rows, conflict wording) is extracted from `app.js` between its `clientLogic` markers and executed under Node, so the code that ships is the code that is tested. `tests/client.rs` skips cleanly when Node is absent |
 
 Fixtures live in `src/testkit.rs` (public, dependency-free):
 `RepoFixture` creates a project root that is a real Git repository, initialises external
@@ -67,7 +70,28 @@ Running a single test:
 ```console
 $ cargo test --lib manifest::tests::detects_overlapping_paths
 $ cargo test --test workflows partial_network_failure
+$ cargo test --test client            # interface logic, needs Node on PATH
 ```
+
+### Validating the graphical interface by hand
+
+The GUI is a transport in front of the service layer, so the strongest check is to drive
+the real HTTP interface end to end:
+
+```console
+$ cargo build --release && ./tools/gui-workflow.py
+```
+
+It creates `/tmp/gui-e2e` with a four-repository project (`root`, `engine`, `renderer`,
+`tools`) and bare remotes, starts the release binary, and walks 18 steps: open, overview,
+status, changes and ownership, one unified commit (then verifying each repository's own
+`git log`), branch creation and consistency, pull, an induced cross-repository conflict,
+resolution, push, reopen after restart, opening from a nested directory, a partial push
+failure, and the CLI non-regression checks. It prints one line per check and exits
+non-zero on the first failing run.
+
+For the browser itself, `gitmesh gui --open` (or the printed URL) is enough: the page is
+self-contained and the network panel shows only `/api/*` calls to the local server.
 
 Debugging a failing scenario: set `GITMESH_TEST_KEEP=1`-style caching is not needed —
 `TempDir` removes its directory on drop, so add a `println!("{}", fixture.path().display())`
@@ -156,11 +180,18 @@ gitmesh/
 │   ├── ops/                       commit, branch, sync, push, shared utilities
 │   ├── providers/                 GitHub (optional) provider foundation
 │   ├── git/                       Git CLI execution and output parsing
+│   ├── service.rs                 application layer shared by all front ends
 │   ├── ui/                        terminal interface (state machine + rendering)
+│   ├── gui/                       graphical interface: model, HTTP/SSE server, assets
+│   │   └── static/                index.html, app.css, app.js (embedded at build time)
 │   └── testkit.rs                 test fixtures (temporary repositories)
+├── tools/
+│   ├── rust-env.sh                reproducible local toolchain bootstrap
+│   └── gui-workflow.py            end-to-end validation of the graphical interface
 └── tests/
     ├── workflows.rs               library-level multi-repository workflows
-    └── cli.rs                     process-level CLI tests
+    ├── cli.rs                     process-level CLI tests
+    └── client.rs                  interface client logic under Node
 ```
 
 ## 9. Troubleshooting

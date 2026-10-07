@@ -104,6 +104,9 @@ pub enum Command {
     /// Open the interactive terminal interface.
     #[command(alias = "tui")]
     Ui(UiArgs),
+
+    /// Open the graphical interface in a browser (served locally by GitMesh).
+    Gui(GuiArgs),
 }
 
 #[derive(Debug, Args)]
@@ -340,6 +343,30 @@ pub struct UiArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
     /// Start in dry-run mode: operations are simulated.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GuiArgs {
+    /// Directory to open (defaults to the current directory).
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+    /// Port of the local interface.
+    #[arg(long, default_value_t = 7345)]
+    pub port: u16,
+    /// Address to bind. 127.0.0.1 keeps the interface local; 0.0.0.0 exposes it
+    /// on the network (there is no authentication).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// Also accept requests addressed to this host name. Needed when the interface
+    /// is reached through a proxy or a port forward; repeat for several names.
+    #[arg(long = "allow-host", value_name = "NAME")]
+    pub allow_hosts: Vec<String>,
+    /// Try to open the interface in a browser.
+    #[arg(long)]
+    pub open: bool,
+    /// Start in dry-run mode: every operation is simulated.
     #[arg(long)]
     pub dry_run: bool,
 }

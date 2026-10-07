@@ -42,6 +42,21 @@ impl Json {
         }
     }
 
+    /// Add or replace a field of an object (no-op on other values).
+    ///
+    /// Used where a base document is built once and one or two fields are added
+    /// conditionally, which keeps the caller from rebuilding the whole object.
+    pub fn with_field(mut self, key: impl Into<String>, value: Json) -> Json {
+        if let Json::Object(fields) = &mut self {
+            let key = key.into();
+            match fields.iter_mut().find(|(existing, _)| *existing == key) {
+                Some((_, existing)) => *existing = value,
+                None => fields.push((key, value)),
+            }
+        }
+        self
+    }
+
     /// Compact, valid JSON text.
     pub fn compact(&self) -> String {
         let mut out = String::new();

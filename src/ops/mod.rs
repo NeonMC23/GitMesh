@@ -20,13 +20,68 @@ pub mod sync;
 pub mod util;
 
 use crate::json::Json;
-use crate::model::RepositoryRole;
+use crate::model::{PhysicalRepository, RepositoryRole};
 
-pub use branch::{branch_operation, BranchAction, BranchOptions};
-pub use commit::{commit_project, CommitOptions};
-pub use push::{push_project, PushOptions};
-pub use sync::{fetch_project, pull_project, PullStrategy, SyncOptions};
+pub use branch::{branch_operation, branch_operation_observed, BranchAction, BranchOptions};
+pub use commit::{commit_project, commit_project_observed, CommitOptions};
+pub use push::{push_project, push_project_observed, PushOptions};
+pub use sync::{
+    fetch_project, fetch_project_observed, pull_project, pull_project_observed, PullStrategy,
+    SyncOptions,
+};
 pub use util::RepositorySelection;
+
+/// Progress hooks for one logical operation.
+///
+/// A logical operation is a loop over physical repositories. Front ends that can be
+/// busy for a while (a GUI showing "engine ... running") need to know where the loop
+/// is, without reimplementing it and without the orchestrator knowing anything about
+/// widgets, terminals or sockets. This type is that seam: it is deliberately tiny,
+/// front-end agnostic, and silent by default.
+#[derive(Default)]
+pub struct OperationObserver<'a> {
+    on_repository_start: Option<&'a mut dyn FnMut(&PhysicalRepository)>,
+    on_repository_end: Option<&'a mut dyn FnMut(&RepoOutcome)>,
+}
+
+impl<'a> OperationObserver<'a> {
+    /// An observer that does nothing (used by front ends that do not show progress).
+    pub fn silent() -> Self {
+        OperationObserver::default()
+    }
+
+    /// Observer notified before a repository is worked on.
+    pub fn on_start<F>(mut self, f: &'a mut F) -> Self
+    where
+        F: FnMut(&PhysicalRepository),
+    {
+        self.on_repository_start = Some(f);
+        self
+    }
+
+    /// Observer notified after a repository has produced its outcome.
+    pub fn on_end<F>(mut self, f: &'a mut F) -> Self
+    where
+        F: FnMut(&RepoOutcome),
+    {
+        self.on_repository_end = Some(f);
+        self
+    }
+
+    /// Called by the orchestration loop before touching a repository.
+    pub fn repository_started(&mut self, repo: &PhysicalRepository) {
+        if let Some(f) = self.on_repository_start.as_mut() {
+            f(repo);
+        }
+    }
+
+    /// Called by the orchestration loop once a repository has an outcome.
+    pub fn repository_finished(&mut self, outcome: &RepoOutcome) {
+        if let Some(f) = self.on_repository_end.as_mut() {
+            f(outcome);
+        }
+    }
+}
 
 /// Result of one repository's part of a logical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

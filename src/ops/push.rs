@@ -48,13 +48,29 @@ pub fn push_project(
     runner: &crate::git::GitRunner,
     options: &PushOptions,
 ) -> Result<OperationReport> {
+    push_project_observed(
+        project,
+        runner,
+        options,
+        &mut crate::ops::OperationObserver::silent(),
+    )
+}
+
+/// Same as [`push_project`], reporting each repository as the loop reaches it.
+pub fn push_project_observed(
+    project: &GitMeshProject,
+    runner: &crate::git::GitRunner,
+    options: &PushOptions,
+    observer: &mut crate::ops::OperationObserver<'_>,
+) -> Result<OperationReport> {
     options.selection.validate(project)?;
     let analyzer = Analyzer::new(project, runner);
-    let outcomes = util::each_repository(
+    let outcomes = util::each_repository_observed(
         project,
         &analyzer,
         runner,
         &options.selection,
+        observer,
         |repo, state, git| push_one(repo, state, git, options),
     );
     Ok(OperationReport::new("push", options.dry_run, outcomes))

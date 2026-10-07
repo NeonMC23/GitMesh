@@ -59,6 +59,21 @@ pub fn commit_project(
     runner: &crate::git::GitRunner,
     options: &CommitOptions,
 ) -> Result<OperationReport> {
+    commit_project_observed(
+        project,
+        runner,
+        options,
+        &mut crate::ops::OperationObserver::silent(),
+    )
+}
+
+/// Same as [`commit_project`], reporting each repository as the loop reaches it.
+pub fn commit_project_observed(
+    project: &GitMeshProject,
+    runner: &crate::git::GitRunner,
+    options: &CommitOptions,
+    observer: &mut crate::ops::OperationObserver<'_>,
+) -> Result<OperationReport> {
     if options.message.trim().is_empty() {
         return Err(crate::error::Error::Other(
             "a commit message is required (use -m/--message)".into(),
@@ -67,11 +82,12 @@ pub fn commit_project(
     options.selection.validate(project)?;
 
     let analyzer = Analyzer::new(project, runner);
-    let outcomes = util::each_repository(
+    let outcomes = util::each_repository_observed(
         project,
         &analyzer,
         runner,
         &options.selection,
+        observer,
         |repo, state, git| commit_one(project, repo, state, git, options),
     );
     Ok(OperationReport::new("commit", options.dry_run, outcomes))

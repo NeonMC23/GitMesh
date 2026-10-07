@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitMesh</title>
+<!-- Everything is served by GitMesh itself: no CDN, no fonts, no analytics. -->
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◆</span>
+    <span class="brand-name">GitMesh</span>
+    <span class="tagline">one project, many repositories</span>
+  </div>
+  <div class="topbar-right">
+    <span id="dry-run-badge" class="badge badge-warn" hidden>dry run</span>
+    <button id="btn-refresh" class="ghost" title="Re-read the project (R)">Refresh</button>
+    <button id="btn-open" class="ghost" title="Open another GitMesh project">Open…</button>
+  </div>
+</header>
+
+<main>
+  <!-- Shown while a project is open. -->
+  <section id="workspace" hidden>
+    <div class="project-head">
+      <div>
+        <h1 id="project-name">—</h1>
+        <p class="meta">
+          <span id="project-root" class="mono"></span>
+          <span class="dot">·</span>
+          <span id="project-repos"></span>
+          <span class="dot">·</span>
+          <span id="project-state"></span>
+        </p>
+      </div>
+      <div class="branch-box">
+        <span class="label">branch</span>
+        <span id="project-branch" class="branch mono">—</span>
+      </div>
+    </div>
+
+    <p id="project-notices" class="notices" hidden></p>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="status" role="tab">Status</button>
+      <button class="tab" data-tab="changes" role="tab">Changes <span id="changes-count" class="pill">0</span></button>
+      <button class="tab" data-tab="commit" role="tab">Commit</button>
+      <button class="tab" data-tab="branches" role="tab">Branches</button>
+      <button class="tab" data-tab="sync" role="tab">Pull / Push</button>
+      <button class="tab" data-tab="settings" role="tab">Project</button>
+    </nav>
+
+    <section id="panel-status" class="panel">
+      <div class="split">
+        <div class="card">
+          <h2>Project tree</h2>
+          <p class="hint">Directories marked <span class="tag">repo</span> are independent Git
+            repositories. Everything else is part of the project.</p>
+          <div id="tree" class="tree"></div>
+        </div>
+        <div class="card">
+          <h2>Repository status</h2>
+          <div id="status-table"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-changes" class="panel" hidden>
+      <div class="card">
+        <div class="row-between">
+          <h2>Changes</h2>
+          <label class="check"><input type="checkbox" id="group-by-repo"> group by repository</label>
+        </div>
+        <p id="staging-note" class="hint"></p>
+        <div id="changes-table"></div>
+      </div>
+    </section>
+
+    <section id="panel-commit" class="panel" hidden>
+      <div class="card">
+        <h2>One commit for the whole project</h2>
+        <p class="hint">GitMesh commits every change below with one message. Each affected
+          repository receives its own real Git commit — there is no synthetic global commit.</p>
+        <div id="commit-targets"></div>
+        <label class="field">
+          <span>Commit message</span>
+          <textarea id="commit-message" rows="3" placeholder="Describe the change for the whole project" autocomplete="off"></textarea>
+        </label>
+        <div class="row">
+          <button id="btn-commit" class="primary">Commit the project</button>
+          <span id="commit-hint" class="hint inline"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-branches" class="panel" hidden>
+      <div class="card">
+        <h2>One branch across the project</h2>
+        <p id="branch-state" class="hint"></p>
+        <div class="grid-actions">
+          <label class="field"><span>Branch name</span>
+            <input id="branch-name" type="text" placeholder="feature/xyz" autocomplete="off"></label>
+          <div class="row actions">
+            <button id="btn-branch-start" class="primary">Create &amp; switch</button>
+            <button id="btn-branch-create" class="ghost">Create only</button>
+            <button id="btn-branch-checkout" class="ghost">Switch</button>
+            <button id="btn-branch-merge" class="ghost">Merge into current</button>
+            <button id="btn-branch-delete" class="danger ghost">Delete</button>
+          </div>
+        </div>
+        <div id="branches-table"></div>
+      </div>
+    </section>
+
+    <section id="panel-sync" class="panel" hidden>
+      <div class="card">
+        <h2>Synchronise the project</h2>
+        <p class="hint">Pull defaults to fast-forward only: GitMesh never merges or rebases
+          behind your back. Repositories that cannot be updated are reported, the others still
+          complete.</p>
+        <div class="grid-actions">
+          <label class="field"><span>Pull strategy</span>
+            <select id="pull-strategy">
+              <option value="ff-only">Fast-forward only (refuses divergence)</option>
+              <option value="merge">Merge (may create merge commits)</option>
+              <option value="rebase">Rebase (rewrites local commits)</option>
+            </select></label>
+          <div class="row actions">
+            <button id="btn-fetch" class="ghost">Fetch</button>
+            <button id="btn-pull" class="primary">Pull</button>
+            <button id="btn-push" class="primary">Push</button>
+          </div>
+        </div>
+        <div id="sync-summary"></div>
+      </div>
+    </section>
+
+    <section id="panel-settings" class="panel" hidden>
+      <div class="card">
+        <h2>Project information</h2>
+        <p class="hint">This view is read-only. Repository boundaries are configuration and are
+          changed with <code>gitmesh configure</code> or in the terminal interface, so a click
+          never silently redraws your project layout.</p>
+        <div id="settings-table"></div>
+      </div>
+    </section>
+
+    <!-- Operation progress and result, shared by every action. -->
+    <section id="operation" class="card operation" hidden>
+      <div class="row-between">
+        <h2 id="operation-title">Operation</h2>
+        <span id="operation-elapsed" class="mono"></span>
+      </div>
+      <div id="operation-progress" class="progress"></div>
+      <div id="operation-result" class="result" hidden></div>
+    </section>
+  </section>
+
+  <!-- Shown when no project is open. -->
+  <section id="welcome" hidden>
+    <div class="card welcome">
+      <h2 id="welcome-title">No GitMesh project is open</h2>
+      <p id="welcome-message" class="hint"></p>
+      <label class="field">
+        <span>Directory of the project (or of any directory inside it)</span>
+        <input id="welcome-path" type="text" placeholder="/path/to/project" autocomplete="off">
+      </label>
+      <div class="row">
+        <button id="btn-welcome-open" class="primary">Open project</button>
+        <button id="btn-welcome-here" class="ghost">Use the directory above</button>
+      </div>
+      <p id="welcome-error" class="error" hidden></p>
+      <p class="hint">A GitMesh project is any directory tree containing
+        <code>.gitmesh/project.toml</code>. Create one with <code>gitmesh init</code>.</p>
+    </div>
+  </section>
+</main>
+
+<dialog id="open-dialog">
+  <form method="dialog" class="dialog-body">
+    <h2>Open a GitMesh project</h2>
+    <label class="field">
+      <span>Directory</span>
+      <input id="open-path" type="text" placeholder="/path/to/project" autocomplete="off">
+    </label>
+    <p id="open-error" class="error" hidden></p>
+    <div class="row">
+      <button id="btn-open-confirm" value="confirm" class="primary">Open</button>
+      <button value="cancel" class="ghost">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<footer class="statusbar">
+  <span id="status-line">ready</span>
+  <span id="status-connection" class="mono"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

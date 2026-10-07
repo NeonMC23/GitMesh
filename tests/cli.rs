@@ -315,3 +315,146 @@ fn no_unrelated_repository_is_touched() {
         "sibling repository must be untouched"
     );
 }
+
+#[test]
+fn gui_command_serves_the_interface_and_can_be_opened_from_the_cli() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", "."), ("engine", "engine")]);
+    fixture.write("src/main.rs", "x");
+    fixture.write("engine/lib.rs", "y");
+
+    // Start the real binary and wait for it to announce the address it bound.
+    let mut child = Command::new(binary())
+        .args(["gui", "--port", "0"])
+        .current_dir(fixture.path())
+        .env("GIT_AUTHOR_NAME", "GitMesh Test")
+        .env("GIT_AUTHOR_EMAIL", "test@gitmesh.test")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start gitmesh gui");
+
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if sender.send(line.clone()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut announced = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(line) => {
+                if let Some(rest) = line.split("http://").nth(1) {
+                    let address = rest.trim().to_string();
+                    if address.contains(':') {
+                        announced = Some(address);
+                        break;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let address = announced.expect("the GUI announces its address");
+
+    // The interface and its assets are served.
+    let health = http_get(&address, "/api/health");
+    assert!(health.contains("200 OK"), "{health}");
+    let page = http_get(&address, "/");
+    assert!(page.contains("GitMesh"), "{page}");
+    assert!(page.contains("id=\"workspace\""), "{page}");
+    let model = http_get(&address, "/api/model");
+    assert!(model.contains("\"project\""), "{model}");
+    assert!(model.contains("\"engine\""), "{model}");
+    assert!(model.contains("engine/lib.rs"), "{model}");
+
+    // A cross-site request is refused before it can reach Git.
+    let refused = http_request(
+        &address,
+        "POST /api/commit HTTP/1.1",
+        &[
+            "Content-Type: application/x-www-form-urlencoded",
+            "Origin: http://evil.example.com",
+        ],
+        "message=evil",
+    );
+    assert!(refused.contains("403"), "{refused}");
+
+    // A real commit through the interface works (and leaves the CLI untouched).
+    let started = http_request(
+        &address,
+        "POST /api/commit HTTP/1.1",
+        &["Content-Type: application/x-www-form-urlencoded"],
+        "message=commit%20from%20the%20interface",
+    );
+    assert!(started.contains("202"), "{started}");
+    let id = started
+        .split("\"id\":")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .map(str::to_string)
+        .expect("operation id");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut finished = String::new();
+    while std::time::Instant::now() < deadline {
+        finished = http_get(&address, &format!("/api/report/{id}"));
+        if finished.contains("\"commit\"") && finished.contains("\"model\"") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(finished.contains("commit"), "{finished}");
+    assert!(finished.contains("\"success\""), "{finished}");
+
+    child.kill().ok();
+    child.wait().ok();
+
+    // Both repositories received their own real commit with the same message.
+    assert!(fixture
+        .git_ok(".", &["log", "-1", "--pretty=%s"])
+        .contains("commit from the interface"));
+    assert!(fixture
+        .git_ok("engine", &["log", "-1", "--pretty=%s"])
+        .contains("commit from the interface"));
+    // The CLI keeps working exactly as before.
+    let cli = Cli::new(fixture.path());
+    let stdout = cli.ok(&["status", "-s"]);
+    assert!(stdout.contains("root"), "{stdout}");
+    assert!(stdout.contains("clean"), "{stdout}");
+}
+
+/// Minimal HTTP GET, used to talk to the interface the way a browser would.
+fn http_get(address: &str, path: &str) -> String {
+    http_request(address, &format!("GET {path} HTTP/1.1"), &[], "")
+}
+
+fn http_request(address: &str, request_line: &str, headers: &[&str], body: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(address).expect("connect to the interface");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut request = format!(
+        "{request_line}\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for header in headers {
+        request.push_str(&format!("{header}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}

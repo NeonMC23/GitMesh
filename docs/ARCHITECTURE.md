@@ -44,15 +44,22 @@ orchestrates them at operation time.
 
 ```text
 ┌────────────────────────────────────────────────────────────────┐
-│ cli (src/cli.rs, src/main.rs)   ui (src/ui)                    │
-│ argument parsing / rendering    state machine + terminal       │
-│ no Git logic, no filesystem policy                             │
+│ cli (src/cli.rs, src/main.rs)   ui (src/ui)   gui (src/gui)     │
+│ argument parsing / rendering    terminal      browser interface │
+│ no Git logic, no filesystem policy, no ownership rules          │
 └───────────────┬────────────────────────────────┬───────────────┘
                 │                                │
 ┌───────────────▼────────────────────────────────▼───────────────┐
+│ service (src/service.rs)     application layer                  │
+│ open a project · status/changes · operations · view models      │
+│ progress events · presentation vocabulary shared by front ends  │
+└───────────────┬────────────────────────────────────────────────┘
+                │
+┌───────────────▼────────────────────────────────────────────────┐
 │ ops (src/ops)            one logical operation → many repos    │
 │ commit · branch · sync (fetch/pull) · push · util               │
 │ per-repository resilience, outcome classification               │
+│ OperationObserver: reusable per-repository progress reporting   │
 └───────────────┬────────────────────────────────────────────────┘
                 │
 ┌───────────────▼────────────────────────────────────────────────┐
@@ -76,8 +83,17 @@ Rules that keep the layering honest:
 * **`model` is pure data.** No I/O, no Git: it is the vocabulary shared by every layer.
 * **`ops` is the only module that changes repositories** (apart from `discovery`, which
   can `git init` when explicitly asked). Everything else is read-only.
-* **`cli` and `ui` contain no Git logic.** They call `ops`, `analyzer` and `discovery`,
-  so the two front ends cannot drift apart.
+* **`cli`, `ui` and `gui` contain no Git logic.** They call `service` (and, for
+  configuration editing, `discovery`), so the front ends cannot drift apart. The GUI
+  additionally goes through `service` exclusively: it has no direct `ops` call for
+  anything but the observer-aware operation methods, and no direct `git` call at all.
+* **`service` is front-end neutral.** It holds the vocabulary shared by every front end
+  (`ChangeState`, `RepositoryStateKind`, `PendingWork`, the JSON view models) and the
+  `*_observed` operation entry points. It adds no Git behaviour of its own.
+* **`ops::OperationObserver` is the only progress seam.** Logical operations report
+  "repository X started / finished with outcome Y" through it; the CLI passes a silent
+  observer, the GUI turns it into server-sent events. No widget, terminal or socket is
+  referenced below `service`.
 * Every dependency points downwards. There is no cycle.
 
 ## 3. Module map
@@ -94,7 +110,9 @@ Rules that keep the layering honest:
 | `src/paths.rs` | Lexical normalisation, project-relative conversion, manifest path validation |
 | `src/json.rs` | Minimal JSON writer used by `--json` output (no serialisation dependency) |
 | `src/providers/` | Hosting provider abstraction; `github.rs` parses GitHub URLs and coordinates |
+| `src/service.rs` | Application layer: `ProjectSession` (open, status, changes, operations), shared presentation vocabulary (`ChangeState`, `RepositoryStateKind`, `ProjectStateKind`, `PendingWork`, `ProjectBranch`), JSON view models (`status_view_json`, `operation_view_json`), `*_observed` operation entry points |
 | `src/ui/` | `app.rs` state machine (terminal-independent), `render.rs` ratatui drawing, `mod.rs` event loop |
+| `src/gui/` | `editor.rs` builds the model the interface renders from the service layer, `server.rs` is a minimal HTTP/SSE transport, `asset.rs` embeds the three front-end files, `static/` holds them (page, stylesheet, script, and the script's pure-logic tests) |
 | `src/testkit.rs` | Temporary project/repository fixtures used by unit and integration tests |
 
 ## 4. Safety invariants

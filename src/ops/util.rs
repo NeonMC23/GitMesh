@@ -117,6 +117,30 @@ pub fn each_repository<F>(
     analyzer: &Analyzer<'_>,
     runner: &crate::git::GitRunner,
     selection: &RepositorySelection,
+    step: F,
+) -> Vec<RepoOutcome>
+where
+    F: FnMut(&PhysicalRepository, &RepositoryState, &GitRepo<'_>) -> RepoOutcome,
+{
+    each_repository_observed(
+        project,
+        analyzer,
+        runner,
+        selection,
+        &mut crate::ops::OperationObserver::silent(),
+        step,
+    )
+}
+
+/// Same as [`each_repository`], reporting each repository to an observer as the loop
+/// progresses. This is the only place where per-repository progress is produced, so
+/// every front end sees the same sequence.
+pub fn each_repository_observed<F>(
+    project: &GitMeshProject,
+    analyzer: &Analyzer<'_>,
+    runner: &crate::git::GitRunner,
+    selection: &RepositorySelection,
+    observer: &mut crate::ops::OperationObserver<'_>,
     mut step: F,
 ) -> Vec<RepoOutcome>
 where
@@ -135,6 +159,7 @@ where
         }
 
         if let Some(error) = &state.error {
+            observer.repository_started(repo);
             // A repository that cannot be inspected is a failure, never a success —
             // the reason is carried in the summary and the details.
             outcomes.push(
@@ -147,6 +172,8 @@ where
                 )
                 .with_detail(error.clone()),
             );
+            let outcome = outcomes.last().expect("just pushed");
+            observer.repository_finished(outcome);
             continue;
         }
 
@@ -154,6 +181,7 @@ where
             continue;
         }
 
+        observer.repository_started(repo);
         match crate::discovery::verified_repo(runner, repo, &project.root) {
             Ok(handle) => outcomes.push(step(repo, &state, &handle)),
             Err(err) => outcomes.push(
@@ -167,6 +195,8 @@ where
                 .with_detail(err.to_string()),
             ),
         }
+        let outcome = outcomes.last().expect("just pushed");
+        observer.repository_finished(outcome);
     }
 
     outcomes

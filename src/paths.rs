@@ -180,6 +180,20 @@ pub fn is_root_relative(rel: &Path) -> bool {
     rel.as_os_str().is_empty() || rel == Path::new(".") || rel == Path::new("./")
 }
 
+/// Resolve a path argument to an absolute, lexically normalised path.
+///
+/// The path does not have to exist (that is what makes it usable for "open this
+/// directory" flows), and nothing is resolved through symlinks: GitMesh treats the
+/// path the user typed as the path the user meant.
+pub fn absolute(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if path.is_absolute() {
+        return Ok(lexical_normalize(path));
+    }
+    let cwd = std::env::current_dir().map_err(|e| crate::Error::io(PathBuf::from("."), e))?;
+    Ok(lexical_normalize(&cwd.join(path)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

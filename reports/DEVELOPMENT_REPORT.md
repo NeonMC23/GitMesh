@@ -8,6 +8,10 @@ Origin: the ten milestone prompts were executed in sequence in one working sessi
 milestone below records the audit it started with, the implementation, the design
 decisions, and the verification that was actually run.
 
+The work that followed milestone 10 — the first real **graphical interface** — is recorded
+separately in [`GUI_REPORT.md`](GUI_REPORT.md), with its own audit, architecture, tests,
+manual validation and readiness assessment.
+
 ---
 
 ## Milestone 1 — Audit, architecture and project foundation

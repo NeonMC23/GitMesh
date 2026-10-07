@@ -85,6 +85,23 @@ pub fn branch_operation(
     action: &BranchAction,
     options: &BranchOptions,
 ) -> Result<OperationReport> {
+    branch_operation_observed(
+        project,
+        runner,
+        action,
+        options,
+        &mut crate::ops::OperationObserver::silent(),
+    )
+}
+
+/// Same as [`branch_operation`], reporting each repository as the loop reaches it.
+pub fn branch_operation_observed(
+    project: &GitMeshProject,
+    runner: &crate::git::GitRunner,
+    action: &BranchAction,
+    options: &BranchOptions,
+    observer: &mut crate::ops::OperationObserver<'_>,
+) -> Result<OperationReport> {
     options.selection.validate(project)?;
     if let Some(name) = action.branch_name() {
         validate_branch_name(name)?;
@@ -95,11 +112,12 @@ pub fn branch_operation(
     }
 
     let analyzer = Analyzer::new(project, runner);
-    let outcomes = util::each_repository(
+    let outcomes = util::each_repository_observed(
         project,
         &analyzer,
         runner,
         &options.selection,
+        observer,
         |repo, state, git| {
             if options.excluded.iter().any(|id| id == &repo.id) {
                 return RepoOutcome::new(

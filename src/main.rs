@@ -139,6 +139,7 @@ fn run(cli: Cli) -> Result<u8> {
             render_report(&global, &report)
         }
         Command::Remotes => cmd_remotes(&global, &runner),
+        Command::Gui(args) => cmd_gui(&global, &args),
         Command::Ui(args) => {
             let path = resolve_start_path(&global, &args.path);
             match gitmesh::ui::run(&path, args.dry_run) {
@@ -151,6 +152,27 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
     }
+}
+
+// --------------------------------------------------------------------- gui --
+
+fn cmd_gui(global: &GlobalOptions, args: &gitmesh::cli::GuiArgs) -> Result<u8> {
+    // `gui` takes the project directory the same way every other command does: the
+    // path argument, or the global `-C` when it is set.
+    let start = match &global.project {
+        Some(path) => path.clone(),
+        None => args.path.clone(),
+    };
+    let options = gitmesh::gui::GuiOptions {
+        start: Some(start),
+        host: args.host.clone(),
+        allow_hosts: args.allow_hosts.clone(),
+        port: args.port,
+        open: args.open,
+        dry_run: args.dry_run,
+    };
+    gitmesh::gui::run(options)?;
+    Ok(EXIT_OK)
 }
 
 // ----------------------------------------------------------------- utilities --
@@ -170,11 +192,7 @@ fn load_project(global: &GlobalOptions, runner: &GitRunner) -> Result<GitMeshPro
 
 /// Resolve a path argument to an absolute path (without requiring existence).
 fn absolute(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(gitmesh::paths::lexical_normalize(path));
-    }
-    let cwd = std::env::current_dir().map_err(|e| Error::io(PathBuf::from("."), e))?;
-    Ok(gitmesh::paths::lexical_normalize(&cwd.join(path)))
+    gitmesh::paths::absolute(path)
 }
 
 /// Where a command that works on a *directory* (rather than a project) starts.
@@ -668,17 +686,9 @@ fn cmd_status(
         println!();
         println!("Changes ({}):", changes.len());
         for change in &changes {
-            let flag = if change.is_conflict() {
-                "conflict"
-            } else if change.entry.untracked {
-                "untracked"
-            } else if change.entry.staged && change.entry.unstaged {
-                "staged+modified"
-            } else if change.entry.staged {
-                "staged"
-            } else {
-                "modified"
-            };
+            // One classification, shared with every other front end (see
+            // `service::status_column_label` for why this stays the legacy wording).
+            let flag = gitmesh::service::status_column_label(&change.entry);
             let renamed = change
                 .entry
                 .original_path
@@ -733,11 +743,10 @@ fn cmd_status(
     })
 }
 
+/// Delegates to the shared presentation helper, so the CLI, the terminal interface and
+/// the GUI always describe a repository the same way.
 fn branch_cell(state: &RepositoryState) -> String {
-    if !state.is_usable() {
-        return "-".to_string();
-    }
-    state.head().label()
+    gitmesh::service::branch_cell(state)
 }
 
 // ------------------------------------------------------------------ remotes --

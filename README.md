@@ -114,9 +114,22 @@ $ gitmesh pull
 $ gitmesh push
 ```
 
-Prefer a full-screen interface? `gitmesh ui` (alias `gitmesh tui`) provides the same
-operations: inspect the tree, mark directories as external repositories, edit ids and
-remote URLs, save the configuration, then commit / pull / push / branch from one screen.
+Prefer an interface? GitMesh ships two, and both drive the same core as the CLI:
+
+```console
+$ gitmesh gui                    # graphical interface in your browser (local only)
+$ gitmesh ui                     # full-screen terminal interface (alias: tui)
+```
+
+The graphical interface shows the project as **one** project — one tree, one status, one
+changes list, one commit message, one branch, one pull, one push — while GitMesh keeps
+managing the physical repositories underneath. It starts a small local server
+(`http://127.0.0.1:7345` by default) and calls nothing outside your machine: no account,
+no telemetry, no CDN. See [docs/GUI.md](docs/GUI.md).
+
+`gitmesh ui` is the terminal equivalent and additionally supports editing the project
+configuration (marking directories as repositories, renaming ids, setting remote URLs)
+from inside the interface.
 
 To see the whole workflow run end to end against real repositories and local bare remotes
 (including a genuine cross-repository conflict), use the demo script:
@@ -142,7 +155,8 @@ $ ./examples/demo.sh /tmp/gitmesh-demo
 | `gitmesh fetch` / `gitmesh pull [--strategy ff-only\|merge\|rebase]` | Synchronise the project |
 | `gitmesh push [--dry-run] [--no-set-upstream]` | Push every repository that has commits to push |
 | `gitmesh remotes` | Remotes per repository, provider and GitHub coordinates |
-| `gitmesh ui` | Interactive terminal interface |
+| `gitmesh ui` | Interactive terminal interface (can also edit the configuration) |
+| `gitmesh gui [--port N] [--host A] [--allow-host NAME] [--open] [--dry-run]` | Graphical interface served locally in a browser |
 
 Global flags: `-C <path>` (project directory), `--json` (machine-readable output),
 `-v/--verbose` (include Git output and details).
@@ -172,15 +186,18 @@ problems in their output but exit `0` as long as the project itself could be rea
 | --- | --- |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layering, module boundaries, ownership model, safety invariants, design decisions |
 | [`docs/MANIFEST.md`](docs/MANIFEST.md) | The exact manifest format, semantics and validation rules |
+| [`docs/GUI.md`](docs/GUI.md) | The graphical interface: running it, the views, commit/branch/pull/push semantics, conflict presentation, safety, what is not supported |
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Build, test, lint, extend; test strategy; UI architecture |
 | [`reports/DEVELOPMENT_REPORT.md`](reports/DEVELOPMENT_REPORT.md) | What was built, milestone by milestone, and why |
 | [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) | Hardening audit, limitations, technical debt, readiness assessment |
+| [`reports/GUI_REPORT.md`](reports/GUI_REPORT.md) | The graphical interface: audit, architecture, technology choice, tests, manual end-to-end validation, readiness |
 
 ## Status
 
 GitMesh implements the complete local multi-repository workflow — discovery,
 configuration, status/ownership, commit, branch/checkout/merge, fetch/pull/push — with a
-terminal UI and a GitHub-aware (but GitHub-independent) provider foundation. It is usable
+command line, a full-screen terminal interface and a local graphical interface, over a
+GitHub-aware (but GitHub-independent) provider foundation. It is usable
 by a small team on a real multi-repository project today, with the limitations listed in
 [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md).
 

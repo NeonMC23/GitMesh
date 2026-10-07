@@ -80,13 +80,29 @@ pub fn fetch_project(
     runner: &crate::git::GitRunner,
     options: &SyncOptions,
 ) -> Result<OperationReport> {
+    fetch_project_observed(
+        project,
+        runner,
+        options,
+        &mut crate::ops::OperationObserver::silent(),
+    )
+}
+
+/// Same as [`fetch_project`], reporting each repository as the loop reaches it.
+pub fn fetch_project_observed(
+    project: &GitMeshProject,
+    runner: &crate::git::GitRunner,
+    options: &SyncOptions,
+    observer: &mut crate::ops::OperationObserver<'_>,
+) -> Result<OperationReport> {
     options.selection.validate(project)?;
     let analyzer = Analyzer::new(project, runner);
-    let outcomes = util::each_repository(
+    let outcomes = util::each_repository_observed(
         project,
         &analyzer,
         runner,
         &options.selection,
+        observer,
         |repo, state, git| fetch_one(repo, state, git, options),
     );
     Ok(OperationReport::new("fetch", options.dry_run, outcomes))
@@ -98,13 +114,29 @@ pub fn pull_project(
     runner: &crate::git::GitRunner,
     options: &SyncOptions,
 ) -> Result<OperationReport> {
+    pull_project_observed(
+        project,
+        runner,
+        options,
+        &mut crate::ops::OperationObserver::silent(),
+    )
+}
+
+/// Same as [`pull_project`], reporting each repository as the loop reaches it.
+pub fn pull_project_observed(
+    project: &GitMeshProject,
+    runner: &crate::git::GitRunner,
+    options: &SyncOptions,
+    observer: &mut crate::ops::OperationObserver<'_>,
+) -> Result<OperationReport> {
     options.selection.validate(project)?;
     let analyzer = Analyzer::new(project, runner);
-    let outcomes = util::each_repository(
+    let outcomes = util::each_repository_observed(
         project,
         &analyzer,
         runner,
         &options.selection,
+        observer,
         |repo, state, git| pull_one(repo, state, git, options),
     );
     Ok(OperationReport::new("pull", options.dry_run, outcomes))

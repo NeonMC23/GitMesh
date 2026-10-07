@@ -119,6 +119,11 @@ pub struct OwnedChange {
     pub repository_id: String,
     /// Repository role.
     pub role: crate::model::RepositoryRole,
+    /// Project-relative path of the owning repository (`.` for the root repository).
+    ///
+    /// Carried on the change itself so that front ends can group changes by repository
+    /// without a second lookup into the project.
+    pub repository_path: String,
     /// Path relative to the owning repository (what `git` reports).
     pub repo_relative: String,
     /// Path relative to the project root (what the user sees).
@@ -312,6 +317,7 @@ impl<'a> Analyzer<'a> {
                 owned.push(OwnedChange {
                     repository_id: state.id.clone(),
                     role: state.role,
+                    repository_path: repo.relative_slash(),
                     logical_path: logical_path_of(repo, state.role, &entry.path),
                     repo_relative: entry.path.clone(),
                     entry: entry.clone(),

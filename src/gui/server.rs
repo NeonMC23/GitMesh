@@ -1,0 +1,957 @@
+//! Minimal HTTP/1.1 server for the local interface.
+//!
+//! Deliberately small and dependency-free:
+//!
+//! * one thread per connection (the interface serves a browser on one machine),
+//! * GET for the embedded assets and read-only endpoints,
+//! * POST for operations, with `application/x-www-form-urlencoded` bodies (the browser
+//!   sends those natively through `URLSearchParams`, and parsing them needs no JSON
+//!   parser on the Rust side),
+//! * server-sent events for operation progress, so a long Git operation never blocks
+//!   the interface and never requires polling.
+//!
+//! Two protections matter for a local tool that can commit and push:
+//!
+//! * if a request carries an `Origin` header, it must match the `Host` header — a web
+//!   page on another site cannot drive the interface (cross-site request forgery);
+//! * responses carry `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`,
+//!   because they describe the state of a working tree.
+//!
+//! Nothing here knows about projects, repositories or Git: it routes to [`Gui`].
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::error::{Error, Result};
+use crate::gui::{asset, Gui, GuiOperation};
+
+/// Maximum size of a request head, in bytes.
+const MAX_HEAD: usize = 16 * 1024;
+/// Maximum size of a request body, in bytes (a path and a commit message).
+const MAX_BODY: usize = 256 * 1024;
+/// How long an idle event stream is kept open before it is closed.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bind the listening socket.
+pub fn bind(host: &str, port: u16) -> Result<TcpListener> {
+    let address = format!("{host}:{port}");
+    let listener = TcpListener::bind(&address).map_err(|e| {
+        Error::Other(format!(
+            "could not bind {address}: {e}. Use --port to choose another port."
+        ))
+    })?;
+    Ok(listener)
+}
+
+/// Serve until the process is stopped.
+pub fn serve(
+    listener: TcpListener,
+    gui: Arc<Gui>,
+    host: &str,
+    extra_hosts: &[String],
+) -> Result<()> {
+    let allowed_hosts = allowed_hosts(host, extra_hosts);
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let gui = Arc::clone(&gui);
+                let allowed = allowed_hosts.clone();
+                std::thread::spawn(move || {
+                    // A connection that fails is not fatal: the interface reloads.
+                    let _ = handle(stream, &gui, &allowed);
+                });
+            }
+            Err(err) => {
+                eprintln!("gitmesh gui: connection error: {err}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Host names that may appear in the `Host` header for this server.
+///
+/// `extra` holds hosts the user explicitly allowed (`--allow-host`), for the cases where
+/// the interface is reached through a proxy or a port forward: the browser then sends
+/// that name in `Host`, and refusing it would make the page unusable. Nothing is allowed
+/// implicitly — an unexpected host is still answered with 421.
+fn allowed_hosts(host: &str, extra: &[String]) -> Vec<String> {
+    let mut hosts = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "[::1]".to_string(),
+    ];
+    if host != "0.0.0.0" && host != "::" && host != "[::]" && !hosts.iter().any(|k| k == host) {
+        hosts.push(host.to_string());
+    }
+    for name in extra {
+        let name = name.trim();
+        if !name.is_empty() && !hosts.iter().any(|known| known == name) {
+            hosts.push(name.to_string());
+        }
+    }
+    hosts
+}
+
+struct Request {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Path without the query string.
+    fn path(&self) -> &str {
+        match self.target.split_once('?') {
+            Some((path, _)) => path,
+            None => &self.target,
+        }
+    }
+}
+
+struct Response {
+    status: u16,
+    reason: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+    /// Extra headers (used by the event stream).
+    headers: Vec<(String, String)>,
+}
+
+impl Response {
+    fn new(status: u16, reason: &'static str, content_type: &'static str, body: String) -> Self {
+        Response {
+            status,
+            reason,
+            content_type,
+            body: body.into_bytes(),
+            headers: Vec::new(),
+        }
+    }
+
+    fn json(body: String) -> Self {
+        Response::new(200, "OK", "application/json; charset=utf-8", body)
+    }
+
+    fn html(body: &'static str) -> Self {
+        Response::new(200, "OK", "text/html; charset=utf-8", body.to_string())
+    }
+
+    fn css(body: &'static str) -> Self {
+        Response::new(200, "OK", "text/css; charset=utf-8", body.to_string())
+    }
+
+    fn js(body: &'static str) -> Self {
+        Response::new(
+            200,
+            "OK",
+            "application/javascript; charset=utf-8",
+            body.to_string(),
+        )
+    }
+
+    fn error(status: u16, reason: &'static str, message: &str) -> Self {
+        Response::json(
+            crate::json::Json::object([
+                ("error", crate::json::Json::from(message.to_string())),
+                ("status", crate::json::Json::from(status as i64)),
+            ])
+            .to_pretty_string(),
+        )
+        .with_status(status, reason)
+    }
+
+    fn with_status(mut self, status: u16, reason: &'static str) -> Self {
+        self.status = status;
+        self.reason = reason;
+        self
+    }
+
+    fn empty(status: u16, reason: &'static str) -> Self {
+        Response::new(status, reason, "text/plain; charset=utf-8", String::new())
+    }
+}
+
+fn handle(mut stream: TcpStream, gui: &Arc<Gui>, allowed_hosts: &[String]) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    // Requests are small; one read of the head is enough to route them.
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let request = match read_request(&mut reader)? {
+        Some(request) => request,
+        None => return Ok(()), // client hung up
+    };
+
+    // Cross-site guard: an `Origin` that does not match the `Host` is not the interface.
+    if let (Some(origin), Some(host)) = (request.header("Origin"), request.header("Host")) {
+        if !origin_matches_host(origin, host) {
+            let response = Response::error(
+                403,
+                "Forbidden",
+                "cross-site requests are not allowed: this interface can commit and push, so it \
+                 only accepts requests from its own page",
+            );
+            return write_response(&mut stream, response);
+        }
+    }
+
+    // The `Host` header must be plausible, which closes the DNS-rebinding hole.
+    if let Some(host) = request.header("Host") {
+        let host_name = host_name(host);
+        if !allowed_hosts.iter().any(|allowed| allowed == &host_name) {
+            let response = Response::error(
+                421,
+                "Misdirected Request",
+                "this interface only answers requests addressed to the host it was started with",
+            );
+            return write_response(&mut stream, response);
+        }
+    }
+
+    match (request.method.as_str(), request.path()) {
+        ("GET", "/") | ("GET", "/index.html") => {
+            write_response(&mut stream, Response::html(asset::INDEX_HTML))
+        }
+        ("GET", "/app.css") => write_response(&mut stream, Response::css(asset::APP_CSS)),
+        ("GET", "/app.js") => write_response(&mut stream, Response::js(asset::APP_JS)),
+        ("GET", "/favicon.ico") => write_response(&mut stream, Response::empty(204, "No Content")),
+        ("GET", "/api/health") => write_response(&mut stream, Response::json(health_json())),
+        ("GET", "/api/model") => write_response(&mut stream, Response::json(gui.model())),
+        ("POST", "/api/refresh") => write_response(&mut stream, Response::json(gui.model())),
+        ("POST", "/api/open") => write_response(&mut stream, open_response(gui, &request)),
+        ("POST", "/api/dry-run") => write_response(&mut stream, dry_run_response(gui, &request)),
+        ("POST", "/api/commit") => write_response(&mut stream, commit_response(gui, &request)),
+        ("POST", "/api/branch") => write_response(&mut stream, branch_response(gui, &request)),
+        ("POST", "/api/sync") => write_response(&mut stream, sync_response(gui, &request)),
+        ("POST", "/api/push") => write_response(&mut stream, push_response(gui)),
+        (method, path) if method == "GET" && path.starts_with("/api/events/") => {
+            match path.trim_start_matches("/api/events/").parse::<u64>() {
+                Ok(id) => stream_events(&mut stream, gui, id),
+                Err(_) => write_response(
+                    &mut stream,
+                    Response::error(400, "Bad Request", "the event stream id must be a number"),
+                ),
+            }
+        }
+        (method, path) if method == "GET" && path.starts_with("/api/report/") => {
+            match path.trim_start_matches("/api/report/").parse::<u64>() {
+                Ok(id) => match gui.stored_report(id) {
+                    Some(report) => write_response(&mut stream, Response::json(report)),
+                    None => write_response(
+                        &mut stream,
+                        Response::error(404, "Not Found", "no such operation result"),
+                    ),
+                },
+                Err(_) => write_response(
+                    &mut stream,
+                    Response::error(400, "Bad Request", "the operation id must be a number"),
+                ),
+            }
+        }
+        (method, _) if method != "GET" && method != "POST" => write_response(
+            &mut stream,
+            Response::error(405, "Method Not Allowed", "only GET and POST are supported"),
+        ),
+        _ => write_response(&mut stream, not_found()),
+    }
+}
+
+// ------------------------------------------------------------------- endpoints --
+
+fn not_found() -> Response {
+    Response::error(404, "Not Found", "no such endpoint")
+}
+
+fn health_json() -> String {
+    crate::json::Json::object([
+        ("ok", crate::json::Json::from(true)),
+        ("name", crate::json::Json::from("gitmesh")),
+        ("version", crate::json::Json::from(crate::VERSION)),
+    ])
+    .compact()
+}
+
+fn open_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let path = form_value(&request.body, "path").unwrap_or_default();
+    if path.trim().is_empty() {
+        return Response::error(400, "Bad Request", "the 'path' field is required");
+    }
+    // On failure the interface reloads the model itself, so the error response only
+    // has to carry the reason: the server never has to merge two JSON documents.
+    match gui.open(std::path::Path::new(path.trim())) {
+        Ok(()) => Response::json(gui.model()),
+        Err(message) => Response::json(
+            crate::json::Json::object([("error", crate::json::Json::from(message))])
+                .to_pretty_string(),
+        )
+        .with_status(422, "Unprocessable Entity"),
+    }
+}
+
+fn dry_run_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let value = form_value(&request.body, "value")
+        .map(|value| value == "true" || value == "1" || value == "on")
+        .unwrap_or(false);
+    gui.set_dry_run(value);
+    Response::json(gui.model())
+}
+
+fn operation_response(gui: &Arc<Gui>, operation: GuiOperation) -> Response {
+    match gui.start_operation(operation) {
+        Ok(id) => Response::json(
+            crate::json::Json::object([
+                ("id", crate::json::Json::from(id as i64)),
+                (
+                    "events",
+                    crate::json::Json::from(format!("/api/events/{id}")),
+                ),
+            ])
+            .compact(),
+        )
+        .with_status(202, "Accepted"),
+        Err(message) => Response::error(409, "Conflict", &message),
+    }
+}
+
+fn commit_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let message = form_value(&request.body, "message").unwrap_or_default();
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Response::error(
+            400,
+            "Bad Request",
+            "a commit message is required; GitMesh uses it for every repository it commits",
+        );
+    }
+    operation_response(gui, GuiOperation::Commit { message })
+}
+
+fn branch_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let action = form_value(&request.body, "action").unwrap_or_default();
+    let name = form_value(&request.body, "name").unwrap_or_default();
+    let name = name.trim().to_string();
+    let force = form_value(&request.body, "force").as_deref() == Some("true");
+    if name.is_empty() {
+        return Response::error(400, "Bad Request", "a branch name is required");
+    }
+    let operation = match action.as_str() {
+        "create" => GuiOperation::BranchCreate { name },
+        "checkout" => GuiOperation::BranchCheckout { name },
+        "start" => GuiOperation::BranchStart { name },
+        "merge" => GuiOperation::BranchMerge { name },
+        "delete" => GuiOperation::BranchDelete { name, force },
+        other => {
+            return Response::error(
+                400,
+                "Bad Request",
+                &format!("unknown branch action '{other}'"),
+            )
+        }
+    };
+    operation_response(gui, operation)
+}
+
+fn sync_response(gui: &Arc<Gui>, request: &Request) -> Response {
+    let action = form_value(&request.body, "action").unwrap_or_else(|| "pull".to_string());
+    match action.as_str() {
+        "fetch" => operation_response(gui, GuiOperation::Fetch),
+        "pull" => {
+            let strategy = form_value(&request.body, "strategy").unwrap_or_default();
+            match crate::gui::parse_strategy(&strategy) {
+                Ok(strategy) => operation_response(gui, GuiOperation::Pull { strategy }),
+                Err(message) => Response::error(400, "Bad Request", &message),
+            }
+        }
+        other => Response::error(
+            400,
+            "Bad Request",
+            &format!("unknown sync action '{other}'"),
+        ),
+    }
+}
+
+fn push_response(gui: &Arc<Gui>) -> Response {
+    operation_response(gui, GuiOperation::Push)
+}
+
+/// Thread one operation's progress to the browser as server-sent events.
+fn stream_events(stream: &mut TcpStream, gui: &Arc<Gui>, id: u64) -> std::io::Result<()> {
+    let Some(log) = gui.events_for(id) else {
+        // The operation is gone (restarted server, or an unknown id): answer with the
+        // stored result if there is one, so a reconnecting interface still recovers.
+        return match gui.stored_report(id) {
+            Some(report) => {
+                let event = format!("event: result\ndata: {}\n\n", report.replace('\n', ""));
+                write_sse_head(stream)?;
+                stream.write_all(event.as_bytes())?;
+                stream.flush()
+            }
+            None => write_response(
+                stream,
+                Response::error(404, "Not Found", "no such operation"),
+            ),
+        };
+    };
+
+    write_sse_head(stream)?;
+    let started = Instant::now();
+    loop {
+        for event in log.drain() {
+            if stream
+                .write_all(format!("data: {event}\n\n").as_bytes())
+                .is_err()
+            {
+                return Ok(()); // the browser went away
+            }
+        }
+        if log.is_finished() {
+            // One last drain, then close the stream: the interface reconnects for the
+            // next operation.
+            for event in log.drain() {
+                let _ = stream.write_all(format!("data: {event}\n\n").as_bytes());
+            }
+            let _ = stream.write_all(b"event: closed\ndata: {}\n\n");
+            let _ = stream.flush();
+            return Ok(());
+        }
+        if stream.flush().is_err() {
+            return Ok(());
+        }
+        if started.elapsed() > STREAM_TIMEOUT {
+            let _ = stream.write_all(b"event: closed\ndata: {\"reason\":\"timeout\"}\n\n");
+            let _ = stream.flush();
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+fn write_sse_head(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream; charset=utf-8\r\n\
+                Cache-Control: no-store\r\n\
+                Connection: close\r\n\
+                X-Content-Type-Options: nosniff\r\n\r\n";
+    stream.write_all(head.as_bytes())?;
+    stream.flush()
+}
+
+// ----------------------------------------------------------------- HTTP plumbing --
+
+/// Read one request. Returns `None` when the client closed the connection first.
+fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        head.push_str(&line);
+        if head.len() > MAX_HEAD {
+            return Ok(Some(Request {
+                method: "GET".into(),
+                target: "/too-large".into(),
+                headers: Vec::new(),
+                body: String::new(),
+            }));
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let target = parts.next().unwrap_or("/").to_string();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect();
+
+    let length: usize = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(0);
+    let body = if length == 0 {
+        String::new()
+    } else {
+        let length = length.min(MAX_BODY);
+        let mut buffer = vec![0u8; length];
+        reader.read_exact(&mut buffer)?;
+        String::from_utf8_lossy(&buffer).to_string()
+    };
+
+    Ok(Some(Request {
+        method,
+        target,
+        headers,
+        body,
+    }))
+}
+
+fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\n",
+        response.status,
+        response.reason,
+        response.content_type,
+        response.body.len()
+    );
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&response.body)?;
+    stream.flush()
+}
+
+/// `application/x-www-form-urlencoded` field, percent-decoded.
+fn form_value(body: &str, key: &str) -> Option<String> {
+    body.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| percent_decode(value))
+}
+
+/// Decode `%XX` and `+` from a form value. Invalid escapes are kept verbatim, because a
+/// half-decoded path is worse than a visible one.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        index += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            other => {
+                out.push(other);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Host part of a `Host` header (`example.com:8080` -> `example.com`).
+fn host_name(host: &str) -> String {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 literal
+        return match rest.split_once(']') {
+            Some((address, _)) => format!("[{address}]"),
+            None => host.to_string(),
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+/// True when an `Origin` header belongs to the same origin as the `Host` header.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let origin = origin.trim();
+    if origin == "null" {
+        return false;
+    }
+    let without_scheme = match origin.split_once("://") {
+        Some((_, rest)) => rest,
+        None => origin,
+    };
+    host_name(without_scheme) == host_name(host) && origin_port(without_scheme) == host_port(host)
+}
+
+fn origin_port(origin: &str) -> Option<String> {
+    match origin.rsplit_once(':') {
+        Some((_, port)) if port.chars().all(|c| c.is_ascii_digit()) => Some(port.to_string()),
+        _ => None,
+    }
+}
+
+fn host_port(host: &str) -> Option<String> {
+    match host.rsplit_once(':') {
+        Some((_, port)) if port.chars().all(|c| c.is_ascii_digit()) => Some(port.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::RepoFixture;
+    use std::net::TcpStream;
+
+    fn get(port: u16, path: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        read_all(&mut stream)
+    }
+
+    fn post(port: u16, path: &str, body: &str, origin: Option<&str>) -> (u16, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let origin = origin
+            .map(|origin| format!("Origin: {origin}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{origin}Content-Type: \
+             application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        read_all(&mut stream)
+    }
+
+    fn read_all(stream: &mut TcpStream) -> (u16, String) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        let body = raw.split_once("\r\n\r\n").map(|(_, body)| body.to_string());
+        (status, body.unwrap_or_default())
+    }
+
+    /// Start a server on a free port and return (port, join handle).
+    fn start_server(gui: Arc<Gui>) -> u16 {
+        let listener = bind("127.0.0.1", 0).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _ = serve(listener, gui, "127.0.0.1", &[]);
+        });
+        port
+    }
+
+    #[test]
+    fn serves_the_interface_and_the_model() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+
+        let (status, html) = get(port, "/");
+        assert_eq!(status, 200);
+        assert!(html.contains("GitMesh"));
+        assert!(html.contains("<!doctype html>"));
+
+        let (status, css) = get(port, "/app.css");
+        assert_eq!(status, 200);
+        assert!(css.contains("--"));
+
+        let (status, js) = get(port, "/app.js");
+        assert_eq!(status, 200);
+        assert!(js.contains("clientLogic"));
+
+        let (status, health) = get(port, "/api/health");
+        assert_eq!(status, 200);
+        assert!(health.contains("\"ok\":true"));
+
+        let (status, model) = get(port, "/api/model");
+        assert_eq!(status, 200);
+        assert!(model.contains("\"name\": \"demo\""));
+        assert!(model.contains("\"tree\""));
+
+        let (status, _) = get(port, "/nope");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn model_reports_a_missing_project_instead_of_failing() {
+        let fixture = RepoFixture::named("demo");
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+        let (status, model) = get(port, "/api/model");
+        assert_eq!(status, 200);
+        assert!(model.contains("\"kind\": \"no-project\""));
+    }
+
+    #[test]
+    fn opening_a_directory_through_the_api_works_and_reports_errors() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        let empty = fixture.outside_path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let gui = Arc::new(Gui::new(empty.clone(), false));
+        let port = start_server(gui);
+
+        let (status, body) = post(
+            port,
+            "/api/open",
+            &format!("path={}", url_encode(fixture.path().to_str().unwrap())),
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"name\": \"demo\""));
+
+        // Opening a directory that is not a project is a client error with a message.
+        let (status, body) = post(
+            port,
+            "/api/open",
+            &format!("path={}", url_encode(empty.to_str().unwrap())),
+            None,
+        );
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("no GitMesh project found"), "{body}");
+    }
+
+    #[test]
+    fn commit_endpoint_streams_progress_events() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.write("src/main.rs", "x");
+        fixture.write("engine/lib.rs", "y");
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+
+        let (status, body) = post(
+            port,
+            "/api/commit",
+            "message=from%20the%20interface",
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        assert_eq!(status, 202, "{body}");
+        let id = body
+            .split("\"id\":")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap()
+            .to_string();
+
+        let (status, events) = get(port, &format!("/api/events/{id}"));
+        assert_eq!(status, 200);
+        assert!(events.contains("\"type\":\"started\""), "{events}");
+        assert!(events.contains("\"type\":\"finished\""), "{events}");
+        assert!(events.contains("\"sentence\":\"Committing the project\""));
+
+        // The stored report is available for a late page load.
+        let (status, report) = get(port, &format!("/api/report/{id}"));
+        assert_eq!(status, 200);
+        assert!(report.contains("\"operation\": \"commit\""));
+
+        assert!(fixture
+            .git_ok("engine", &["log", "-1", "--pretty=%s"])
+            .contains("from the interface"));
+    }
+
+    #[test]
+    fn commit_without_a_message_is_rejected() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.write("src/main.rs", "x");
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+        let (status, body) = post(port, "/api/commit", "message=%20%20", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("commit message is required"), "{body}");
+    }
+
+    #[test]
+    fn branch_and_sync_endpoints_validate_their_input() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+
+        let (status, body) = post(port, "/api/branch", "action=nonsense&name=x", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("unknown branch action"));
+
+        let (status, body) = post(port, "/api/branch", "action=create&name=", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("branch name is required"));
+
+        let (status, body) = post(port, "/api/sync", "action=pull&strategy=sideways", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("unknown pull strategy"));
+
+        let (status, body) = post(port, "/api/sync", "action=teleport", None);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("unknown sync action"));
+
+        let (status, body) = post(port, "/api/branch", "action=start&name=feature%2Fapi", None);
+        assert_eq!(status, 202, "{body}");
+        let id = body
+            .split("\"id\":")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap()
+            .to_string();
+        let (_, events) = get(port, &format!("/api/events/{id}"));
+        assert!(events.contains("feature/api"), "{events}");
+        assert_eq!(
+            fixture
+                .git_ok("engine", &["rev-parse", "--abbrev-ref", "HEAD"])
+                .trim(),
+            "feature/api"
+        );
+    }
+
+    #[test]
+    fn dry_run_endpoint_toggles_the_mode() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+        let (status, model) = post(port, "/api/dry-run", "value=true", None);
+        assert_eq!(status, 200);
+        assert!(model.contains("\"dryRun\": true"));
+        let (_, model) = post(port, "/api/dry-run", "value=false", None);
+        assert!(model.contains("\"dryRun\": false"));
+    }
+
+    #[test]
+    fn cross_site_and_misdirected_requests_are_refused() {
+        let fixture = RepoFixture::named("demo");
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.write("src/main.rs", "x");
+        let gui = Arc::new(Gui::new(fixture.path().to_path_buf(), false));
+        let port = start_server(gui);
+
+        // A page on another site cannot drive the interface.
+        let (status, body) = post(
+            port,
+            "/api/commit",
+            "message=evil",
+            Some("http://evil.example.com"),
+        );
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("cross-site"), "{body}");
+        assert!(!fixture.git_ok(".", &["log", "--oneline"]).contains("evil"));
+
+        // A different port is a different origin too.
+        let (status, _) = post(
+            port,
+            "/api/commit",
+            "message=evil",
+            Some(&format!("http://127.0.0.1:{}", port + 1)),
+        );
+        assert_eq!(status, 403);
+
+        // A misdirected Host header (DNS rebinding) is refused.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                b"GET /api/model HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let (status, _) = read_all(&mut stream);
+        assert_eq!(status, 421);
+    }
+
+    #[test]
+    fn extra_hosts_are_only_accepted_when_requested() {
+        assert_eq!(
+            allowed_hosts("127.0.0.1", &[]),
+            vec!["127.0.0.1", "localhost", "[::1]"]
+        );
+        // The bind address is allowed, a wildcard bind is not a usable name.
+        assert!(allowed_hosts("10.0.0.5", &[]).contains(&"10.0.0.5".to_string()));
+        assert!(!allowed_hosts("0.0.0.0", &[]).contains(&"0.0.0.0".to_string()));
+        let extra = allowed_hosts("0.0.0.0", &["preview.example.com".to_string()]);
+        assert!(extra.contains(&"preview.example.com".to_string()));
+        assert!(!allowed_hosts("0.0.0.0", &[]).contains(&"preview.example.com".to_string()));
+        // Blank and duplicate entries do not pile up.
+        let messy = allowed_hosts(
+            "127.0.0.1",
+            &[" ".to_string(), "localhost".to_string(), "".to_string()],
+        );
+        assert_eq!(messy, vec!["127.0.0.1", "localhost", "[::1]"]);
+    }
+
+    #[test]
+    fn form_values_and_host_parsing_are_sound() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%2Ftmp%2Fproject"), "/tmp/project");
+        assert_eq!(percent_decode("%C3%A9t%C3%A9"), "été");
+        assert_eq!(
+            form_value("path=%2Ftmp%2Fx&other=1", "path").as_deref(),
+            Some("/tmp/x")
+        );
+        assert_eq!(
+            form_value("path=/tmp/x&other=1", "other").as_deref(),
+            Some("1")
+        );
+        assert_eq!(form_value("nothing=1", "path"), None);
+
+        assert_eq!(host_name("example.com:8080"), "example.com");
+        assert_eq!(host_name("example.com"), "example.com");
+        assert_eq!(host_name("[::1]:80"), "[::1]");
+        assert!(origin_matches_host(
+            "http://127.0.0.1:7345",
+            "127.0.0.1:7345"
+        ));
+        assert!(!origin_matches_host(
+            "http://127.0.0.1:7346",
+            "127.0.0.1:7345"
+        ));
+        assert!(!origin_matches_host(
+            "http://evil.test:7345",
+            "127.0.0.1:7345"
+        ));
+        assert!(!origin_matches_host("null", "127.0.0.1:7345"));
+    }
+
+    fn url_encode(value: &str) -> String {
+        let mut out = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                b' ' => out.push('+'),
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+        out
+    }
+}
