@@ -201,12 +201,6 @@ fn pull_one(
     };
 
     // ---- preconditions ----------------------------------------------------
-    if let Some(operation) = util::has_operation_in_progress(state) {
-        return base(
-            OutcomeKind::Failed,
-            format!("{operation}: finish or abort it first"),
-        );
-    }
     if state.has_conflicts() {
         let files: Vec<String> = state
             .status
@@ -218,6 +212,12 @@ fn pull_one(
             format!("{} unresolved conflict(s)", files.len()),
         )
         .with_details(files);
+    }
+    if let Some(operation) = util::has_operation_in_progress(state) {
+        return base(
+            OutcomeKind::Failed,
+            format!("{operation}: finish or abort it first"),
+        );
     }
     if state.head().is_detached() {
         return base(

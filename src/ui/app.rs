@@ -16,6 +16,7 @@ use crate::analyzer::{Analyzer, ProjectStatus};
 use crate::discovery::{self, DirectoryNode, ProjectScan, ScanOptions};
 use crate::error::Result;
 use crate::git::GitRunner;
+use crate::manage;
 use crate::manifest;
 use crate::model::{GitMeshProject, RepositoryRole};
 use crate::ops::sync::SyncOptions;
@@ -379,7 +380,14 @@ impl App {
         self.reload_project()
     }
 
-    /// Return the selected directory to the root repository.
+    /// Remove the selected repository from the configuration.
+    ///
+    /// Same path as the command line and the graphical interface: the shared management
+    /// service plans the change, and the plan is applied only when it is ready. The plan
+    /// refuses when the root repository still tracks files inside the directory, because
+    /// those files go back to the root repository. The terminal has no step for confirming
+    /// that consequence, so it refuses and says where the explicit confirmation lives. The
+    /// directory, its `.git`, its history and its remote are never touched.
     pub fn unassign_selected(&mut self) -> Result<()> {
         let Some(project) = self.project.clone() else {
             return Ok(());
@@ -388,29 +396,39 @@ impl App {
             self.log("select a configured repository to remove it");
             return Ok(());
         };
-        // Removing a repository from the configuration never touches it, but files the root
-        // repository tracks inside it do come back to the root repository: say so. (The
-        // command line and the graphical interface make the same consequence explicit
-        // before the change runs.)
-        if let Some(entry) = project.repository(&repo) {
-            let tracked = discovery::count_files_tracked_under(
-                &project.root,
-                &entry.relative_path,
-                &self.runner,
-            );
-            if tracked > 0 {
-                self.log(format!(
-                    "note: the root repository still tracks {tracked} file(s) inside '{}'; \
-                     they go back to it, and nothing is deleted",
-                    entry.relative_slash()
-                ));
+        let request = manage::RepositoryManagementRequest::one(manage::RepositoryIntent::Remove {
+            id: repo.clone(),
+            confirm_takeover: false,
+        });
+        let plan = manage::plan(&project, &request, &self.runner)?;
+        if !plan.is_ready() {
+            for blocker in &plan.blockers {
+                self.log(format!("cannot remove '{repo}': {blocker}"));
             }
+            self.log(format!(
+                "to confirm that, run `gitmesh configure remove {repo} --confirm-takeover`"
+            ));
+            return Ok(());
         }
-        let updated = discovery::unassign_repository(&project, &repo)?;
-        manifest::save_project(&updated)?;
-        self.log(format!(
-            "'{repo}' is no longer a separate repository (its files and history are untouched)"
-        ));
+        for warning in &plan.warnings {
+            self.log(format!("note: {warning}"));
+        }
+        let result = manage::apply(
+            &plan,
+            self.dry_run,
+            &self.runner,
+            &mut manage::RepositoryObserver::silent(),
+        );
+        for outcome in &result.actions {
+            self.log(format!("{}: {}", outcome.row_id(), outcome.summary));
+        }
+        if !result.is_success() {
+            self.log("the removal did not complete; review the lines above");
+        } else if result.dry_run {
+            self.log(format!(
+                "dry run: '{repo}' would be removed; nothing was changed"
+            ));
+        }
         self.reload_project()
     }
 
@@ -668,12 +686,12 @@ mod tests {
     }
 
     #[test]
-    fn unassigning_says_which_files_go_back_to_the_root_repository() {
+    fn unassigning_refuses_when_files_would_go_back_to_the_root_repository() {
         let fixture = RepoFixture::new();
         fixture.project_with(&[("root", ".")]);
         // The root repository starts by tracking a file that later belongs to the external
-        // repository (the order a real project grows in), so removing the external entry
-        // hands that file back — which the interface has to say out loud.
+        // repository (the order a real project grows in). Removing the external entry would
+        // hand that file back to the root repository, which needs an explicit confirmation.
         fixture.write("engine/lib.rs", "pub fn go() {}\n");
         fixture.add_all(".");
         fixture.commit(".", "root tracks engine/lib.rs");
@@ -698,11 +716,24 @@ mod tests {
             .unwrap();
         app.selected = index;
         app.unassign_selected().unwrap();
-        assert!(app.project.as_ref().unwrap().repository("engine").is_none());
+
+        // The terminal refuses: the repository stays configured, and the reason and the
+        // explicit way to confirm it are on screen.
+        assert!(
+            app.project.as_ref().unwrap().repository("engine").is_some(),
+            "a refused removal changes nothing"
+        );
         assert!(
             app.log
                 .iter()
-                .any(|line| line.contains("still tracks 1 file(s) inside 'engine'")),
+                .any(|line| line.contains("cannot remove 'engine'") && line.contains("1 file(s)")),
+            "{:?}",
+            app.log
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("--confirm-takeover")),
             "{:?}",
             app.log
         );
@@ -714,6 +745,11 @@ mod tests {
             fixture.git_ok(".", &["ls-files", "--", "engine"]).trim(),
             "engine/lib.rs",
             "and the root repository still owns it"
+        );
+        let manifest_now = manifest::load_from_root(fixture.path()).unwrap();
+        assert!(
+            manifest_now.repository("engine").is_some(),
+            "the manifest is unchanged"
         );
     }
 

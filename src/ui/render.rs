@@ -334,8 +334,8 @@ fn draw_log(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let hints = match app.screen {
-        Screen::Setup => "Enter: open directory   A: mark/unmark repository   I: rename   U: remote   W: save configuration   S: rescan   ?: help   Q: quit",
-        Screen::Project => "C: commit   P: pull   Shift-P: push   F: fetch   S: refresh   N: new branch   B: switch branch   M: merge   A: unassign   D: dry-run   R: reload   ?: help   Q: quit",
+        Screen::Setup => "Enter: open directory   a: mark/unmark repository   i: rename   u: remote   w: save configuration   s: rescan   ?: help   q: quit",
+        Screen::Project => "c: commit   p: pull   P: push   f: fetch   s: refresh   n: new branch   b: switch branch   m: merge   a: mark/unmark repository   d: dry-run   r: reload   ?: help   q: quit",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(hints, Style::default().fg(MUTED))),
@@ -369,17 +369,17 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw(""),
         Line::raw("Navigation      j/k or arrows: move in the tree"),
         Line::raw("                Enter: open a directory (setup) / confirm input"),
-        Line::raw("Configuration   A: mark or unmark the selected directory as an independent"),
+        Line::raw("Configuration   a: mark or unmark the selected directory as an independent"),
         Line::raw("                   physical repository (saved to .gitmesh/project.toml)"),
-        Line::raw("                I: rename the repository   U: set its remote URL"),
-        Line::raw("                W: save the configuration"),
-        Line::raw("Everyday work   C: commit all changes with one message"),
-        Line::raw("                P: pull every repository   Shift-P: push every repository"),
-        Line::raw("                F: fetch   S: refresh status"),
-        Line::raw("Branches        N: create and switch to a branch everywhere"),
-        Line::raw("                B: switch to an existing branch   M: merge a branch"),
-        Line::raw("Safety          D: dry-run on/off (nothing is changed)"),
-        Line::raw("                Q: quit   ?: close this help"),
+        Line::raw("                i: rename the repository   u: set its remote URL"),
+        Line::raw("                w: save the configuration"),
+        Line::raw("Everyday work   c: commit all changes with one message"),
+        Line::raw("                p: pull every repository   P: push every repository"),
+        Line::raw("                f: fetch   s: refresh status"),
+        Line::raw("Branches        n: create and switch to a branch everywhere"),
+        Line::raw("                b: switch to an existing branch   m: merge a branch"),
+        Line::raw("Safety          d: dry-run on/off (nothing is changed)"),
+        Line::raw("                q: quit   ?: close this help"),
         Line::raw(""),
         Line::styled(
             "GitMesh never discards local work and never reimplements Git.",

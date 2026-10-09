@@ -241,8 +241,12 @@ ownership comes from the manifest, not from the filesystem, so `engine/foo.rs` i
 a file of the project that happens to live in the `engine` repository — and the
 repository root is never reported as "containing" another repository's files.
 
-Refresh (`R`, or the refresh button) re-reads everything. The view also refreshes
-automatically every 15 seconds while it is visible and no operation is running.
+Refresh (`R`, or the refresh button) re-reads the project from disk: the manifest, and
+every repository's state. A repository added or removed from the command line or the
+terminal interface therefore appears after Refresh, without restarting the interface. If
+the manifest is now invalid, the interface shows the error instead of the old project.
+While an operation is running, Refresh does nothing. The view also refreshes automatically
+every 15 seconds while it is visible and no operation is running.
 
 ## How the unified commit works
 
@@ -289,6 +293,11 @@ Conflicts are shown as conflicts — a distinct colour, a distinct symbol (`!`),
 conflicted files listed, the project state marked *conflicted*, and the affected
 repositories marked as blocked in the commit view.
 
+While a repository has a merge, rebase or cherry-pick open (for example after a conflict
+was resolved by hand but not concluded), GitMesh's unified commit, pull, push and branch
+operations refuse that repository and say so. Only Git concludes such an operation: the
+unified commit never completes someone else's merge.
+
 GitMesh does not resolve conflicts, and the interface does not pretend to. When one
 occurs, it shows the repository and the files, and the exact Git commands to use
 (`git status`, `git add … && git commit`, `git merge --abort`). Resolve in the repository,
@@ -314,6 +323,22 @@ Pulling the project
 
 The final panel replaces it with the aggregate result: how many repositories succeeded,
 were skipped, conflicted or failed, with details per repository.
+
+Each repository ends in one of these states, and the interface never invents another:
+
+| Mark | State | Meaning |
+| --- | --- | --- |
+| ✓ | success | the operation completed in this repository |
+| – | skipped | nothing to do, or not applicable (for example a local-only repository for a remote operation) |
+| ! | conflict | a conflict blocks the operation here; the files are listed |
+| ✗ | failed | Git reported an error, with Git's message |
+| ? | unreported | the operation started here but no result arrived, or a failure stopped the run before this repository was reached |
+
+The title is never *completed* while a repository is unreported or a run has failed. A
+failure after some results reads *stopped before finishing*, and the results that did
+complete stay listed. If the connection to a running operation is lost, the interface says
+so and asks you to check the state before starting another action, because the operation
+may still be running on the server.
 
 ## The local HTTP surface
 
@@ -358,7 +383,11 @@ The page talks only to the server it was served from.
 * **No silent configuration changes.** The GUI can change the project's configuration,
   but never silently: a change is planned first, the plan shows every change, every step
   and the exact manifest it would write, and it runs only after it is confirmed. A plan
-  that is not the one that was reviewed is refused.
+  that is not the one that was reviewed is refused. The refused plan is then shown in place
+  of the old one, with the reason, and Apply stays disabled until you confirm that plan
+  again. The terminal interface follows the same rule for removals: when files would go
+  back to the root repository it refuses and names the command that confirms it
+  (`gitmesh configure remove <id> --confirm-takeover`).
 
 ## What is not supported yet
 

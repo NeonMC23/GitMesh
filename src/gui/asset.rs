@@ -57,6 +57,48 @@ mod tests {
         assert!(CLIENT_TESTS.contains("assert("));
     }
 
+    /// Two function declarations with one name in the same block silently replace each
+    /// other, so the later one wins for every caller. That is how the setup wizard's
+    /// editors stopped rendering: its `renderRepositories` was replaced by the Repositories
+    /// panel's. Nested helpers may share a name when they live in different functions, so
+    /// the check compares the enclosing line as well.
+    #[test]
+    fn no_function_is_declared_twice_in_one_block() {
+        let lines: Vec<&str> = APP_JS.lines().collect();
+        let mut seen: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("function ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+            let parent = lines[..index]
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    !candidate.trim().is_empty()
+                        && candidate.len() - candidate.trim_start().len() < indent
+                })
+                .map(|candidate| candidate.trim().to_string())
+                .unwrap_or_default();
+            if let Some(first) = seen.insert((parent, name.clone()), index + 1) {
+                panic!(
+                    "function '{name}' is declared on lines {first} and {} in the same block; \
+                     the second replaces the first",
+                    index + 1
+                );
+            }
+        }
+    }
+
     /// Every element the script looks up must exist in the page, or be created by the
     /// script itself — the list below is exactly that second case.
     #[test]

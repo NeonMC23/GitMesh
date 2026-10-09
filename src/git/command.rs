@@ -386,27 +386,26 @@ impl<'a> GitRepo<'a> {
 
     /// A long-running Git operation that is currently in progress, if any.
     pub fn operation_in_progress(&self) -> Result<Option<InProgressOperation>> {
+        // The markers live in this worktree's Git directory. `rev-parse --git-path` prints
+        // them *relative to the repository*, so testing that string from the process's own
+        // working directory would look in the wrong place for every repository except the
+        // one GitMesh runs in. The absolute Git directory is resolved against the repository
+        // itself, which is what makes the check correct for every repository.
+        let Some(git_dir) = self.git_dir()? else {
+            return Ok(None);
+        };
         for (marker, operation) in [
             ("MERGE_HEAD", InProgressOperation::Merge),
             ("CHERRY_PICK_HEAD", InProgressOperation::CherryPick),
             ("REVERT_HEAD", InProgressOperation::Revert),
             ("BISECT_LOG", InProgressOperation::Bisect),
         ] {
-            if let Some(path) = self.run_optional(&["rev-parse", "--git-path", marker])? {
-                if Path::new(&path).exists() {
-                    return Ok(Some(operation));
-                }
+            if git_dir.join(marker).exists() {
+                return Ok(Some(operation));
             }
         }
-        if let Some(path) = self.run_optional(&["rev-parse", "--git-path", "rebase-merge"])? {
-            if Path::new(&path).exists() {
-                return Ok(Some(InProgressOperation::Rebase));
-            }
-        }
-        if let Some(path) = self.run_optional(&["rev-parse", "--git-path", "rebase-apply"])? {
-            if Path::new(&path).exists() {
-                return Ok(Some(InProgressOperation::Rebase));
-            }
+        if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+            return Ok(Some(InProgressOperation::Rebase));
         }
         Ok(None)
     }

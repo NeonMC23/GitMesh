@@ -105,14 +105,6 @@ fn commit_one(
     };
 
     // ---- safety checks -----------------------------------------------------
-    if let Some(operation) = util::has_operation_in_progress(state) {
-        return base(
-            OutcomeKind::Failed,
-            format!("{operation}: finish or abort it first"),
-        )
-        .with_detail(format!("git -C {} status", state.path.display()));
-    }
-
     if state.has_conflicts() {
         let conflicts: Vec<String> = state
             .status
@@ -127,6 +119,13 @@ fn commit_one(
             ),
         )
         .with_details(conflicts);
+    }
+    if let Some(operation) = util::has_operation_in_progress(state) {
+        return base(
+            OutcomeKind::Failed,
+            format!("{operation}: finish or abort it first"),
+        )
+        .with_detail(format!("git -C {} status", state.path.display()));
     }
 
     let Some(status) = state.status.as_ref() else {

@@ -230,7 +230,10 @@ fn handle(mut stream: TcpStream, gui: &Arc<Gui>, allowed_hosts: &[String]) -> st
         ("GET", "/favicon.ico") => write_response(&mut stream, Response::empty(204, "No Content")),
         ("GET", "/api/health") => write_response(&mut stream, Response::json(health_json())),
         ("GET", "/api/model") => write_response(&mut stream, Response::json(gui.model())),
-        ("POST", "/api/refresh") => write_response(&mut stream, Response::json(gui.model())),
+        ("POST", "/api/refresh") => {
+            gui.reload();
+            write_response(&mut stream, Response::json(gui.model()))
+        }
         ("GET", "/api/setup/status") => write_response(&mut stream, setup_status_response(gui)),
         ("POST", "/api/setup/inspect") => {
             write_response(&mut stream, setup_inspect_response(gui, &request))
@@ -1491,6 +1494,50 @@ mod tests {
     }
 
     #[test]
+    fn refresh_rereads_the_project_so_outside_changes_appear_without_a_restart() {
+        let fixture = RepoFixture::named("refresh");
+        fixture.project_with(&[("root", ".")]);
+        let (_gui, port) = open_gui(&fixture);
+
+        let (_, before) = get(port, "/api/repositories");
+        assert!(!before.contains("\"id\": \"engine\""), "{before}");
+
+        // Another tool adds a repository to the same project while the interface is open.
+        fixture.init_repo("engine");
+        let project_root = fixture.path().to_path_buf();
+        let manifest = fixture.load_project();
+        let runner = crate::git::GitRunner::detect().expect("git");
+        let updated = crate::discovery::assign_repository(
+            &manifest,
+            std::path::Path::new("engine"),
+            &crate::discovery::AssignOptions::default(),
+            &runner,
+        )
+        .expect("assign");
+        crate::manifest::save_project(&updated).expect("save");
+
+        // Refresh reads the new configuration.
+        let (status, body) = post(port, "/api/refresh", "", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"id\": \"engine\""), "{body}");
+        let (_, repositories) = get(port, "/api/repositories");
+        assert!(
+            repositories.contains("\"id\": \"engine\""),
+            "{repositories}"
+        );
+
+        // A manifest that no longer parses is reported, not silently kept.
+        std::fs::write(
+            project_root.join(".gitmesh/project.toml"),
+            "[project\nbroken",
+        )
+        .unwrap();
+        let (status, body) = post(port, "/api/refresh", "", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"opened\": false"), "{body}");
+    }
+
+    #[test]
     fn repository_endpoints_inspect_plan_and_apply_without_a_restart() {
         let fixture = project_with_a_candidate();
         let (_gui, port) = open_gui(&fixture);
@@ -1566,6 +1613,14 @@ mod tests {
             body.contains("\"kind\": \"plan\""),
             "the fresh plan is sent back: {body}"
         );
+        // The plan sent back is the one the interface must now show: its id is the current
+        // one, not the stale id that was refused, so Apply is re-armed only for a fresh
+        // review.
+        assert!(
+            body.contains(&format!("\"id\": \"{plan_id}\"")),
+            "the returned plan carries the current id {plan_id}: {body}"
+        );
+        assert!(!body.contains("0000000000000000\""), "{body}");
         assert_eq!(
             std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap(),
             manifest_before,

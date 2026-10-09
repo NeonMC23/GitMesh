@@ -9,8 +9,9 @@ use gitmesh::analyzer::Analyzer;
 use gitmesh::manifest;
 use gitmesh::model::RepositoryRole;
 use gitmesh::ops::{
-    commit_project, fetch_project, pull_project, push_project, BranchAction, BranchOptions,
-    CommitOptions, OperationReport, OutcomeKind, PullStrategy, PushOptions, SyncOptions,
+    branch_operation, commit_project, fetch_project, pull_project, push_project, BranchAction,
+    BranchOptions, CommitOptions, OperationReport, OutcomeKind, PullStrategy, PushOptions,
+    SyncOptions,
 };
 use gitmesh::testkit::RepoFixture;
 
@@ -624,5 +625,102 @@ fn selection_limits_operations_to_the_chosen_repository() {
     assert!(
         renderer_status.contains("src/index.js"),
         "{renderer_status}"
+    );
+}
+
+/// A merge in progress in an external repository must be seen, and a unified commit must
+/// leave that repository alone.
+///
+/// The test process runs from the crate directory, never from inside the repository, so
+/// the check only passes when the in-progress marker is read from the repository's own Git
+/// directory. Before that was fixed, the marker was resolved against the process directory
+/// and the merge was silently completed by the unified commit.
+#[test]
+fn a_merge_in_progress_in_an_external_repository_is_seen_and_protected() {
+    let fixture = RepoFixture::new();
+    let project = fixture.project_with(&[("root", "."), ("engine", "engine")]);
+    fixture.create_conflict("engine", "feature.txt");
+    // The conflict leaves the merge open; resolve the file by hand, but do not conclude
+    // the merge: this is the state that used to be completed by the unified commit.
+    std::fs::write(fixture.path().join("engine/feature.txt"), "resolved\n").unwrap();
+    fixture.git_ok("engine", &["add", "feature.txt"]);
+    let head_before = fixture.git_ok("engine", &["rev-parse", "HEAD"]);
+
+    let status = Analyzer::new(&project, fixture.runner()).analyze();
+    let engine = status
+        .repositories
+        .iter()
+        .find(|state| state.id == "engine")
+        .unwrap();
+    assert_eq!(
+        engine.in_progress,
+        Some(gitmesh::git::InProgressOperation::Merge),
+        "the merge must be reported for an external repository"
+    );
+
+    let report = commit_project(
+        &project,
+        fixture.runner(),
+        &CommitOptions::new("unified commit during a merge"),
+    )
+    .unwrap();
+    let outcome = report.outcomes.iter().find(|o| o.id == "engine").unwrap();
+    assert_ne!(
+        outcome.kind,
+        OutcomeKind::Success,
+        "a repository with a merge in progress must not be committed: {outcome:#?}"
+    );
+    assert_eq!(
+        fixture.git_ok("engine", &["rev-parse", "HEAD"]),
+        head_before,
+        "the merge must not have been concluded by GitMesh"
+    );
+    assert!(
+        fixture.path().join("engine/.git/MERGE_HEAD").exists(),
+        "the merge is still in progress, for the user to finish or abort"
+    );
+
+    // The other unified operations refuse the same repository for the same reason.
+    let pull = pull_project(&project, fixture.runner(), &SyncOptions::new()).unwrap();
+    let pulled = pull.outcomes.iter().find(|o| o.id == "engine").unwrap();
+    assert_ne!(
+        pulled.kind,
+        OutcomeKind::Success,
+        "pull must refuse: {pulled:#?}"
+    );
+    assert!(pulled.summary.contains("merge in progress"), "{pulled:#?}");
+
+    let push = push_project(&project, fixture.runner(), &PushOptions::default()).unwrap();
+    let pushed = push.outcomes.iter().find(|o| o.id == "engine").unwrap();
+    assert_ne!(
+        pushed.kind,
+        OutcomeKind::Success,
+        "push must refuse: {pushed:#?}"
+    );
+    assert!(pushed.summary.contains("merge in progress"), "{pushed:#?}");
+
+    let branch = branch_operation(
+        &project,
+        fixture.runner(),
+        &BranchAction::Create {
+            name: "during-merge".to_string(),
+        },
+        &BranchOptions::default(),
+    )
+    .unwrap();
+    let branched = branch.outcomes.iter().find(|o| o.id == "engine").unwrap();
+    assert_ne!(
+        branched.kind,
+        OutcomeKind::Success,
+        "branch must refuse: {branched:#?}"
+    );
+    assert!(
+        branched.summary.contains("merge in progress"),
+        "{branched:#?}"
+    );
+    assert_eq!(
+        fixture.git_ok("engine", &["rev-parse", "HEAD"]),
+        head_before,
+        "no operation may have moved HEAD during the merge"
     );
 }

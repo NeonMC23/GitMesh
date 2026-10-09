@@ -305,6 +305,19 @@ function emptyModel() {
   var failed = GitMesh.progressRows([{ type: 'failed', message: 'boom' }], []);
   equal(failed.failed, 'boom', 'a refused operation carries its message');
 
+  // A repository that started but never reported has no result: it is unreported, never
+  // "skipped" (which would claim the core found nothing to do).
+  equal(interrupted.rows[1].status, 'unreported', 'a finished run leaves no repository as skipped');
+  equal(interrupted.rows[2].status, 'pending', 'a completed run keeps steps it never reached as pending');
+
+  // A failure stops the run: work that was never reached is unreported, and what finished
+  // before the failure keeps its outcome.
+  var stopped = GitMesh.progressRows(events.slice(0, 4).concat([{ type: 'failed', message: 'git went away' }]), []);
+  equal(stopped.rows[0].status, 'success', 'work finished before the failure keeps its result');
+  equal(stopped.rows[1].status, 'unreported', 'the repository the failure interrupted is unreported');
+  equal(stopped.rows[2].status, 'unreported', 'repositories never reached are unreported after a failure');
+  equal(stopped.failed, 'git went away', 'the failure message is kept');
+
   equal(GitMesh.outcomeSymbol('success'), '✓', 'symbols match the CLI');
   equal(GitMesh.outcomeSymbol('skipped'), '–', 'skipped uses the dash');
   equal(GitMesh.outcomeSymbol('conflict'), '!', 'conflicts use the exclamation mark');
@@ -319,6 +332,18 @@ function emptyModel() {
     'dry runs are labelled');
   equal(GitMesh.resultTitle('pull', [{ status: 'failed' }, { status: 'failed' }], false),
     'Pull failed', 'total failure says failed');
+
+  // The title follows the real outcome of the run, including a failure that reported nothing.
+  equal(GitMesh.resultTitle('pull', [], false, 'boom'), 'Pull failed',
+    'a failure that reported nothing is never called completed');
+  equal(GitMesh.resultTitle('pull', [], true, 'boom'), 'Pull failed (dry run)',
+    'a failed dry run says so');
+  equal(GitMesh.resultTitle('pull', stopped.rows, false, 'git went away'), 'Pull stopped before finishing',
+    'a failure after some results says it did not finish');
+  equal(GitMesh.resultTitle('pull', [{ status: 'success' }, { status: 'unreported' }], false, null),
+    'Pull partly completed', 'unreported repositories prevent a completed title');
+  equal(GitMesh.resultTitle('pull', allGood, false, null), 'Pull completed', 'no failure, no unreported: completed');
+  equal(GitMesh.outcomeSymbol('unreported'), '?', 'unreported has its own symbol, not colour alone');
 
   var guidance = GitMesh.conflictGuidance(state.rows);
   assert(guidance !== null, 'conflicts come with guidance');
@@ -348,6 +373,16 @@ function emptyModel() {
   contains(GitMesh.repositoryDetails(model.repositories[2]), '1 conflict', 'conflicts are described');
   contains(GitMesh.repositoryDetails(model.repositories[1]), 'nothing to record',
     'clean repositories say so');
+  // An operation left open by Git is shown on the overview, not hidden behind the state.
+  var merging = { id: 'engine', exists: true, isRepository: true, remotes: [],
+    operationInProgress: 'merge', counts: {} };
+  contains(GitMesh.repositoryDetails(merging), 'merge in progress',
+    'an open merge is shown on the overview');
+  contains(GitMesh.repositoryDetails(merging), 'local only', 'a repository without a remote is local only');
+  var published = { id: 'engine', exists: true, isRepository: true, remotes: [{ name: 'origin' }],
+    counts: {} };
+  assert(GitMesh.repositoryDetails(published).indexOf('local only') === -1,
+    'a repository with a remote is not called local only');
 
   var rows = GitMesh.settingsRows(model);
   contains(JSON.stringify(rows), 'MyProject', 'settings show the project name');

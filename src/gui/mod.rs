@@ -377,6 +377,23 @@ impl Gui {
         self.adopt(path)
     }
 
+    /// Re-read the project from disk, from the directory the interface last opened.
+    ///
+    /// A session keeps the manifest it was opened with, so a repository added or removed
+    /// by the CLI or the TUI would stay invisible until the interface restarted. A reload
+    /// reopens the session; a project that has become invalid shows its error instead.
+    /// While an operation runs this does nothing: the operation works on the configuration
+    /// it started with, and the busy guard keeps the session from changing under it.
+    pub fn reload(&self) {
+        if self.is_busy() {
+            return;
+        }
+        let start = self.start_directory();
+        // The outcome is already recorded in the state (session or error), so the
+        // returned message is not needed here.
+        let _ = self.adopt(&start);
+    }
+
     /// Open a project from inside a running operation.
     ///
     /// Only the setup operation uses this, and only for the project it just created: the
@@ -881,7 +898,13 @@ fn run_management(
             ]));
             return Json::object([
                 ("status", Json::from("failed")),
-                ("error", Json::from("git is not available")),
+                (
+                    "error",
+                    Json::object([
+                        ("message", Json::from("git is not available")),
+                        ("configuration", Json::from(true)),
+                    ]),
+                ),
             ])
             .to_pretty_string();
         }
@@ -948,10 +971,12 @@ fn run_management(
     let result = manage::apply(plan, dry_run, &runner, &mut observer);
     let result_json = service::management_result_view_json(&result);
 
-    // The configuration changed, so the open project is reloaded: like every other
-    // operation, the interface must show the project as it is now, not as it was.
+    // The configuration may have changed even when the apply did not fully succeed: some
+    // actions write the manifest before a later one fails. The open project is therefore
+    // reloaded after every real apply, so the interface shows what is on disk now, not
+    // what it was before the run.
     let mut opened = false;
-    if !dry_run && result.is_success() {
+    if !dry_run {
         opened = gui.adopt(&plan.root).is_ok();
     }
     let model = gui.model_json();
@@ -1011,7 +1036,13 @@ fn run_setup(
             ]));
             return Json::object([
                 ("status", Json::from("failed")),
-                ("error", Json::from("git is not available")),
+                (
+                    "error",
+                    Json::object([
+                        ("message", Json::from("git is not available")),
+                        ("configuration", Json::from(true)),
+                    ]),
+                ),
             ])
             .to_pretty_string();
         }

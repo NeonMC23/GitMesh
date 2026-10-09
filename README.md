@@ -157,7 +157,9 @@ Git repository is *adopted* with its history and remote left exactly as they are
 repository's logical id or recorded remote can be changed; and a repository can be
 **removed from GitMesh without its directory, its `.git`, its history or its remote being
 touched** — a removal that hands files back to the root repository says so and asks for
-confirmation first. `gitmesh ui` offers the same operations in the terminal, and
+confirmation first. `gitmesh ui` offers the same operations in the terminal (a removal that
+would hand files back to the root repository is refused there, and the command that
+confirms it is shown), and
 `gitmesh configure` on the command line — all three drive one service and one plan.
 
 To see the whole workflow run end to end against real repositories and local bare remotes

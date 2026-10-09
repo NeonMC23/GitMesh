@@ -249,10 +249,16 @@ var GitMesh = (function () {
       }
     });
 
-    // A finished operation must not leave repositories marked as running.
-    if (state.finished) {
+    // Once the operation has ended, work that started but never reported an outcome has
+    // no result. It is "unreported", never "skipped": skipped means the core decided there
+    // was nothing to do. After a failure, repositories that were never reached are
+    // unreported too, because the failure stopped them. A completed operation keeps
+    // "pending" for steps it never reached.
+    if (state.finished || state.failed) {
       order.forEach(function (id) {
-        if (rows[id].status === 'running') { rows[id].status = 'skipped'; }
+        if (rows[id].status === 'running' || (state.failed && rows[id].status === 'pending')) {
+          rows[id].status = 'unreported';
+        }
       });
     }
 
@@ -275,19 +281,33 @@ var GitMesh = (function () {
       case 'conflict': return '!';
       case 'failed': return '✗';
       case 'running': return '…';
+      case 'unreported': return '?';
       default: return '·';
     }
   }
 
   // The sentence shown above the per-repository result, e.g. "Pull completed".
-  function resultTitle(operation, rows, dryRun) {
+  // `failed` is the message of a failed operation, or null. A failure is never reported
+  // as completed, even when no repository reported anything.
+  function resultTitle(operation, rows, dryRun, failed) {
+    var name = (operation || 'operation');
+    var title = name.charAt(0).toUpperCase() + name.slice(1);
+    var reported = rows.filter(function (row) {
+      return row.status === 'success' || row.status === 'skipped' ||
+        row.status === 'conflict' || row.status === 'failed';
+    }).length;
+    if (failed) {
+      var stopped = reported > 0 ? ' stopped before finishing' : ' failed';
+      return title + stopped + (dryRun ? ' (dry run)' : '');
+    }
+    if (dryRun) { return title + ' (dry run: nothing was changed)'; }
     var problems = rows.filter(function (row) {
       return row.status === 'conflict' || row.status === 'failed';
     }).length;
-    var name = (operation || 'operation');
-    var title = name.charAt(0).toUpperCase() + name.slice(1);
-    if (dryRun) { return title + ' (dry run: nothing was changed)'; }
-    if (problems === 0) { return title + ' completed'; }
+    var unreported = rows.filter(function (row) {
+      return row.status === 'unreported' || row.status === 'pending' || row.status === 'running';
+    }).length;
+    if (problems === 0 && unreported === 0) { return title + ' completed'; }
     if (problems === rows.length) { return title + ' failed'; }
     return title + ' partly completed';
   }
@@ -348,6 +368,14 @@ var GitMesh = (function () {
     if (sync.behind) { parts.push('behind ' + sync.behind); }
     if (repo.error) { parts.push(repo.error); }
     if (!parts.length) { parts.push('nothing to record'); }
+    // Facts the status already established: a repository in the middle of a Git operation,
+    // and one with no remote at all (it exists only on this machine).
+    if (repo.operationInProgress) {
+      parts.unshift(repo.operationInProgress + ' in progress: finish or abort it in Git first');
+    }
+    if (repo.isRepository && repo.exists && !(repo.remotes || []).length) {
+      parts.push('local only (no remote)');
+    }
     return parts.join(', ');
   }
 
@@ -1221,7 +1249,7 @@ if (typeof document !== 'undefined') {
 
     function showOperation(rows, state) {
       $('operation').hidden = false;
-      $('operation-title').textContent = GitMesh.resultTitle(state.operation, rows, state.dryRun);
+      $('operation-title').textContent = GitMesh.resultTitle(state.operation, rows, state.dryRun, state.failed);
       var html = '';
       rows.forEach(function (row) {
         var cls = 'progress-' + row.status;
@@ -1237,6 +1265,7 @@ if (typeof document !== 'undefined') {
       switch (status) {
         case 'running': return 'working…';
         case 'pending': return 'pending';
+        case 'unreported': return 'no result reported';
         case 'skipped': return 'nothing to do';
         default: return '';
       }
@@ -1246,7 +1275,7 @@ if (typeof document !== 'undefined') {
       var box = $('operation-result');
       box.hidden = false;
       var html = '<p class="summary">' + escapeHtml(GitMesh.resultTitle(
-        state.operation, state.rows, state.dryRun)) + '</p>';
+        state.operation, state.rows, state.dryRun, state.failed)) + '</p>';
 
       if (state.failed) {
         html += '<p class="resolve">' + escapeHtml(state.failed) + '</p>';
@@ -1268,9 +1297,14 @@ if (typeof document !== 'undefined') {
       box.innerHTML = html;
     }
 
-    function startOperation(path, body, sentence, onFinished) {
+    // `onRefused(error)` may take over a refusal (return true) when it can show something
+    // better than the generic failure panel, e.g. the fresh plan a stale apply came back with.
+    function startOperation(path, body, sentence, onFinished, onRefused) {
       if (activeOperation) { return; }
       $('operation').hidden = false;
+      // The panel sits below the whole workspace: bring it into view when work starts,
+      // so progress is not started off-screen.
+      $('operation').scrollIntoView({ block: 'nearest' });
       $('operation-title').textContent = sentence || 'Working…';
       $('operation-progress').innerHTML = '<div class="progress-row progress-running">' +
         '<span class="symbol">…</span><span class="name">starting</span></div>';
@@ -1325,17 +1359,42 @@ if (typeof document !== 'undefined') {
           if (payload.model) { model = payload.model; render(); }
           finish(source, payload);
         });
-        source.addEventListener('closed', function () { source.close(); });
+        source.addEventListener('closed', function (message) {
+          source.close();
+          // A stream that closes without a result (the server stops waiting on a long
+          // operation) must not leave the interface locked on "running".
+          var reason = '';
+          try { reason = JSON.parse(message.data).reason || ''; } catch (error) { reason = ''; }
+          if (reason === 'timeout') {
+            abandonOperation('The interface stopped waiting for the operation before it ' +
+              'reported a result. It may still be running or may have finished: check the ' +
+              'state before starting another action.');
+          } else {
+            abandonOperation('The operation ended without a result. Check the state before ' +
+              'starting another action.');
+          }
+        });
         source.onerror = function () {
           source.close();
-          if (activeOperation) {
-            activeOperation = null;
-            refresh();
-          }
+          abandonOperation('The connection to the running operation was lost before it ' +
+            'reported a result. It may still be running in GitMesh, so check the state ' +
+            'before starting another action.');
         };
       }).catch(function (error) {
+        if (onRefused && onRefused(error)) { return; }
         showFailure(error.message);
       });
+    }
+
+    // The interface lost track of an operation it started. Only the first report counts,
+    // and a result that already arrived ends the operation first, so this is a no-op then.
+    function abandonOperation(message) {
+      if (!activeOperation) { return; }
+      activeOperation = null;
+      if (elapsedTimer) { clearInterval(elapsedTimer); }
+      $('operation-result').hidden = false;
+      $('operation-result').innerHTML = '<p class="resolve">' + escapeHtml(message) + '</p>';
+      refresh();
     }
 
     function showFailure(message) {
@@ -1492,7 +1551,7 @@ if (typeof document !== 'undefined') {
       renderInspection();
       renderStructure();
       renderRootRepository();
-      renderRepositories();
+      renderSetupRepositories();
       renderExisting();
       renderRemotes();
       renderHosting();
@@ -1726,7 +1785,10 @@ if (typeof document !== 'undefined') {
 
     // ---------------------------------------------------------------- step 4 --
 
-    function renderRepositories() {
+    // The per-directory editors of the setup wizard. Named apart from the Repositories
+    // panel's renderRepositories: two declarations with one name in one scope silently
+    // replace each other, which is how the wizard's editors stopped rendering.
+    function renderSetupRepositories() {
       var node = $('setup-repositories');
       var directories = GitMesh.selectableDirectories(wizard.inspection);
       var html = '';
@@ -2537,6 +2599,18 @@ if (typeof document !== 'undefined') {
           $('repo-path').value = '';
           invalidateRepoPlan();
           loadRepositories();
+        },
+        function (error) {
+          // A stale or blocked plan comes back with the plan as it is now. That plan is
+          // shown in place of the old one, and Apply stays disabled until the user confirms
+          // it again: a refused apply never keeps the reviewed plan alive.
+          if (error.data && error.data.plan) {
+            repoPlan = error.data.plan;
+            renderRepoPlan(repoPlan);
+            repoMessage(error.message + '. The plan below is the current one: review it again.');
+            return true;
+          }
+          return false;
         });
     }
 
@@ -2569,6 +2643,7 @@ if (typeof document !== 'undefined') {
       tab.addEventListener('click', function () {
         document.querySelectorAll('.tab').forEach(function (other) {
           other.classList.toggle('active', other === tab);
+          other.setAttribute('aria-selected', other === tab ? 'true' : 'false');
         });
         ['status', 'changes', 'commit', 'branches', 'sync', 'repos', 'settings'].forEach(function (name) {
           var panel = $('panel-' + name);
@@ -2646,8 +2721,10 @@ if (typeof document !== 'undefined') {
       reviewPlan();
     });
     $('btn-setup-open').addEventListener('click', function () {
-      openProject($('setup-root').value.trim(), $('setup-scan-error'));
-      setTimeout(function () { if (model && model.opened) { closeWizard(); } }, 400);
+      // The wizard closes when the open request has actually succeeded, not on a timer.
+      openProject($('setup-root').value.trim(), $('setup-scan-error'), function () {
+        closeWizard();
+      });
     });
     $('group-by-repo').addEventListener('change', renderChanges);
     $('btn-commit').addEventListener('click', commit);
@@ -2688,11 +2765,13 @@ if (typeof document !== 'undefined') {
       openProject($('welcome-path').value, $('welcome-error'));
     });
 
-    function openProject(path, errorNode) {
+    function openProject(path, errorNode, onOpened) {
       api('/api/open', { path: path }).then(function () {
         if (typeof openDialog.close === 'function') { openDialog.close(); }
         $('operation').hidden = true;
         return loadModel();
+      }).then(function (data) {
+        if (onOpened && data && data.opened) { onOpened(); }
       }).catch(function (error) {
         errorNode.textContent = error.message;
         errorNode.hidden = false;
@@ -2701,12 +2780,22 @@ if (typeof document !== 'undefined') {
     }
 
     // dry-run toggle lives in the status bar: double-click the badge to switch.
-    $('dry-run-badge').addEventListener('dblclick', function () {
-      api('/api/dry-run', { value: String(!(model && model.dryRun)) }).then(function (data) {
+    $('dry-run-badge').addEventListener('dblclick', toggleDryRun);
+
+    // Switching dry-run off is the risky direction: operations will change repositories.
+    // Both the badge and the keyboard say which state is now active.
+    function toggleDryRun() {
+      var next = !(model && model.dryRun);
+      api('/api/dry-run', { value: String(next) }).then(function (data) {
         model = data;
         render();
+        $('status-line').textContent = next
+          ? 'dry run on: operations show what they would do and change nothing'
+          : 'dry run off: operations will change repositories';
+      }).catch(function (error) {
+        $('status-line').textContent = 'dry run not changed: ' + error.message;
       });
-    });
+    }
 
     document.addEventListener('keydown', function (event) {
       if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
@@ -2716,11 +2805,7 @@ if (typeof document !== 'undefined') {
         return;
       }
       if (event.key === 'r' || event.key === 'R') { refresh(); }
-      if (event.key === 'd' || event.key === 'D') {
-        api('/api/dry-run', { value: String(!(model && model.dryRun)) }).then(function (data) {
-          model = data; render();
-        });
-      }
+      if (event.key === 'd' || event.key === 'D') { toggleDryRun(); }
       var index = ['1', '2', '3', '4', '5', '6', '7'].indexOf(event.key);
       if (index >= 0) {
         var tabs = document.querySelectorAll('.tab');

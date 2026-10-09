@@ -260,7 +260,11 @@ step(12, "Resolve the conflict with Git and refresh the interface")
 with open(os.path.join(project, "engine/src/lib.rs"), "w") as fh:
     fh.write("pub fn tick() { /* merged */ }\n")
 git(os.path.join(project, "engine"), "add", "-A")
-run([BIN, "commit", "-m", "resolve the engine conflict"], cwd=project, env=env)
+# Git concludes the merge. GitMesh deliberately refuses to commit while a merge is open
+# (its unified commit must never complete someone else's merge), so the resolution is
+# finished with Git itself.
+concluded = run(["git", "-C", os.path.join(project, "engine"), "commit", "-m", "resolve the engine conflict"], env=env)
+check(concluded.returncode == 0, "Git concludes the merge", concluded.stderr.strip())
 status, payload = api("POST", "/api/refresh", "")
 m = json.loads(payload)
 check(status == 200 and m["project"]["counts"]["changes"] == 0, "the project is clean again",

@@ -46,13 +46,13 @@
     <p id="project-notices" class="notices" hidden></p>
 
     <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="status" role="tab">Status</button>
-      <button class="tab" data-tab="changes" role="tab">Changes <span id="changes-count" class="pill">0</span></button>
-      <button class="tab" data-tab="commit" role="tab">Commit</button>
-      <button class="tab" data-tab="branches" role="tab">Branches</button>
-      <button class="tab" data-tab="sync" role="tab">Pull / Push</button>
-      <button class="tab" data-tab="repos" role="tab">Repositories</button>
-      <button class="tab" data-tab="settings" role="tab">Project</button>
+      <button class="tab active" data-tab="status" role="tab" aria-selected="true">Status</button>
+      <button class="tab" data-tab="changes" role="tab" aria-selected="false">Changes <span id="changes-count" class="pill">0</span></button>
+      <button class="tab" data-tab="commit" role="tab" aria-selected="false">Commit</button>
+      <button class="tab" data-tab="branches" role="tab" aria-selected="false">Branches</button>
+      <button class="tab" data-tab="sync" role="tab" aria-selected="false">Pull / Push</button>
+      <button class="tab" data-tab="repos" role="tab" aria-selected="false">Repositories</button>
+      <button class="tab" data-tab="settings" role="tab" aria-selected="false">Project</button>
     </nav>
 
     <section id="panel-status" class="panel">
@@ -151,7 +151,7 @@
           directories, history and remotes are never touched by a configuration change.</p>
         <p id="repos-summary" class="hint"></p>
         <div id="repos-table"></div>
-        <p id="repos-message" class="hint inline" hidden></p>
+        <p id="repos-message" class="hint inline" role="status" hidden></p>
       </div>
 
       <div class="card">
@@ -245,7 +245,7 @@
     </section>
 
     <!-- Operation progress and result, shared by every action. -->
-    <section id="operation" class="card operation" hidden>
+    <section id="operation" class="card operation" role="status" aria-live="polite" hidden>
       <div class="row-between">
         <h2 id="operation-title">Operation</h2>
         <span id="operation-elapsed" class="mono"></span>
@@ -447,7 +447,7 @@
 </dialog>
 
 <footer class="statusbar">
-  <span id="status-line">ready</span>
+  <span id="status-line" role="status" aria-live="polite">ready</span>
   <span id="status-connection" class="mono"></span>
 </footer>
 
