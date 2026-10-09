@@ -195,18 +195,27 @@
       <div class="card">
         <h2>Change one repository</h2>
         <div class="grid-actions">
-          <label class="field"><span>Repository</span>
+          <label class="field" id="repo-target-field"><span>Repository</span>
             <select id="repo-target"></select></label>
           <label class="field"><span>What to do</span>
             <select id="repo-intent">
               <option value="rename">give it another name</option>
               <option value="set-remote">record another remote</option>
+              <option value="clone">clone a remote into a new directory</option>
               <option value="remove">remove it from the project</option>
             </select></label>
           <label class="field" id="repo-new-id-field"><span>New name</span>
             <input id="repo-new-id" type="text" autocomplete="off"></label>
           <label class="field" id="repo-edit-remote-field" hidden><span>Remote URL (empty clears it)</span>
             <input id="repo-edit-remote" type="text" autocomplete="off"></label>
+        </div>
+        <div class="grid-actions" id="repo-clone-fields" hidden>
+          <label class="field"><span>New directory (relative to the project)</span>
+            <input id="repo-clone-path" type="text" autocomplete="off" placeholder="libs/core"></label>
+          <label class="field"><span>Remote URL or local path</span>
+            <input id="repo-clone-remote" type="text" autocomplete="off" placeholder="git@host:team/core.git"></label>
+          <label class="field"><span>Name in GitMesh (empty = suggested)</span>
+            <input id="repo-clone-id" type="text" autocomplete="off"></label>
         </div>
         <div class="row actions">
           <label class="check" id="repo-configure-git-field" hidden><input type="checkbox" id="repo-configure-git">

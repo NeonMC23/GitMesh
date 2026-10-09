@@ -571,6 +571,41 @@ fn cmd_configure(
             }
             Ok(EXIT_OK)
         }
+        ConfigureCommand::Clone(args) => {
+            let project = load_project(global, runner)?;
+            let path = to_slash(&args.path);
+            let intent = RepositoryIntent::Clone {
+                path: path.clone(),
+                id: args.id.clone().unwrap_or_default(),
+                remote: args.remote.clone(),
+                branch: args.branch.clone(),
+            };
+            let (plan, result) = run_repository_intent(runner, &project, intent, args.dry_run)?;
+            if args.dry_run {
+                return Ok(EXIT_OK);
+            }
+            let result = result.expect("a plan that ran has a result");
+            if result.exit_code() != EXIT_OK {
+                return Ok(report_management(&result));
+            }
+            let id = result
+                .project
+                .as_ref()
+                .and_then(|project| {
+                    project
+                        .sorted_repositories()
+                        .iter()
+                        .find(|repo| repo.relative_slash() == path)
+                        .map(|repo| repo.id.clone())
+                })
+                .unwrap_or_default();
+            println!(
+                "Cloned '{}' into '{path}' as repository '{id}' (saved to {})",
+                args.remote,
+                plan.manifest_path.display()
+            );
+            Ok(EXIT_OK)
+        }
         ConfigureCommand::Remove(args) => {
             let project = load_project(global, runner)?;
             // A typo stays an error for scripts, even though the service treats repeating a

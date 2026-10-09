@@ -566,6 +566,12 @@ fn repository_request_from_form(
             configure_remote: form_flag(body, "configureRemote"),
             untrack_from_root: form_flag(body, "untrack"),
         },
+        "clone" => RepositoryIntent::Clone {
+            path: required("path")?,
+            id: optional_form(body, "id").unwrap_or_default(),
+            remote: required("remote")?,
+            branch: optional_form(body, "branch"),
+        },
         "remove" => RepositoryIntent::Remove {
             id: required("id")?,
             confirm_takeover: form_flag(body, "confirmTakeover"),
@@ -1933,5 +1939,23 @@ mod tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod clone_form_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_form_is_read_as_a_clone_intent_and_needs_a_remote() {
+        let request =
+            repository_request_from_form("intent=clone&path=libs/core&remote=/srv/core.git&id=")
+                .expect("a clone with a remote is a valid request");
+        assert!(matches!(
+            request.intents[0],
+            crate::manage::RepositoryIntent::Clone { .. }
+        ));
+        assert!(repository_request_from_form("intent=clone&path=libs/core&remote=").is_err());
+        assert!(repository_request_from_form("intent=clone&remote=/srv/core.git").is_err());
     }
 }

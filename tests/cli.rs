@@ -657,3 +657,46 @@ fn configure_remove_and_remote_go_through_the_same_plan() {
         "."
     );
 }
+
+#[test]
+fn configure_clone_clones_into_a_new_directory_and_refuses_a_non_empty_one() {
+    let f = RepoFixture::named("cli-configure-clone");
+    f.project_with(&[(".", ".")]);
+    let bare = f.create_bare("cli-core.git");
+    let seed = f.clone_outside(&bare, "cli-seed");
+    std::fs::write(seed.join("core.txt"), "core").unwrap();
+    let git = f.runner().repo(&seed);
+    git.run_checked(&["add", "-A"]).unwrap();
+    git.run_checked(&["commit", "-q", "-m", "seed"]).unwrap();
+    git.run_checked(&["push", "-q", "origin", "HEAD:main"])
+        .unwrap();
+
+    let cli = Cli::new(f.path());
+    let remote = bare.to_string_lossy().to_string();
+    let (stdout, stderr, code) = cli.out(&[
+        "configure",
+        "clone",
+        "libs/core",
+        "--remote",
+        &remote,
+        "--id",
+        "core",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(f.path().join("libs/core/core.txt").exists());
+
+    // A directory with files is refused, and the files are left exactly as they were.
+    std::fs::create_dir_all(f.path().join("libs/busy")).unwrap();
+    std::fs::write(f.path().join("libs/busy/notes.txt"), "mine").unwrap();
+    let (_, stderr, code) = cli.out(&["configure", "clone", "libs/busy", "--remote", &remote]);
+    assert_eq!(
+        code, 2,
+        "a refused clone exits with the refusal code: {stderr}"
+    );
+    assert!(stderr.contains("not empty"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(f.path().join("libs/busy/notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!f.path().join("libs/busy/.git").exists());
+}

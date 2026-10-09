@@ -186,6 +186,7 @@ $ ./examples/demo.sh /tmp/gitmesh-demo
 | `gitmesh fetch` / `gitmesh pull [--strategy ff-only\|merge\|rebase]` | Synchronise the project |
 | `gitmesh push [--dry-run] [--no-set-upstream]` | Push every repository that has commits to push |
 | `gitmesh remotes` | Remotes per repository, provider and GitHub coordinates |
+| `gitmesh configure clone <dir> --remote <url>` | Clone a remote into a new (missing or empty) directory and record it |
 | `gitmesh ui` | Interactive terminal interface for the everyday workflow: stage, commit, pull, push (see [docs/TUI.md](docs/TUI.md)) |
 | `gitmesh gui [--port N] [--host A] [--allow-host NAME] [--open] [--dry-run]` | Graphical interface served locally in a browser |
 
@@ -217,6 +218,7 @@ problems in their output but exit `0` as long as the project itself could be rea
 | --- | --- |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layering, module boundaries, ownership model, safety invariants, design decisions |
 | [`docs/MANIFEST.md`](docs/MANIFEST.md) | The exact manifest format, semantics and validation rules |
+| [`docs/REPOSITORIES.md`](docs/REPOSITORIES.md) | Onboarding a directory, cloning a remote, connecting remotes and upstreams, and what the sync errors mean |
 | [`docs/GUI.md`](docs/GUI.md) | The graphical interface: running it, the views, commit/branch/pull/push semantics, conflict presentation, safety, what is not supported |
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Build, test, lint, extend; test strategy; UI architecture |
 | [`reports/DEVELOPMENT_REPORT.md`](reports/DEVELOPMENT_REPORT.md) | What was built, milestone by milestone, and why |

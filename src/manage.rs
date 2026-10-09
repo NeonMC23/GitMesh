@@ -544,6 +544,19 @@ pub enum RepositoryIntent {
         /// Stop tracking the directory's files in the root repository.
         untrack_from_root: bool,
     },
+    /// Clone a remote into a missing or empty directory of the project, and record it as a
+    /// repository. The remote is read before anything is planned, and nothing that exists
+    /// is overwritten.
+    Clone {
+        /// Project-relative path of the new repository.
+        path: String,
+        /// Logical id; empty means "use the suggestion".
+        id: String,
+        /// URL or local path of the remote to clone.
+        remote: String,
+        /// Branch hint to record.
+        branch: Option<String>,
+    },
     /// Remove a repository from the project configuration. Its directory, its `.git`, its
     /// history and its remote are never touched.
     Remove {
@@ -576,6 +589,7 @@ impl RepositoryIntent {
     pub fn label(&self) -> &'static str {
         match self {
             RepositoryIntent::Add { .. } => "add",
+            RepositoryIntent::Clone { .. } => "clone",
             RepositoryIntent::Remove { .. } => "remove",
             RepositoryIntent::Rename { .. } => "rename",
             RepositoryIntent::SetRemote { .. } => "set-remote",
@@ -586,6 +600,7 @@ impl RepositoryIntent {
     pub fn target(&self) -> &str {
         match self {
             RepositoryIntent::Add { id, .. } => id,
+            RepositoryIntent::Clone { id, .. } => id,
             RepositoryIntent::Remove { id, .. } => id,
             RepositoryIntent::Rename { id, .. } => id,
             RepositoryIntent::SetRemote { id, .. } => id,
@@ -620,6 +635,8 @@ impl RepositoryManagementRequest {
 pub enum RepositoryChangeKind {
     /// A directory becomes a managed repository.
     AddRepository,
+    /// Clone a remote into a new directory.
+    CloneRepository,
     /// An existing Git repository is managed as it is.
     AdoptRepository,
     /// A Git repository is created in a directory.
@@ -649,6 +666,7 @@ impl RepositoryChangeKind {
     pub fn label(self) -> &'static str {
         match self {
             RepositoryChangeKind::AddRepository => "add-repository",
+            RepositoryChangeKind::CloneRepository => "clone-repository",
             RepositoryChangeKind::AdoptRepository => "adopt-repository",
             RepositoryChangeKind::InitializeRepository => "initialize-repository",
             RepositoryChangeKind::RemoveRepositoryFromManifest => "remove-repository",
@@ -667,6 +685,7 @@ impl RepositoryChangeKind {
     pub fn heading(self) -> &'static str {
         match self {
             RepositoryChangeKind::AddRepository
+            | RepositoryChangeKind::CloneRepository
             | RepositoryChangeKind::AdoptRepository
             | RepositoryChangeKind::InitializeRepository
             | RepositoryChangeKind::AlreadyManaged => "Repositories",
@@ -733,6 +752,8 @@ impl RepositoryChange {
 pub enum RepositoryActionKind {
     /// Use the Git repository that is already there, as it is.
     AdoptRepository,
+    /// Run `git clone` into the planned directory.
+    CloneRepository,
     /// `git init` in a directory that has no repository of its own.
     InitializeRepository,
     /// Add `origin` to a repository that has none.
@@ -752,6 +773,7 @@ impl RepositoryActionKind {
     pub fn label(self) -> &'static str {
         match self {
             RepositoryActionKind::AdoptRepository => "adopt-repository",
+            RepositoryActionKind::CloneRepository => "clone-repository",
             RepositoryActionKind::InitializeRepository => "initialize-repository",
             RepositoryActionKind::ConfigureRemote => "configure-remote",
             RepositoryActionKind::UpdateRemote => "update-remote",
@@ -764,9 +786,9 @@ impl RepositoryActionKind {
     /// Heading used in the review screen.
     pub fn heading(self) -> &'static str {
         match self {
-            RepositoryActionKind::AdoptRepository | RepositoryActionKind::InitializeRepository => {
-                "Repositories"
-            }
+            RepositoryActionKind::AdoptRepository
+            | RepositoryActionKind::InitializeRepository
+            | RepositoryActionKind::CloneRepository => "Repositories",
             RepositoryActionKind::ConfigureRemote | RepositoryActionKind::UpdateRemote => "Remotes",
             RepositoryActionKind::UntrackFromRoot => "Ownership",
             RepositoryActionKind::UpdateManifest => "Configuration",
@@ -788,9 +810,9 @@ impl RepositoryActionKind {
     /// Short role label, the way the interface names the progress row.
     pub fn role(self) -> &'static str {
         match self {
-            RepositoryActionKind::AdoptRepository | RepositoryActionKind::InitializeRepository => {
-                "Repository"
-            }
+            RepositoryActionKind::AdoptRepository
+            | RepositoryActionKind::InitializeRepository
+            | RepositoryActionKind::CloneRepository => "Repository",
             RepositoryActionKind::ConfigureRemote | RepositoryActionKind::UpdateRemote => "Remote",
             RepositoryActionKind::UntrackFromRoot => "Root index",
             RepositoryActionKind::UpdateManifest => "Manifest",
@@ -1043,6 +1065,15 @@ fn describe_intent(intent: &RepositoryIntent) -> String {
             remote.clone().unwrap_or_default(),
             branch.clone().unwrap_or_default()
         ),
+        RepositoryIntent::Clone {
+            path,
+            id,
+            remote,
+            branch,
+        } => format!(
+            "clone {remote} into {path} id={id} branch={}",
+            branch.clone().unwrap_or_default()
+        ),
         RepositoryIntent::Remove {
             id,
             confirm_takeover,
@@ -1285,6 +1316,12 @@ fn plan_intent(planner: &mut Planner, intent: &RepositoryIntent, runner: &GitRun
             *untrack_from_root,
             runner,
         ),
+        RepositoryIntent::Clone {
+            path,
+            id,
+            remote,
+            branch,
+        } => plan_clone(planner, path, id, remote, branch.as_deref(), runner),
         RepositoryIntent::Remove {
             id,
             confirm_takeover,
@@ -1468,7 +1505,10 @@ fn plan_add(
             &id,
             &path_label,
             format!("add '{path_label}' as repository '{id}'"),
-            format!("the directory '{path_label}' does not exist in this project"),
+            format!(
+                "the directory '{path_label}' does not exist in this project; to bring a remote in \
+                 as a new directory, use configure clone (or the Clone action)"
+            ),
         );
         return;
     }
@@ -1486,6 +1526,39 @@ fn plan_add(
             ),
         );
         return;
+    }
+
+    if let Some(url) = clean_url(remote) {
+        match crate::git::probe_remote(runner, &url) {
+            crate::git::RemoteProbe::Unreachable { reason, hint } => {
+                planner.warnings.push(format!(
+                    "cannot reach the remote {url}: {reason}. {hint}. It is recorded anyway; check \
+                     it before the next sync"
+                ));
+            }
+            crate::git::RemoteProbe::Reachable { branches, .. } => {
+                if branches.is_empty() {
+                    planner.notices.push(format!(
+                        "the remote {url} is empty (it has no commits yet); pushing this repository \
+                         will publish it"
+                    ));
+                } else if !is_repository && discovery::is_empty_directory(&absolute) {
+                    refuse(
+                        planner,
+                        RepositoryChangeKind::AddRepository,
+                        &id,
+                        &path_label,
+                        format!("add '{path_label}' as repository '{id}'"),
+                        format!(
+                            "'{path_label}' is an empty directory and the remote {url} already has \
+                             history; clone it instead (configure clone), so the history is brought \
+                             in rather than an unrelated repository being created"
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     let has_commits = if is_repository {
@@ -1599,6 +1672,210 @@ fn plan_add(
         role: RepositoryRole::External,
         relative_path: relative,
         remote_url: recorded,
+        branch: clean_text(branch),
+        absolute_path: absolute,
+    });
+}
+
+/// Plan a clone: a new repository created from a remote, in a directory that is missing or
+/// empty. The remote is read first, and nothing that exists is overwritten.
+fn plan_clone(
+    planner: &mut Planner,
+    raw_path: &str,
+    id: &str,
+    remote: &str,
+    branch: Option<&str>,
+    runner: &GitRunner,
+) {
+    let label = if raw_path.trim().is_empty() {
+        "(no directory given)".to_string()
+    } else {
+        raw_path.trim().to_string()
+    };
+    let relative = match paths::normalize_relative(raw_path.trim()) {
+        Ok(relative) => relative,
+        Err(e) => {
+            refuse(
+                planner,
+                RepositoryChangeKind::CloneRepository,
+                id,
+                &label,
+                format!("clone into '{label}'"),
+                format!("'{label}' is not a usable repository path: {e}"),
+            );
+            return;
+        }
+    };
+    if paths::is_root_relative(&relative) {
+        refuse(
+            planner,
+            RepositoryChangeKind::CloneRepository,
+            id,
+            ".",
+            "clone into the project root".to_string(),
+            "the project root is always the root repository; clone into a directory of its own"
+                .to_string(),
+        );
+        return;
+    }
+    let path_label = to_slash(&relative);
+    let requested_id = id.trim().to_string();
+    let id = if requested_id.is_empty() {
+        discovery::suggest_id(&relative, &planner.target)
+    } else {
+        requested_id
+    };
+    let what = format!("clone into '{path_label}' as repository '{id}'");
+
+    // An exact match only: the root repository contains every path, so a containment lookup
+    // would always find it.
+    let already = planner
+        .target
+        .repositories
+        .iter()
+        .find(|repo| {
+            !repo.is_root()
+                && paths::lexical_normalize(&repo.relative_path)
+                    == paths::lexical_normalize(&relative)
+        })
+        .cloned();
+    if let Some(existing) = already {
+        refuse(
+            planner,
+            RepositoryChangeKind::CloneRepository,
+            &id,
+            &path_label,
+            what,
+            format!(
+                "'{path_label}' is already the GitMesh repository '{}'; nothing was cloned",
+                existing.id
+            ),
+        );
+        return;
+    }
+
+    let url = match clean_url(Some(remote)) {
+        Some(url) => url,
+        None => {
+            refuse(
+                planner,
+                RepositoryChangeKind::CloneRepository,
+                &id,
+                &path_label,
+                what,
+                "a clone needs the URL or path of a remote repository".to_string(),
+            );
+            return;
+        }
+    };
+    if let Some(problem) = id_problem(&id, &planner.target, None) {
+        refuse(
+            planner,
+            RepositoryChangeKind::CloneRepository,
+            &id,
+            &path_label,
+            what,
+            problem,
+        );
+        return;
+    }
+    let conflicts = discovery::assignment_conflicts(&planner.target, &relative);
+    if !conflicts.is_empty() {
+        refuse(
+            planner,
+            RepositoryChangeKind::CloneRepository,
+            &id,
+            &path_label,
+            what,
+            conflicts[0].clone(),
+        );
+        return;
+    }
+
+    let absolute = planner.project.root.join(&relative);
+    if absolute.exists() {
+        let reason = if !absolute.is_dir() {
+            Some(format!("'{path_label}' exists and is not a directory"))
+        } else if discovery::is_repository_root(&absolute, true, runner) {
+            Some(format!(
+                "'{path_label}' is already a Git repository; use add to adopt it, so its history \
+                 is kept as it is"
+            ))
+        } else if !discovery::is_empty_directory(&absolute) {
+            Some(format!(
+                "'{path_label}' is not empty; clone needs a missing or empty directory, so the \
+                 files there are left alone"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            refuse(
+                planner,
+                RepositoryChangeKind::CloneRepository,
+                &id,
+                &path_label,
+                what,
+                reason,
+            );
+            return;
+        }
+    }
+
+    // The remote is read before anything is planned, so an unreachable remote is refused
+    // here and nothing is created.
+    match crate::git::probe_remote(runner, &url) {
+        crate::git::RemoteProbe::Unreachable { reason, hint } => {
+            refuse(
+                planner,
+                RepositoryChangeKind::CloneRepository,
+                &id,
+                &path_label,
+                what,
+                format!("the remote could not be read: {reason}. {hint}"),
+            );
+            return;
+        }
+        crate::git::RemoteProbe::Reachable { branches, .. } => {
+            if branches.is_empty() {
+                planner.notices.push(format!(
+                    "the remote {url} is empty (it has no commits yet); the clone will have no \
+                     commits until the first push"
+                ));
+            }
+        }
+    }
+
+    planner.changes.push(RepositoryChange {
+        kind: RepositoryChangeKind::CloneRepository,
+        id: id.clone(),
+        path: path_label.clone(),
+        before: None,
+        after: Some(path_label.clone()),
+        detail: format!("clone {url} into '{path_label}' and track its default branch"),
+        state: StepState::Planned,
+    });
+    planner.actions.push(RepositoryAction {
+        kind: RepositoryActionKind::CloneRepository,
+        target: id.clone(),
+        path: path_label.clone(),
+        detail: format!("git clone {url} '{path_label}'"),
+        state: StepState::Planned,
+    });
+    planner.changes.push(RepositoryChange {
+        kind: RepositoryChangeKind::AddRepository,
+        id: id.clone(),
+        path: path_label.clone(),
+        before: None,
+        after: Some(path_label.clone()),
+        detail: format!("add '{path_label}' to GitMesh as repository '{id}'"),
+        state: StepState::Planned,
+    });
+    planner.target.repositories.push(PhysicalRepository {
+        id: id.clone(),
+        role: RepositoryRole::External,
+        relative_path: relative,
+        remote_url: Some(url),
         branch: clean_text(branch),
         absolute_path: absolute,
     });
@@ -2532,6 +2809,22 @@ pub fn apply(
             StepState::Blocked(reason) => {
                 RepositoryActionOutcome::new(action, OutcomeKind::Failed, reason.clone())
             }
+            // A failed clone means the repository it would record does not exist. The
+            // manifest is then left as it was, rather than listing a repository that is not there.
+            StepState::Planned
+                if action.kind == RepositoryActionKind::UpdateManifest
+                    && !dry_run
+                    && outcomes.iter().any(|o| {
+                        o.kind == RepositoryActionKind::CloneRepository
+                            && o.outcome == OutcomeKind::Failed
+                    }) =>
+            {
+                RepositoryActionOutcome::new(
+                    action,
+                    OutcomeKind::Skipped,
+                    "not written, because a clone failed and must not be recorded",
+                )
+            }
             StepState::Planned if dry_run => RepositoryActionOutcome::new(
                 action,
                 OutcomeKind::Skipped,
@@ -2696,6 +2989,20 @@ fn run_action(
                 }),
             }
         }
+        RepositoryActionKind::CloneRepository => {
+            let url = plan
+                .target
+                .repository(&action.target)
+                .and_then(|repo| repo.remote_url.clone())
+                .unwrap_or_default();
+            discovery::clone_repository(&url, &path, runner).map(|default| {
+                let summary = match default {
+                    Some(branch) => format!("cloned {url}; tracking origin/{branch}"),
+                    None => format!("cloned {url}; the remote has no commits yet"),
+                };
+                RepositoryActionOutcome::new(action, OutcomeKind::Success, summary)
+            })
+        }
         RepositoryActionKind::UntrackFromRoot => {
             let relative = plan
                 .target
@@ -2807,6 +3114,23 @@ fn verify_change(
     let mut outcome = ChangeOutcome::NotApplied;
 
     match change.kind {
+        CloneRepository => {
+            let absolute = plan.root.join(&change.path);
+            let cloned = discovery::is_repository_root(&absolute, true, runner);
+            match (recorded, cloned) {
+                (Some(_), true) => {
+                    evidence.push(format!(
+                        "{}/.git exists and the manifest lists it",
+                        change.path
+                    ));
+                    outcome = ChangeOutcome::Applied;
+                }
+                (None, _) => evidence.push(format!("the manifest does not list '{}'", change.id)),
+                (Some(_), false) => {
+                    evidence.push(format!("there is no .git in {}", change.path));
+                }
+            }
+        }
         AddRepository | AdoptRepository => match recorded {
             Some(repo) => {
                 evidence.push(format!(

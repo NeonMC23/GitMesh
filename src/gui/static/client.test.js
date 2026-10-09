@@ -676,6 +676,15 @@ function sampleInspection() {
   equal(add.untrack, 'true', 'and the untrack choice');
   equal(add.planId, undefined, 'no plan id before the review');
 
+  var clone = GitMesh.repositoryRequestFields({
+    intent: 'clone', path: ' libs/core ', id: '', remote: ' /srv/core.git '
+  });
+  equal(clone.intent, 'clone', 'cloning is its own intent');
+  equal(clone.path, 'libs/core', 'the target directory is trimmed');
+  equal(clone.remote, '/srv/core.git', 'the remote is trimmed and sent');
+  equal(clone.id, '', 'an empty id means the suggestion');
+  equal(clone.configureRemote, undefined, 'a clone never sends the add-only flags');
+
   var rename = GitMesh.repositoryRequestFields({ intent: 'rename', id: 'engine', newId: 'engine-core' });
   equal(rename.newId, 'engine-core', 'renaming sends the new name');
   var remove = GitMesh.repositoryRequestFields({ intent: 'remove', id: 'engine', takeover: true });

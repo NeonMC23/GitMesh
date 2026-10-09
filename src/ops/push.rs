@@ -179,7 +179,9 @@ fn push_one(
         );
     }
 
-    let mut args: Vec<String> = vec!["push".to_string()];
+    // `--porcelain` gives one machine-readable line per ref, so refusals are classified by the
+    // ref status rather than by matching English words in the human output.
+    let mut args: Vec<String> = vec!["push".to_string(), "--porcelain".to_string()];
     if options.dry_run {
         args.push("--dry-run".to_string());
     }
@@ -215,6 +217,10 @@ fn push_one(
         }
         Ok(out) => {
             let stderr = out.stderr.clone();
+            let refusals = crate::git::parse_push_porcelain(&out.stdout);
+            if let Some(refusal) = refusals.first() {
+                return refusal_outcome(&base, git, &remote_name, refusal, &stderr);
+            }
             let lower = stderr.to_ascii_lowercase();
             let (kind, summary) = if lower.contains("non-fast-forward")
                 || lower.contains("rejected")
@@ -261,6 +267,76 @@ fn push_one(
         }
         Err(err) => base(OutcomeKind::Failed, "git could not be run".to_string())
             .with_detail(err.to_string()),
+    }
+}
+
+/// Explain a refused push from its ref status. Histories are never forced: the outcome says
+/// how to integrate them, or what the remote itself refused.
+fn refusal_outcome(
+    base: &dyn Fn(OutcomeKind, String) -> RepoOutcome,
+    git: &GitRepo<'_>,
+    remote: &str,
+    refusal: &crate::git::PushRefusal,
+    stderr: &str,
+) -> RepoOutcome {
+    use crate::git::PushRefusal;
+    match refusal {
+        PushRefusal::HistoryMismatch { branch } => {
+            let remote_ref = format!("{remote}/{branch}");
+            // A rejected push does not update the remote-tracking refs, so refresh them (a fetch
+            // never changes the work tree) before deciding how the histories relate.
+            let _ = git.run(&["fetch", "--quiet", remote]);
+            match crate::git::divergence(git, &remote_ref).ok().flatten() {
+                Some(shape) if !shape.shares_history => base(
+                    OutcomeKind::Failed,
+                    format!("rejected: '{branch}' and {remote_ref} have unrelated histories (no common commit)"),
+                )
+                .with_detail(
+                    "neither a pull nor a merge can join them automatically; decide which history should be kept, then push deliberately. GitMesh never force-pushes; nothing local was changed"
+                        .to_string(),
+                ),
+                Some(shape) if shape.is_diverged() => base(
+                    OutcomeKind::Failed,
+                    format!(
+                        "rejected: '{branch}' has diverged from {remote_ref} ({} local, {} remote commit(s))",
+                        shape.ahead, shape.behind
+                    ),
+                )
+                .with_detail(
+                    "run `gitmesh pull --strategy merge` (or `gitmesh pull --strategy rebase`) to integrate the remote commits, then push again. GitMesh never force-pushes; nothing local was changed"
+                        .to_string(),
+                ),
+                _ => base(
+                    OutcomeKind::Failed,
+                    "rejected: the remote has commits this repository does not have".to_string(),
+                )
+                .with_detail(
+                    "run `gitmesh pull` first, then push again; nothing local was changed".to_string(),
+                ),
+            }
+        }
+        PushRefusal::RemoteRefused { branch, reason } => {
+            let mut outcome = base(
+                OutcomeKind::Failed,
+                format!("rejected by the remote: '{branch}' was refused ({reason})"),
+            );
+            let remote_lines: Vec<String> = stderr
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("remote:"))
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .take(10)
+                .collect();
+            outcome.details.extend(remote_lines);
+            outcome.details.push(
+                "the remote's own policy refused this push; nothing local was changed".to_string(),
+            );
+            outcome
+        }
+        PushRefusal::Other { branch, reason } => {
+            base(OutcomeKind::Failed, format!("push of '{branch}' failed"))
+                .with_detail(reason.clone())
+        }
     }
 }
 

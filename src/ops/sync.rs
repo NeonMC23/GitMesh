@@ -271,11 +271,41 @@ fn pull_one(
             }
         }
     }
+    // The fetch pruned the remote-tracking refs: a branch the remote deleted is reported as
+    // such, never as "up to date".
+    if refreshed && crate::git::upstream_is_gone(git, &upstream).unwrap_or(false) {
+        return base(
+            OutcomeKind::Failed,
+            format!("'{upstream}' no longer exists on the remote"),
+        )
+        .with_detail(
+            "the remote deleted this branch; the local branch is unchanged. Push it again with `git push -u <remote> <branch>`, or choose another upstream"
+                .to_string(),
+        );
+    }
+
     let (ahead, behind) = if refreshed {
         git.ahead_behind().ok().flatten().unwrap_or((0, 0))
     } else {
         (state.ahead().unwrap_or(0), state.behind().unwrap_or(0))
     };
+
+    // Unrelated histories share no commit, so no merge or rebase can join them. That is a
+    // different problem from divergence and is reported as such, whatever the strategy.
+    if ahead > 0 && behind > 0 {
+        if let Ok(Some(shape)) = crate::git::divergence(git, &upstream) {
+            if !shape.shares_history {
+                return base(
+                    OutcomeKind::Failed,
+                    format!("'{upstream}' and this branch have unrelated histories (no common commit)"),
+                )
+                .with_detail(
+                    "neither a pull nor a merge can join them automatically; decide which history should be kept. Nothing local was changed"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     // Divergence is reported rather than resolved behind the user's back — unless the
     // caller explicitly asked for merge or rebase.
@@ -285,7 +315,7 @@ fn pull_one(
             format!("diverged from '{upstream}' ({ahead} ahead, {behind} behind)"),
         )
         .with_detail(
-            "GitMesh will not merge or rebase automatically; rerun with --merge or --rebase, \
+            "GitMesh will not merge or rebase automatically; rerun with --strategy merge or --strategy rebase, \
              or resolve it manually"
                 .to_string(),
         );
@@ -367,7 +397,7 @@ fn pull_one(
                 }
             } else if state_is_diverged(git) {
                 outcome.details.push(
-                    "the branch diverged from upstream; rerun with --merge or --rebase".to_string(),
+                    "the branch diverged from upstream; rerun with --strategy merge or --strategy rebase".to_string(),
                 );
             } else {
                 outcome.details.push(classify_transport_hint(&out.stderr));
@@ -611,7 +641,8 @@ mod tests {
         let root = &report.outcomes[0];
         assert_eq!(root.kind, OutcomeKind::Failed);
         assert!(root.summary.contains("diverged"), "{}", root.summary);
-        assert!(root.details.iter().any(|d| d.contains("--merge")));
+        // The strategy flag the CLI really has (there is no `--merge` flag).
+        assert!(root.details.iter().any(|d| d.contains("--strategy merge")));
         // Nothing was merged or lost.
         let log = fixture.git_ok(".", &["log", "--oneline"]);
         assert!(log.contains("our change") || log.contains("update our-file.txt"));

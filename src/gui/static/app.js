@@ -827,6 +827,10 @@ var GitMesh = (function () {
       fields.initialize = form.initialize ? 'true' : 'false';
       fields.configureRemote = form.configureRemote ? 'true' : 'false';
       fields.untrack = form.untrack ? 'true' : 'false';
+    } else if (form.intent === 'clone') {
+      fields.path = (form.path || '').trim();
+      fields.id = (form.id || '').trim();
+      fields.remote = (form.remote || '').trim();
     } else if (form.intent === 'rename') {
       fields.id = (form.id || '').trim();
       fields.newId = (form.newId || '').trim();
@@ -2458,6 +2462,10 @@ if (typeof document !== 'undefined') {
       $('repo-new-id-field').hidden = intent !== 'rename';
       $('repo-edit-remote-field').hidden = intent !== 'set-remote';
       $('repo-configure-git-field').hidden = intent !== 'set-remote';
+      // Cloning brings a new directory in from a remote, so it names its own fields and not
+      // a repository that already exists.
+      $('repo-clone-fields').hidden = intent !== 'clone';
+      $('repo-target-field').hidden = intent === 'clone';
       $('repo-takeover-field').hidden = intent !== 'remove';
     }
 
@@ -2522,6 +2530,15 @@ if (typeof document !== 'undefined') {
         initialize: $('repo-initialize').checked,
         configureRemote: $('repo-configure-remote').checked,
         untrack: $('repo-untrack').checked
+      });
+    }
+
+    function repoCloneRequest() {
+      return GitMesh.repositoryRequestFields({
+        intent: 'clone',
+        path: $('repo-clone-path').value,
+        id: $('repo-clone-id').value,
+        remote: $('repo-clone-remote').value
       });
     }
 
@@ -2717,7 +2734,9 @@ if (typeof document !== 'undefined') {
       if (event.key === 'Enter') { event.preventDefault(); checkRepoDirectory(); }
     });
     $('btn-repo-review').addEventListener('click', function () { reviewRepoChange(repoAddRequest()); });
-    $('btn-repo-change').addEventListener('click', function () { reviewRepoChange(repoEditRequest()); });
+    $('btn-repo-change').addEventListener('click', function () {
+      reviewRepoChange($('repo-intent').value === 'clone' ? repoCloneRequest() : repoEditRequest());
+    });
     $('repo-intent').addEventListener('change', function () {
       renderRepoIntent();
       invalidateRepoPlan();

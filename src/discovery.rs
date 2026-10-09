@@ -778,6 +778,55 @@ pub fn initialize_repository(path: &Path, runner: &GitRunner) -> Result<()> {
     Ok(())
 }
 
+/// True when `path` is an existing directory with no entries at all.
+pub fn is_empty_directory(path: &Path) -> bool {
+    path.is_dir()
+        && std::fs::read_dir(path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+}
+
+/// Clone `url` into `path`, which must be missing or an empty directory.
+///
+/// Nothing that exists is overwritten: a non-empty directory is refused before Git runs. When
+/// the remote has commits, its default branch is tracked; the return value is that branch, or
+/// `None` when the remote is empty and the clone has no commits.
+pub fn clone_repository(url: &str, path: &Path, runner: &GitRunner) -> Result<Option<String>> {
+    if path.exists() && !is_empty_directory(path) {
+        return Err(Error::Other(format!(
+            "'{}' is not an empty directory; nothing was cloned",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Other(format!("could not create '{}': {e}", parent.display())))?;
+    }
+    let target = path.to_string_lossy().to_string();
+    runner
+        .run(&["clone", "--quiet", "--", url, &target])?
+        .require("clone")?;
+
+    let repo = runner.repo(path);
+    let default = repo
+        .run_optional(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])?
+        .map(|name| name.trim().trim_start_matches("origin/").to_string())
+        .filter(|name| !name.is_empty());
+    let has_commits = repo.head_oid()?.is_some();
+    match default {
+        Some(branch) if has_commits => {
+            repo.run_checked(&["branch", "--set-upstream-to", &format!("origin/{branch}")])?;
+            Ok(Some(branch))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Point `origin` of the repository at `repo_path` to `url`, adding it when missing.
 ///
 /// Only the remote itself is touched: no fetch, no push, no branch is created. An

@@ -249,3 +249,7 @@ operations must keep working with no network at all.
   committed; GitMesh does not commit it implicitly.
 * Repository-specific history operations (rebase, cherry-pick, submodule handling) are
   intentionally left to Git inside the individual repository.
+
+## 9. Remote and lifecycle checks
+
+`src/git/remote.rs` reads remotes without changing anything: `probe_remote` (`git ls-remote`), push refusals from `git push --porcelain`, divergence and shared-history checks (`git rev-list --left-right --count` and `git merge-base`), and whether a tracked branch still exists after a fetch. Planning (`manage.rs`) probes the remote before recording or cloning it; execution (`discovery::clone_repository`) refuses a non-empty destination before Git runs. Sync (`ops/push.rs`, `ops/sync.rs`) classifies refusals from structured status, not English message text. See [REPOSITORIES.md](REPOSITORIES.md).

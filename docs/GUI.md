@@ -440,3 +440,12 @@ and then checks the result on disk: real `.git` directories, the generated manif
 configured remotes, the first publish, a real push, a deliberately broken remote (partial
 failure), a rerun on the now-configured project, and a restart of the interface. It also
 checks that a repository outside the project is never touched.
+
+## Cloning a remote into the project
+
+Under *Change one repository*, choose **clone a remote into a new directory**, then give the
+new directory (relative to the project), the remote URL or local path, and optionally a name
+in GitMesh. The review shows the plan the service built, exactly as for the other actions; the
+remote is read before anything is cloned, and a directory that already has files is refused
+without being touched. The same operation is `gitmesh configure clone` on the command line.
+See [REPOSITORIES.md](REPOSITORIES.md) for the rules and the sync error messages.

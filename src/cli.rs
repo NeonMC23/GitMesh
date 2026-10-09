@@ -155,6 +155,9 @@ pub struct DiscoverArgs {
 pub enum ConfigureCommand {
     /// Mark a directory as an independent physical repository.
     Add(ConfigureAddArgs),
+    /// Clone a remote into a new directory and record it. The directory must be missing or
+    /// empty; nothing that exists is overwritten.
+    Clone(ConfigureCloneArgs),
     /// Remove a repository from the configuration (never deletes files).
     Remove(ConfigureRemoveArgs),
     /// Rename the logical identifier of a repository.
@@ -190,6 +193,23 @@ pub struct ConfigureAddArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct ConfigureCloneArgs {
+    /// New directory relative to the project root (missing or empty).
+    pub path: PathBuf,
+    /// URL or local path of the remote to clone.
+    #[arg(long)]
+    pub remote: String,
+    /// Logical identifier (defaults to the directory name).
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Branch hint recorded in the manifest.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Report what would change without cloning or writing the manifest.
+    #[arg(long)]
+    pub dry_run: bool,
+}
 #[derive(Debug, Args)]
 pub struct ConfigureRemoveArgs {
     /// Logical identifier of the repository.
