@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<u8> {
                 dry_run: args.dry_run,
                 include_untracked: true,
                 quiet_clean: false,
+                staged_only: false,
             };
             let report = ops::commit_project(&project, &runner, &options)?;
             render_report(&global, &report)

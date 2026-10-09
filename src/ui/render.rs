@@ -1,17 +1,31 @@
-//! Rendering of the terminal UI.
+//! Drawing for the terminal interface. No state changes happen here.
 //!
-//! Pure drawing: every value comes from the [`App`](super::app::App) state machine.
-//! The layout is deliberately simple — one tree, one status panel, one message log —
-//! because the point of the interface is that the user sees one project.
+//! Layout, top to bottom:
+//!
+//! ```text
+//! GitMesh · project · branch · DRY RUN          header (2 lines)
+//! /path/to/project · 5 changes · 1 staged
+//! ┌ Changes by repository ───────────────┐
+//! │ app  2 changes, 1 staged             │      grouped changes (flexible)
+//! │   M  app/main.rs                     │
+//! └──────────────────────────────────────┘
+//! ┌ Commit message ──────────────────────┐
+//! │ fix the parser                       │      one message field
+//! └──────────────────────────────────────┘
+//! [ s Stage all ] [ c Commit ] [ p Pull ] [ P Push ]
+//! ┌ Result ──────────────────────────────┐      last operation, per repository
+//! └──────────────────────────────────────┘
+//! s stage all · c commit · p pull · …          footer: real shortcuts only
+//! ```
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{App, InputKind, Screen};
-use crate::model::RepositoryState;
+use super::app::{App, ChangeLine, Focus, BUTTONS, MIN_HEIGHT, MIN_WIDTH, SHORTCUTS};
+use crate::model::RepositoryRole;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
@@ -19,395 +33,584 @@ const OK: Color = Color::Green;
 const WARN: Color = Color::Yellow;
 const BAD: Color = Color::Red;
 
-/// Draw the whole interface.
+/// Draw one frame.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(if app.report.is_some() || !app.log.is_empty() {
-                10
-            } else {
-                3
-            }),
-            Constraint::Length(if app.mode.is_some() { 3 } else { 2 }),
-        ])
-        .split(area);
-
-    draw_header(frame, app, chunks[0]);
-    match app.screen {
-        Screen::Setup => draw_setup(frame, app, chunks[1]),
-        Screen::Project => draw_project(frame, app, chunks[1]),
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(frame, area);
+        return;
     }
-    draw_log(frame, app, chunks[2]);
-    if app.mode.is_some() {
-        draw_input(frame, app, chunks[3]);
-    } else {
-        draw_hints(frame, app, chunks[3]);
-    }
-
     if app.show_help {
         draw_help(frame, area);
+        return;
     }
+    if app.project.is_none() {
+        draw_no_project(frame, app, area);
+        return;
+    }
+    draw_project(frame, app, area);
+}
+
+fn draw_too_small(frame: &mut Frame<'_>, area: Rect) {
+    let text = vec![
+        Line::from(Span::styled(
+            "Terminal too small for GitMesh",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "Needs at least {MIN_WIDTH}×{MIN_HEIGHT}, this is {}×{}.",
+            area.width, area.height
+        )),
+        Line::from("Enlarge the window, or press q to quit."),
+    ];
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_no_project(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let width = area.width as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "No GitMesh project is open",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if let Some(error) = &app.open_error {
+        lines.push(Line::from(Span::styled(
+            fit(error, width),
+            Style::default().fg(BAD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Create one with `gitmesh init` in your project directory",
+    ));
+    lines.push(Line::from(
+        "(or use `gitmesh gui`), then open this screen again.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "q quit",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_project(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let result_height = result_height(app, area.height);
+    let chunks = Layout::vertical([
+        Constraint::Length(2),             // header
+        Constraint::Min(3),                // changes
+        Constraint::Length(3),             // message
+        Constraint::Length(1),             // action bar
+        Constraint::Length(result_height), // result
+        Constraint::Length(1),             // footer
+    ])
+    .split(area);
+
+    draw_header(frame, app, chunks[0]);
+    draw_changes(frame, app, chunks[1]);
+    draw_message(frame, app, chunks[2]);
+    draw_actions(frame, app, chunks[3]);
+    if result_height > 0 {
+        draw_result(frame, app, chunks[4]);
+    }
+    draw_footer(frame, app, chunks[5]);
+}
+
+/// Rows given to the result panel: its content, bounded so changes keep room.
+fn result_height(app: &App, total: u16) -> u16 {
+    let Some(result) = &app.result else {
+        return 0;
+    };
+    // Title + one row per line + the two borders, bounded so the changes list keeps room.
+    let wanted = (result.lines.len() as u16 + 3).clamp(3, 12);
+    // Keep at least six rows for the changes list.
+    let budget = total.saturating_sub(2 + 3 + 1 + 1 + 6);
+    wanted.min(budget.max(3))
 }
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let title = match (&app.project, app.screen) {
-        (Some(project), _) => format!(" {} ", project.name),
-        (None, Screen::Setup) => " GitMesh setup ".to_string(),
-        _ => " GitMesh ".to_string(),
-    };
-    let mut spans = vec![
+    let width = area.width as usize;
+    let project = app.project.as_ref();
+    let name = project.map(|p| p.name.as_str()).unwrap_or("-");
+    let mut first = vec![
         Span::styled(
-            "gitmesh",
+            "GitMesh",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
-            title.trim().to_string(),
+            fit(name, width.saturating_sub(30).max(8)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
+        Span::styled("  branch ", Style::default().fg(MUTED)),
         Span::styled(
-            format!("{}", app.start_dir.display()),
-            Style::default().fg(MUTED),
-        ),
-        Span::raw("  "),
-    ];
-    if app.screen == Screen::Project {
-        spans.push(Span::styled(
-            format!("branch {}", app.logical_branch()),
+            fit(&app.header_branch(), width / 2),
             Style::default().fg(ACCENT),
+        ),
+    ];
+    if app.dry_run {
+        first.push(Span::raw("  "));
+        first.push(Span::styled(
+            " DRY RUN ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(WARN)
+                .add_modifier(Modifier::BOLD),
         ));
     }
-    if app.dry_run {
-        spans.push(Span::styled("  [DRY RUN]", Style::default().fg(WARN)));
-    }
+    let root = project
+        .map(|p| p.root.display().to_string())
+        .unwrap_or_default();
+    let (staged_files, staged_repos) = app.staged_summary();
+    let summary = format!(
+        "{} change(s) · {} staged in {} repositor{}",
+        app.change_count(),
+        staged_files,
+        staged_repos,
+        if staged_repos == 1 { "y" } else { "ies" }
+    );
+    let second = Line::from(vec![
+        Span::styled(
+            fit(
+                &root,
+                width.saturating_sub(summary.chars().count() + 3).max(8),
+            ),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled("  ·  ", Style::default().fg(MUTED)),
+        Span::raw(summary),
+    ]);
+    frame.render_widget(Paragraph::new(vec![Line::from(first), second]), area);
+}
+
+fn draw_changes(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" one project, one status ");
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
-}
+        .border_style(Style::default().fg(MUTED))
+        .title(" Changes by repository ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-fn draw_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-
-    frame.render_widget(
-        tree_widget(app, " project tree (Enter/E: path, A: mark repository) "),
-        chunks[0],
-    );
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "No GitMesh project here yet.",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::raw("Setup steps:"),
-        Line::raw("  1. choose the project directory (Enter)"),
-        Line::raw("  2. select a directory in the tree"),
-        Line::raw("  3. press A to make it an independent repository"),
-        Line::raw("     (or leave it in the root repository)"),
-        Line::raw("  4. press W to save .gitmesh/project.toml"),
-        Line::raw(""),
-        Line::styled(
-            "GitMesh never moves or modifies your files.",
-            Style::default().fg(MUTED),
-        ),
-    ];
-    if let Some(scan) = &app.scan {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            format!(
-                "{} Git repository(ies) found in this tree",
-                scan.repositories.len()
-            ),
-            Style::default().fg(ACCENT),
-        ));
-        for notice in scan.notices.iter().take(3) {
-            lines.push(Line::styled(notice.clone(), Style::default().fg(WARN)));
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" setup ")),
-        chunks[1],
-    );
-}
-
-fn draw_project(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-        .split(area);
-
-    frame.render_widget(tree_widget(app, " project tree "), chunks[0]);
-
-    let rows_panel = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(8)])
-        .split(chunks[1]);
-
-    frame.render_widget(status_widget(app), rows_panel[0]);
-    frame.render_widget(changes_widget(app), rows_panel[1]);
-}
-
-fn tree_widget<'a>(app: &'a App, title: &'a str) -> Paragraph<'a> {
-    let mut lines: Vec<Line> = Vec::new();
-    for (index, row) in app.rows.iter().enumerate() {
-        let selected = index == app.selected;
-        let indent = "  ".repeat(row.depth);
-        let mut spans = vec![Span::raw(indent)];
-        let name_style = if selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+    if app.changes.is_empty() {
+        let text = if app.status.is_some() {
+            "No changes. Every repository matches its last commit."
         } else {
+            "Status not available yet. Press r to refresh."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(MUTED)))),
+            inner,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for line in app.changes.iter().skip(app.scroll).take(height) {
+        lines.push(match line {
+            ChangeLine::Repository {
+                id,
+                role,
+                path,
+                changes,
+                staged,
+                note,
+            } => {
+                let role_text = match role {
+                    RepositoryRole::Root => "root",
+                    RepositoryRole::External => "repo",
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        fit(
+                            &format!("{id} ({role_text}, {path})"),
+                            width.saturating_sub(30).max(10),
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {changes} changed, {staged} staged"),
+                        Style::default().fg(MUTED),
+                    ),
+                ];
+                if let Some(note) = note {
+                    spans.push(Span::styled(
+                        format!("  ! {note}"),
+                        Style::default().fg(BAD),
+                    ));
+                }
+                Line::from(spans)
+            }
+            ChangeLine::File { code, path, staged } => {
+                let color = if *staged { OK } else { WARN };
+                let label = change_label(code);
+                let path_width = width.saturating_sub(16).max(8);
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{code:<2}"),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {label:<10}"), Style::default().fg(MUTED)),
+                    Span::raw(fit(path, path_width)),
+                ])
+            }
+        });
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Human word for a two-letter status code.
+fn change_label(code: &str) -> &'static str {
+    match code {
+        "??" => "untracked",
+        "UU" => "conflict",
+        c if c.starts_with('A') => "added",
+        c if c.starts_with('M') || c.ends_with('M') => "modified",
+        c if c.starts_with('D') || c.ends_with('D') => "deleted",
+        c if c.starts_with('R') || c.ends_with('R') => "renamed",
+        c if c.starts_with('C') || c.ends_with('C') => "copied",
+        c if c.starts_with('T') || c.ends_with('T') => "type changed",
+        _ => "changed",
+    }
+}
+
+fn draw_message(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Message;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
+        .title(if focused {
+            " Commit message (Tab: actions) "
+        } else {
+            " Commit message (Tab: edit) "
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let (text, placeholder) = if app.message.is_empty() {
+        (
+            "write the commit message for every repository with staged changes".to_string(),
+            true,
+        )
+    } else {
+        (app.message.clone(), false)
+    };
+    // Show the end of long messages so the cursor stays visible.
+    let shown = tail(&text, width.saturating_sub(1).max(1));
+    let style = if placeholder {
+        Style::default().fg(MUTED)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(shown.clone(), style))),
+        inner,
+    );
+    if focused && !placeholder {
+        let col = shown.chars().count().min(width.saturating_sub(1)) as u16;
+        frame.set_cursor_position((inner.x + col, inner.y));
+    } else if focused {
+        frame.set_cursor_position((inner.x, inner.y));
+    }
+}
+
+fn draw_actions(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    for (index, button) in BUTTONS.iter().enumerate() {
+        let selected = app.focus == Focus::Actions && app.button == index;
+        let style = if selected {
             Style::default()
-        };
-        spans.push(Span::styled(row.name.clone(), name_style));
-
-        if row.is_external {
-            let id = row.repository_id.clone().unwrap_or_else(|| "repo".into());
-            spans.push(Span::styled(
-                format!("  [repo {id}]"),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-        } else if row.is_repository_root {
-            spans.push(Span::styled(
-                "  [git repository - unassigned]",
-                Style::default().fg(WARN),
-            ));
-        } else if row.relative_path == std::path::Path::new(".") {
-            spans.push(Span::styled(
-                "  [root repository]",
-                Style::default().fg(MUTED),
-            ));
-        }
-        if row.file_count > 0 {
-            spans.push(Span::styled(
-                format!("  {} file(s)", row.file_count),
-                Style::default().fg(MUTED),
-            ));
-        }
-        if row.truncated {
-            spans.push(Span::styled("  …", Style::default().fg(MUTED)));
-        }
-        lines.push(Line::from(spans));
-    }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "(empty directory)",
-            Style::default().fg(MUTED),
-        ));
-    }
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title.to_string()),
-    )
-}
-
-fn status_widget<'a>(app: &'a App) -> Table<'a> {
-    let header = Row::new(vec!["REPOSITORY", "PATH", "BRANCH", "STATE"])
-        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = app
-        .status
-        .as_ref()
-        .map(|status| {
-            status
-                .repositories
-                .iter()
-                .map(|state| {
-                    let style = if !state.is_usable() {
-                        Style::default().fg(BAD)
-                    } else if state.has_conflicts() {
-                        Style::default().fg(WARN)
-                    } else {
-                        Style::default()
-                    };
-                    Row::new(vec![
-                        state.id.clone(),
-                        state.relative_path.clone(),
-                        branch_of(state),
-                        state.summary(),
-                    ])
-                    .style(style)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Table::new(
-        rows,
-        [
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Length(16),
-            Constraint::Min(16),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" unified status "),
-    )
-}
-
-fn changes_widget<'a>(app: &'a App) -> Paragraph<'a> {
-    let mut lines: Vec<Line> = Vec::new();
-    let Some(project) = &app.project else {
-        return Paragraph::new(lines);
-    };
-    let Some(status) = &app.status else {
-        return Paragraph::new(lines);
-    };
-    let analyzer = crate::analyzer::Analyzer::new(project, &app.runner);
-    let changes = analyzer.owned_changes(status);
-    if changes.is_empty() {
-        lines.push(Line::styled(
-            "no changes: the project is clean",
-            Style::default().fg(OK),
-        ));
-    }
-    for change in changes.iter().take(20) {
-        let (label, style) = if change.is_conflict() {
-            ("conflict", Style::default().fg(BAD))
-        } else if change.entry.untracked {
-            ("new", Style::default().fg(OK))
-        } else if change.entry.staged {
-            ("staged", Style::default().fg(ACCENT))
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
-            ("modified", Style::default().fg(WARN))
+            Style::default().add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:<10}", change.repository_id),
-                Style::default().fg(MUTED),
-            ),
-            Span::styled(format!("{label:<9} "), style),
-            Span::raw(change.logical_path.clone()),
-        ]));
-    }
-    if changes.len() > 20 {
-        lines.push(Line::styled(
-            format!("... and {} more", changes.len() - 20),
-            Style::default().fg(MUTED),
+        spans.push(Span::styled(
+            format!(" {} {} ", button.key, button.action.label()),
+            style,
         ));
+        spans.push(Span::raw(" "));
     }
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" changes by owning repository "),
-    )
+    if app.busy.is_some() {
+        spans.push(Span::styled(" working… ", Style::default().fg(WARN)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_log(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .log
-        .iter()
-        .rev()
-        .take(area.height.saturating_sub(2) as usize)
-        .map(|line| {
-            let style = if line.contains('✗') {
-                Style::default().fg(BAD)
-            } else if line.contains('!') {
-                Style::default().fg(WARN)
-            } else if line.contains('✓') {
-                Style::default().fg(OK)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::raw(line.clone())).style(style)
-        })
-        .collect();
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" activity ")),
-        area,
-    );
-}
-
-fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let hints = match app.screen {
-        Screen::Setup => "Enter: open directory   a: mark/unmark repository   i: rename   u: remote   w: save configuration   s: rescan   ?: help   q: quit",
-        Screen::Project => "c: commit   p: pull   P: push   f: fetch   s: refresh   n: new branch   b: switch branch   m: merge   a: mark/unmark repository   d: dry-run   r: reload   ?: help   q: quit",
+fn draw_result(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(result) = &app.result else {
+        return;
     };
-    frame.render_widget(
-        Paragraph::new(Line::styled(hints, Style::default().fg(MUTED))),
-        area,
-    );
+    let color = if result.problems { BAD } else { OK };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(" Result ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        result.title.clone(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))];
+    // Rows left after the title. If the result does not fit, say so: a repository's
+    // outcome must never disappear silently.
+    let room = (inner.height as usize).saturating_sub(1);
+    let (shown, hidden) = if result.lines.len() <= room {
+        (result.lines.len(), 0)
+    } else {
+        // One row is reserved for the note that says how much is hidden.
+        let shown = room.saturating_sub(1);
+        (shown, result.lines.len() - shown)
+    };
+    for line in result.lines.iter().take(shown) {
+        lines.push(Line::from(line.clone()));
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("… {hidden} more line(s) hidden: enlarge the terminal to see them"),
+            Style::default().fg(MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let kind = app.mode.unwrap_or(InputKind::Directory);
-    let text = format!("{}: {}", kind.prompt(), app.input);
-    let cursor_x = text.chars().count() as u16;
+fn draw_footer(frame: &mut Frame<'_>, _app: &App, area: Rect) {
+    let width = area.width as usize;
+    let keys = [
+        ("s", "stage all"),
+        ("c", "commit"),
+        ("p", "pull"),
+        ("P", "push"),
+        ("Tab", "message/actions"),
+        ("d", "dry run"),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+    let mut text = String::new();
+    for (key, label) in keys {
+        let piece = format!("{key} {label}");
+        let separator = if text.is_empty() { "" } else { "  " };
+        if text.chars().count() + separator.len() + piece.chars().count() > width {
+            break;
+        }
+        text.push_str(separator);
+        text.push_str(&piece);
+    }
     frame.render_widget(
-        Paragraph::new(Line::raw(text)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Enter to confirm, Esc to cancel "),
-        ),
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(MUTED)))),
         area,
     );
-    frame.set_cursor_position((area.x + 2 + cursor_x, area.y + 1));
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 78, 20);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled(
-            "GitMesh - one logical project over many physical repositories",
-            Style::default().fg(ACCENT),
-        ),
-        Line::raw(""),
-        Line::raw("Navigation      j/k or arrows: move in the tree"),
-        Line::raw("                Enter: open a directory (setup) / confirm input"),
-        Line::raw("Configuration   a: mark or unmark the selected directory as an independent"),
-        Line::raw("                   physical repository (saved to .gitmesh/project.toml)"),
-        Line::raw("                i: rename the repository   u: set its remote URL"),
-        Line::raw("                w: save the configuration"),
-        Line::raw("Everyday work   c: commit all changes with one message"),
-        Line::raw("                p: pull every repository   P: push every repository"),
-        Line::raw("                f: fetch   s: refresh status"),
-        Line::raw("Branches        n: create and switch to a branch everywhere"),
-        Line::raw("                b: switch to an existing branch   m: merge a branch"),
-        Line::raw("Safety          d: dry-run on/off (nothing is changed)"),
-        Line::raw("                q: quit   ?: close this help"),
-        Line::raw(""),
-        Line::styled(
-            "GitMesh never discards local work and never reimplements Git.",
-            Style::default().fg(MUTED),
-        ),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" help ")),
-        popup,
-    );
+    let mut lines = vec![Line::from(Span::styled(
+        "Keys",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    for (keys, what) in SHORTCUTS {
+        lines.push(Line::from(format!("  {keys:<16} {what}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Commit: write a message, press c (or Enter) once to review, again to confirm.",
+    ));
+    lines.push(Line::from(
+        "Stage all: stages each repository's own changes; never another's.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press any key to close.",
+        Style::default().fg(MUTED),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
+/// Fit text into `width` columns, keeping the start and marking the cut with "…".
+pub fn fit(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let kept: String = text.chars().take(width - 1).collect();
+    format!("{kept}…")
+}
+
+/// Keep the end of text, marking the cut with "…" at the start.
+fn tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().skip(count - (width - 1)).collect();
+    format!("…{kept}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_marks_cuts_and_never_panics_on_multibyte() {
+        assert_eq!(fit("short", 10), "short");
+        assert_eq!(fit("abcdef", 4), "abc…");
+        assert_eq!(fit("héllo wörld", 5), "héll…");
+        assert_eq!(fit("anything", 0), "");
+    }
+
+    #[test]
+    fn tail_keeps_the_end() {
+        assert_eq!(tail("abcdef", 4), "…def");
+        assert_eq!(tail("ab", 4), "ab");
     }
 }
 
-fn branch_of(state: &RepositoryState) -> String {
-    if !state.is_usable() {
-        return "-".to_string();
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+    use crate::testkit::RepoFixture;
+    use crate::ui::app::{App, Key};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render one frame and return it as text rows.
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
     }
-    state.head().label()
+
+    fn populated_app(fixture: &RepoFixture) -> App {
+        App::new(fixture.path(), false).expect("open")
+    }
+
+    fn busy_fixture() -> RepoFixture {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.create_conflict("engine", "src/shared.txt");
+        let long_dir = "deeply/nested/".repeat(8);
+        fixture.write(
+            &format!("{long_dir}file-with-a-very-long-name-indeed.rs"),
+            "x\n",
+        );
+        fixture.write("README.md", "root\n");
+        fixture
+    }
+
+    #[test]
+    fn draws_at_every_size_without_panicking() {
+        let fixture = busy_fixture();
+        let mut app = populated_app(&fixture);
+        app.message =
+            "a commit message that is considerably longer than the field itself allows".into();
+        app.result = Some(crate::ui::app::ResultView {
+            title: "Push: NOT everything succeeded".into(),
+            lines: (0..30)
+                .map(|i| {
+                    format!("✗ engine  line {i} of a multi-line error that keeps going and going")
+                })
+                .collect(),
+            problems: true,
+        });
+        for (w, h) in [
+            (1, 1),
+            (20, 5),
+            (55, 13),
+            (56, 14),
+            (80, 24),
+            (120, 40),
+            (200, 60),
+        ] {
+            let rows = screen(&app, w, h);
+            assert_eq!(rows.len(), h as usize);
+        }
+        app.show_help = true;
+        screen(&app, 80, 24);
+    }
+
+    #[test]
+    fn small_terminals_get_a_resize_notice_instead_of_a_cramped_layout() {
+        let fixture = busy_fixture();
+        let app = populated_app(&fixture);
+        let text = screen(&app, 40, 10).join("\n");
+        assert!(text.contains("Terminal too small"), "{text}");
+        assert!(text.contains("40×10"), "{text}");
+        let just_big_enough = screen(&app, MIN_WIDTH, MIN_HEIGHT).join("\n");
+        assert!(
+            just_big_enough.contains("Changes by repository"),
+            "{just_big_enough}"
+        );
+    }
+
+    #[test]
+    fn the_main_screen_shows_the_advertised_actions_and_footer_keys() {
+        let fixture = busy_fixture();
+        let app = populated_app(&fixture);
+        let text = screen(&app, 100, 30).join("\n");
+        for label in [
+            "Stage all",
+            "Commit",
+            "Pull",
+            "Push",
+            "Changes by repository",
+            "Commit message",
+        ] {
+            assert!(text.contains(label), "missing '{label}':\n{text}");
+        }
+        assert!(text.contains("s stage all"), "{text}");
+        assert!(text.contains("q quit"), "{text}");
+    }
+
+    #[test]
+    fn long_paths_are_cut_with_an_ellipsis_not_wrapped_into_other_panels() {
+        let fixture = busy_fixture();
+        let app = populated_app(&fixture);
+        let rows = screen(&app, 70, 24);
+        assert!(rows.iter().any(|r| r.contains('…')), "{rows:#?}");
+        // The frame borders stay in place on every row of the changes panel.
+        assert!(rows.iter().any(|r| r.starts_with('┌') || r.contains('┌')));
+    }
+
+    #[test]
+    fn the_message_field_shows_the_end_of_a_long_message() {
+        let fixture = busy_fixture();
+        let mut app = populated_app(&fixture);
+        app.message = format!("{}END-OF-MESSAGE", "x".repeat(200));
+        let text = screen(&app, 80, 24).join("\n");
+        assert!(text.contains("END-OF-MESSAGE"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_project_is_explained() {
+        let fixture = RepoFixture::new();
+        let app = populated_app(&fixture);
+        let text = screen(&app, 80, 24).join("\n");
+        assert!(text.contains("No GitMesh project is open"), "{text}");
+        assert!(text.contains("gitmesh init"), "{text}");
+    }
+
+    #[test]
+    fn dry_run_is_labelled_on_screen() {
+        let fixture = busy_fixture();
+        let mut app = populated_app(&fixture);
+        app.handle_key(Key::Char('d'));
+        let text = screen(&app, 100, 30).join("\n");
+        assert!(text.contains("DRY RUN"), "{text}");
+    }
 }

@@ -1,541 +1,329 @@
 //! Terminal UI state machine.
 //!
-//! The UI exists so that the user perceives **one project**: one tree, one status, one
-//! commit, one pull, one push. Physical repository boundaries are visible where they
-//! help (the tree shows which repository owns a directory, the status lists changes per
-//! repository) but they never dominate the experience.
+//! The terminal interface is a minimal everyday workflow for one GitMesh project:
 //!
-//! This module contains no Git logic and no rendering: it is a state machine over the
-//! core API ([`crate::analyzer`], [`crate::discovery`], [`crate::ops`]). Keeping it
-//! free of terminal I/O means the workflows can be tested without a terminal, and it
-//! guarantees the UI cannot drift away from the CLI.
+//! * see the project, its branch and every changed file grouped by the repository that
+//!   owns it;
+//! * stage all changes (repository-scoped, see [`crate::ops::stage_project`]);
+//! * write one commit message and commit it to every repository that has staged work;
+//! * pull and push, with a per-repository result.
+//!
+//! Repository creation, renaming, remote configuration, manifest editing and branch
+//! management are deliberately **not** here: the CLI and the GUI own those.
+//!
+//! This module contains no Git logic and no rendering. Keys go in through [`App::handle_key`],
+//! which returns the [`Action`] (if any) to run; [`App::run_action`] executes it through
+//! the same core operations the CLI uses. Keeping rendering out lets the tests drive whole
+//! workflows without a terminal.
 
 use std::path::{Path, PathBuf};
 
 use crate::analyzer::{Analyzer, ProjectStatus};
-use crate::discovery::{self, DirectoryNode, ProjectScan, ScanOptions};
 use crate::error::Result;
-use crate::git::GitRunner;
-use crate::manage;
+use crate::git::{ChangeKind, GitRunner};
 use crate::manifest;
 use crate::model::{GitMeshProject, RepositoryRole};
 use crate::ops::sync::SyncOptions;
 use crate::ops::{
-    self, BranchAction, BranchOptions, CommitOptions, OperationReport, PushOptions,
-    RepositorySelection,
+    self, CommitOptions, OperationReport, PushOptions, RepositorySelection, StageOptions,
 };
-use crate::paths::to_slash;
 
-/// Which screen is shown.
+/// Smallest terminal the interface draws in. Below this it shows a resize notice.
+pub const MIN_WIDTH: u16 = 56;
+/// Smallest terminal height the interface draws in.
+pub const MIN_HEIGHT: u16 = 14;
+
+/// A key, independent of the terminal library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    /// No project yet: choose a directory, inspect the tree, mark repositories.
-    Setup,
-    /// A project is configured: tree, status and operations.
-    Project,
+pub enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Tab,
+    BackTab,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    CtrlC,
 }
 
-/// A modal text input.
+/// An operation the user asked for. Each one maps to one core operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputKind {
-    Directory,
-    RepositoryId,
-    RemoteUrl,
-    CommitMessage,
-    CheckoutBranch,
-    NewBranch,
-    MergeBranch,
+pub enum Action {
+    StageAll,
+    Commit,
+    Pull,
+    Push,
+    Refresh,
 }
 
-impl InputKind {
-    /// Prompt shown above the input line.
-    pub fn prompt(self) -> &'static str {
+impl Action {
+    /// Short name shown while the operation runs and in its result title.
+    pub fn label(self) -> &'static str {
         match self {
-            InputKind::Directory => "Project directory",
-            InputKind::RepositoryId => "Logical repository id",
-            InputKind::RemoteUrl => "Remote URL (empty clears)",
-            InputKind::CommitMessage => "Commit message (applies to every affected repository)",
-            InputKind::CheckoutBranch => "Branch to switch every repository to",
-            InputKind::NewBranch => "New branch name",
-            InputKind::MergeBranch => "Branch to merge into the current branch",
+            Action::StageAll => "Stage all",
+            Action::Commit => "Commit",
+            Action::Pull => "Pull",
+            Action::Push => "Push",
+            Action::Refresh => "Refresh",
         }
     }
 }
 
-/// One visible row of the project tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeRow {
-    pub depth: usize,
-    pub name: String,
-    pub relative_path: PathBuf,
-    pub is_repository_root: bool,
-    /// Configured logical repository that owns this directory.
-    pub repository_id: Option<String>,
-    /// True when this directory is configured as an external repository.
-    pub is_external: bool,
-    pub file_count: usize,
-    pub truncated: bool,
-}
-
-/// What the user is looking at.
+/// Where keyboard focus is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Tree,
-    Repository,
+    /// Typing the commit message.
+    Message,
+    /// Choosing one of the action buttons (←/→, Enter) or using the letter shortcuts.
+    Actions,
+}
+
+/// One visible action button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Button {
+    pub action: Action,
+    /// The key that does the same thing from the action bar.
+    pub key: char,
+}
+
+/// Action buttons, in display order. The footer and help are built from the same table.
+pub const BUTTONS: [Button; 4] = [
+    Button {
+        action: Action::StageAll,
+        key: 's',
+    },
+    Button {
+        action: Action::Commit,
+        key: 'c',
+    },
+    Button {
+        action: Action::Pull,
+        key: 'p',
+    },
+    Button {
+        action: Action::Push,
+        key: 'P',
+    },
+];
+
+/// Every keyboard shortcut the interface advertises, as (keys, description).
+pub const SHORTCUTS: [(&str, &str); 9] = [
+    ("s", "stage all"),
+    ("c", "commit"),
+    ("p / P", "pull / push"),
+    ("Tab", "message ⇄ actions"),
+    ("↑ ↓ PgUp PgDn", "scroll changes"),
+    ("r", "refresh"),
+    ("d", "dry run on/off"),
+    ("?", "this help"),
+    ("q", "quit"),
+];
+
+/// One line of the grouped changes list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeLine {
+    /// A repository heading with its counts.
+    Repository {
+        id: String,
+        role: RepositoryRole,
+        /// Project-relative path ("." for the root).
+        path: String,
+        changes: usize,
+        staged: usize,
+        /// The repository's problem, if any (conflict, operation in progress, ...).
+        note: Option<String>,
+    },
+    /// One changed file.
+    File {
+        /// Two-character git-style code: index then work tree (`M `, ` M`, `A `, `??`, ...).
+        code: String,
+        path: String,
+        staged: bool,
+    },
+}
+
+/// Result of the last operation, shown in the result panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultView {
+    pub title: String,
+    /// One line per repository, plus detail lines.
+    pub lines: Vec<String>,
+    /// True when at least one repository needs attention.
+    pub problems: bool,
 }
 
 /// The application state.
 pub struct App {
     pub runner: GitRunner,
-    /// Directory being configured (Setup) or the project root (Project).
+    /// Directory the project was opened from (for refresh).
     pub start_dir: PathBuf,
-    pub screen: Screen,
     pub project: Option<GitMeshProject>,
-    pub scan: Option<ProjectScan>,
-    pub rows: Vec<TreeRow>,
-    pub selected: usize,
     pub status: Option<ProjectStatus>,
-    /// Result of the most recent operation.
-    pub report: Option<OperationReport>,
-    /// Rolling message log.
-    pub log: Vec<String>,
-    pub mode: Option<InputKind>,
-    pub input: String,
+    /// The grouped change list, derived from `status`.
+    pub changes: Vec<ChangeLine>,
+    /// Index of the first visible change line.
+    pub scroll: usize,
+    /// Commit message being written.
+    pub message: String,
+    pub focus: Focus,
+    /// Selected action button (index into [`BUTTONS`]).
+    pub button: usize,
     pub dry_run: bool,
     pub show_help: bool,
     pub quit: bool,
-    /// Repositories the user excluded from operations in this session.
-    pub excluded: Vec<String>,
+    /// Last operation's result.
+    pub result: Option<ResultView>,
+    /// True after Commit was pressed once: the next Commit/Enter confirms it.
+    pub confirm_commit: bool,
+    /// Operation currently running (set only while [`run_action`](Self::run_action) runs).
+    pub busy: Option<Action>,
+    /// Message shown in the header when the project cannot be opened.
+    pub open_error: Option<String>,
 }
 
 impl App {
-    /// Create the application, opening a project when one is found at or above `start`.
+    /// Create the application, opening the project at or above `start`.
     pub fn new(start: &Path, dry_run: bool) -> Result<App> {
         let runner = GitRunner::detect()?;
         let start = crate::paths::lexical_normalize(start);
         let mut app = App {
             runner,
             start_dir: start.clone(),
-            screen: Screen::Setup,
             project: None,
-            scan: None,
-            rows: Vec::new(),
-            selected: 0,
             status: None,
-            report: None,
-            log: Vec::new(),
-            mode: None,
-            input: String::new(),
+            changes: Vec::new(),
+            scroll: 0,
+            message: String::new(),
+            focus: Focus::Actions,
+            button: 0,
             dry_run,
             show_help: false,
             quit: false,
-            excluded: Vec::new(),
+            result: None,
+            confirm_commit: false,
+            busy: None,
+            open_error: None,
         };
-
-        match manifest::find_project_root(&start)
-            .and_then(|root| manifest::load_from_root(&root).ok())
-        {
-            Some(project) => {
-                app.log(format!("opened project '{}'", project.name));
-                app.set_project(project)?;
-            }
+        match manifest::find_project_root(&start) {
+            Some(root) => match manifest::load_from_root(&root) {
+                Ok(project) => {
+                    app.start_dir = project.root.clone();
+                    app.project = Some(project);
+                    app.refresh()?;
+                }
+                Err(err) => app.open_error = Some(err.to_string()),
+            },
             None => {
-                app.log(format!(
+                app.open_error = Some(format!(
                     "no GitMesh project found at or above {}",
                     start.display()
                 ));
-                app.log("choose a directory and press Enter, or press 's' to scan the current one");
-                app.scan_directory(&start)?;
             }
         }
         Ok(app)
     }
 
-    /// Switch to the project screen with a loaded project.
-    pub fn set_project(&mut self, project: GitMeshProject) -> Result<()> {
-        self.start_dir = project.root.clone();
-        self.screen = Screen::Project;
-        self.project = Some(project);
-        self.refresh_scan()?;
-        self.refresh_status()?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------- data load --
-
-    /// (Re)scan the project tree.
-    pub fn refresh_scan(&mut self) -> Result<()> {
-        let options = ScanOptions::default();
-        let scan = discovery::scan_project(&self.start_dir, &options, &self.runner)?;
-        self.scan = Some(scan);
-        self.rebuild_rows();
-        Ok(())
-    }
-
-    fn scan_directory(&mut self, path: &Path) -> Result<()> {
-        self.start_dir = crate::paths::lexical_normalize(path);
-        self.refresh_scan()
-    }
-
-    /// (Re)load the project from disk.
-    pub fn reload_project(&mut self) -> Result<()> {
-        match manifest::find_project_root(&self.start_dir) {
-            Some(root) => {
-                let project = manifest::load_from_root(&root)?;
-                self.set_project(project)
-            }
-            None => {
-                self.screen = Screen::Setup;
-                self.project = None;
-                self.refresh_scan()
+    /// Re-read the project manifest and the status of every repository.
+    pub fn refresh(&mut self) -> Result<()> {
+        if let Some(root) = self.project.as_ref().map(|p| p.root.clone()) {
+            if let Ok(project) = manifest::load_from_root(&root) {
+                self.project = Some(project);
             }
         }
-    }
-
-    /// (Re)read the unified status.
-    pub fn refresh_status(&mut self) -> Result<()> {
         if let Some(project) = &self.project {
             let analyzer = Analyzer::new(project, &self.runner);
             self.status = Some(analyzer.analyze());
         }
+        self.rebuild_changes();
         Ok(())
     }
 
-    fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        let Some(scan) = &self.scan else { return };
-        collect_rows(&scan.tree, 0, self.project.as_ref(), &mut self.rows);
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-    }
-
-    /// The currently selected tree row.
-    pub fn selected_row(&self) -> Option<&TreeRow> {
-        self.rows.get(self.selected)
-    }
-
-    /// The configured repository that owns the selected directory.
-    pub fn selected_repository(&self) -> Option<&crate::model::PhysicalRepository> {
-        let row = self.selected_row()?;
-        self.project
-            .as_ref()?
-            .repository_for_relative(&row.relative_path)
-            .filter(|repo| !repo.is_root() || row.relative_path == Path::new("."))
-    }
-
-    // ------------------------------------------------------------- navigation --
-
-    pub fn move_selection(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+    fn rebuild_changes(&mut self) {
+        self.changes.clear();
+        let Some(status) = &self.status else {
             return;
-        }
-        let index = self.selected as isize + delta;
-        self.selected = index.clamp(0, self.rows.len() as isize - 1) as usize;
-    }
-
-    pub fn log(&mut self, message: impl Into<String>) {
-        self.log.push(message.into());
-        if self.log.len() > 200 {
-            self.log.drain(0..100);
-        }
-    }
-
-    // ------------------------------------------------------------- operations --
-
-    /// Start a modal input.
-    pub fn begin_input(&mut self, kind: InputKind) {
-        self.mode = Some(kind);
-        self.input = match kind {
-            InputKind::Directory => self.start_dir.display().to_string(),
-            _ => String::new(),
         };
+        for repo in &status.repositories {
+            let entries: Vec<_> = repo
+                .status
+                .as_ref()
+                .map(|s| s.entries.iter().filter(|e| !e.ignored).collect())
+                .unwrap_or_default();
+            // The root never lists files owned by an external repository.
+            let external_excluded = |path: &str| -> bool {
+                repo.role == RepositoryRole::Root
+                    && self.project.as_ref().is_some_and(|p| {
+                        crate::ops::util::relative_owned_by_external(p, path).is_some()
+                    })
+            };
+            let files: Vec<_> = entries
+                .into_iter()
+                .filter(|e| !external_excluded(&e.path))
+                .collect();
+            let staged = files.iter().filter(|e| e.staged).count();
+            let note = if repo.has_conflicts() {
+                Some("has conflicts".to_string())
+            } else if let Some(op) = repo.in_progress {
+                Some(format!("{} in progress", op.label()))
+            } else if repo.status.is_none() {
+                Some("status unavailable".to_string())
+            } else {
+                None
+            };
+            self.changes.push(ChangeLine::Repository {
+                id: repo.id.clone(),
+                role: repo.role,
+                path: repo.relative_path.clone(),
+                changes: files.len(),
+                staged,
+                note,
+            });
+            for entry in files {
+                self.changes.push(ChangeLine::File {
+                    code: two_letter_code(entry),
+                    path: entry.path.clone(),
+                    staged: entry.staged,
+                });
+            }
+        }
+        if self.scroll >= self.changes.len() {
+            self.scroll = self.changes.len().saturating_sub(1);
+        }
     }
 
-    /// Cancel the modal input.
-    pub fn cancel_input(&mut self) {
-        self.mode = None;
-        self.input.clear();
+    /// Total number of changed files across the project.
+    pub fn change_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|l| matches!(l, ChangeLine::File { .. }))
+            .count()
     }
 
-    /// Submit the modal input.
-    pub fn submit_input(&mut self) -> Result<()> {
-        let Some(kind) = self.mode.take() else {
-            return Ok(());
-        };
-        let value = self.input.trim().to_string();
-        self.input.clear();
-        match kind {
-            InputKind::Directory => {
-                let path = PathBuf::from(&value);
-                if !path.is_dir() {
-                    self.log(format!("'{value}' is not a directory"));
-                    return Ok(());
-                }
-                match manifest::find_project_root(&path) {
-                    Some(root) => {
-                        let project = manifest::load_from_root(&root)?;
-                        self.log(format!("opened project '{}'", project.name));
-                        self.set_project(project)?;
+    /// Number of staged files and of repositories that have staged files.
+    pub fn staged_summary(&self) -> (usize, usize) {
+        let mut files = 0;
+        let mut repos = 0;
+        for line in &self.changes {
+            match line {
+                ChangeLine::Repository { staged, .. } => {
+                    if *staged > 0 {
+                        repos += 1;
                     }
-                    None => {
-                        self.log(format!("no GitMesh project at or above {value}; scanning"));
-                        self.scan_directory(&path)?;
-                    }
+                    files += staged;
                 }
-            }
-            InputKind::RepositoryId => {
-                if let Some(repo) = self.selected_repository().map(|r| r.id.clone()) {
-                    let project = self.project.clone().unwrap();
-                    let updated = discovery::rename_repository(&project, &repo, &value)?;
-                    manifest::save_project(&updated)?;
-                    self.log(format!("renamed '{repo}' to '{value}'"));
-                    self.reload_project()?;
-                }
-            }
-            InputKind::RemoteUrl => {
-                if let Some(id) = self.selected_repository().map(|r| r.id.clone()) {
-                    let project = self.project.clone().unwrap();
-                    let url = if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.clone())
-                    };
-                    let updated =
-                        discovery::set_repository_remote(&project, &id, url, true, &self.runner)?;
-                    manifest::save_project(&updated)?;
-                    self.log(match value.is_empty() {
-                        true => format!("cleared the remote of '{id}'"),
-                        false => format!("set the remote of '{id}' to {value}"),
-                    });
-                    self.reload_project()?;
-                }
-            }
-            InputKind::CommitMessage => {
-                if value.is_empty() {
-                    self.log("commit cancelled: no message");
-                } else {
-                    self.run_commit(&value)?;
-                }
-            }
-            InputKind::CheckoutBranch => {
-                self.run_branch(BranchAction::Checkout {
-                    name: value,
-                    create: false,
-                })?;
-            }
-            InputKind::NewBranch => {
-                self.run_branch(BranchAction::Checkout {
-                    name: value,
-                    create: true,
-                })?;
-            }
-            InputKind::MergeBranch => {
-                self.run_branch(BranchAction::Merge { name: value })?;
+                ChangeLine::File { .. } => {}
             }
         }
-        Ok(())
+        (files, repos)
     }
 
-    /// Mark the selected directory as an external repository.
-    pub fn assign_selected(&mut self) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            // Setup screen without a saved project: create the project first.
-            return self.create_project_from_scan();
-        };
-        let Some(row) = self.selected_row().cloned() else {
-            return Ok(());
-        };
-        if row.relative_path == Path::new(".") {
-            self.log("the project root is always the root repository");
-            return Ok(());
-        }
-        if row.is_external {
-            return self.unassign_selected();
-        }
-        let check = discovery::check_assignment(&project, &row.relative_path, &self.runner)?;
-        if !check.can_assign() {
-            for blocker in &check.blockers {
-                self.log(format!("cannot assign: {blocker}"));
-            }
-            return Ok(());
-        }
-        let options = discovery::AssignOptions {
-            id: None,
-            remote_url: None,
-            init_git: true,
-            branch: None,
-        };
-        let updated =
-            discovery::assign_repository(&project, &row.relative_path, &options, &self.runner)?;
-        manifest::save_project(&updated)?;
-        let id = updated
-            .repository_for_relative(&row.relative_path)
-            .map(|r| r.id.clone())
-            .unwrap_or_default();
-        self.log(format!(
-            "'{}' is now the independent repository '{id}'",
-            to_slash(&row.relative_path)
-        ));
-        self.reload_project()
-    }
-
-    /// Remove the selected repository from the configuration.
-    ///
-    /// Same path as the command line and the graphical interface: the shared management
-    /// service plans the change, and the plan is applied only when it is ready. The plan
-    /// refuses when the root repository still tracks files inside the directory, because
-    /// those files go back to the root repository. The terminal has no step for confirming
-    /// that consequence, so it refuses and says where the explicit confirmation lives. The
-    /// directory, its `.git`, its history and its remote are never touched.
-    pub fn unassign_selected(&mut self) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let Some(repo) = self.selected_repository().map(|r| r.id.clone()) else {
-            self.log("select a configured repository to remove it");
-            return Ok(());
-        };
-        let request = manage::RepositoryManagementRequest::one(manage::RepositoryIntent::Remove {
-            id: repo.clone(),
-            confirm_takeover: false,
-        });
-        let plan = manage::plan(&project, &request, &self.runner)?;
-        if !plan.is_ready() {
-            for blocker in &plan.blockers {
-                self.log(format!("cannot remove '{repo}': {blocker}"));
-            }
-            self.log(format!(
-                "to confirm that, run `gitmesh configure remove {repo} --confirm-takeover`"
-            ));
-            return Ok(());
-        }
-        for warning in &plan.warnings {
-            self.log(format!("note: {warning}"));
-        }
-        let result = manage::apply(
-            &plan,
-            self.dry_run,
-            &self.runner,
-            &mut manage::RepositoryObserver::silent(),
-        );
-        for outcome in &result.actions {
-            self.log(format!("{}: {}", outcome.row_id(), outcome.summary));
-        }
-        if !result.is_success() {
-            self.log("the removal did not complete; review the lines above");
-        } else if result.dry_run {
-            self.log(format!(
-                "dry run: '{repo}' would be removed; nothing was changed"
-            ));
-        }
-        self.reload_project()
-    }
-
-    /// Create the manifest for the current directory, keeping the root repository only.
-    pub fn create_project_from_scan(&mut self) -> Result<()> {
-        let root = self.start_dir.clone();
-        if root.join(".gitmesh/project.toml").exists() {
-            return self.reload_project();
-        }
-        let project = discovery::initial_project(&root, None, None, None)?;
-        let path = manifest::save_project(&project)?;
-        self.log(format!("saved configuration to {}", path.display()));
-        self.set_project(project)
-    }
-
-    /// Commit every change with one logical message.
-    pub fn run_commit(&mut self, message: &str) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let options = CommitOptions {
-            message: message.to_string(),
-            selection: RepositorySelection::All,
-            dry_run: self.dry_run,
-            include_untracked: true,
-            quiet_clean: false,
-        };
-        let report = ops::commit_project(&project, &self.runner, &options)?;
-        self.finish_report(report)
-    }
-
-    /// Fetch from every remote.
-    pub fn run_fetch(&mut self) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let mut options = SyncOptions::new();
-        options.dry_run = self.dry_run;
-        let report = ops::fetch_project(&project, &self.runner, &options)?;
-        self.finish_report(report)
-    }
-
-    /// Pull every repository.
-    pub fn run_pull(&mut self) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let mut options = SyncOptions::new();
-        options.dry_run = self.dry_run;
-        let report = ops::pull_project(&project, &self.runner, &options)?;
-        self.finish_report(report)
-    }
-
-    /// Push every repository that has work to push.
-    pub fn run_push(&mut self) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let options = PushOptions {
-            selection: RepositorySelection::All,
-            dry_run: self.dry_run,
-            set_upstream: true,
-            default_remote: "origin".to_string(),
-        };
-        let report = ops::push_project(&project, &self.runner, &options)?;
-        self.finish_report(report)
-    }
-
-    /// Run a logical branch operation.
-    pub fn run_branch(&mut self, action: BranchAction) -> Result<()> {
-        let Some(project) = self.project.clone() else {
-            return Ok(());
-        };
-        let options = BranchOptions {
-            selection: RepositorySelection::All,
-            force: false,
-            dry_run: self.dry_run,
-            excluded: self.excluded.clone(),
-        };
-        let report = ops::branch_operation(&project, &self.runner, &action, &options)?;
-        self.finish_report(report)
-    }
-
-    /// Store a report and mirror it into the log so the user sees the outcome.
-    fn finish_report(&mut self, report: OperationReport) -> Result<()> {
-        for line in report.summary_lines() {
-            if !line.is_empty() {
-                self.log(line);
-            }
-        }
-        for detail in report.detail_lines() {
-            self.log(detail);
-        }
-        self.report = Some(report);
-        self.refresh_status()
-    }
-
-    /// True when the last operation had failures or conflicts.
-    pub fn last_operation_had_problems(&self) -> bool {
-        self.report
-            .as_ref()
-            .is_some_and(|report| report.outcomes.iter().any(|o| o.kind.is_problem()))
-    }
-
-    /// Branch label of the project: the branch of the root repository, with the
-    /// outliers spelled out so the project can never look consistent when it is not.
-    pub fn logical_branch(&self) -> String {
+    /// Branch of the project (the root's branch), with the outliers spelled out.
+    pub fn header_branch(&self) -> String {
         let Some(status) = &self.status else {
             return "-".to_string();
         };
@@ -551,365 +339,832 @@ impl App {
             .map(|state| format!("{} on {}", state.id, state.head().label()))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{reference} ({detail})")
+        format!("{reference} (differs: {detail})")
     }
 
-    /// Repositories that are not on the same branch as the majority.
-    pub fn branch_outliers(&self) -> Vec<String> {
-        self.status
-            .as_ref()
-            .map(|status| {
-                status
-                    .inconsistent_branches()
-                    .iter()
-                    .map(|r| format!("{} on {}", r.id, r.head().label()))
-                    .collect()
-            })
-            .unwrap_or_default()
+    // ----------------------------------------------------------- keyboard --
+
+    /// Apply one key. Returns the action to run, if the key asked for one.
+    ///
+    /// While an operation is running ([`busy`](Self::busy) is set) every key is refused.
+    pub fn handle_key(&mut self, key: Key) -> Option<Action> {
+        if key == Key::CtrlC {
+            self.quit = true;
+            return None;
+        }
+        if self.busy.is_some() {
+            return None;
+        }
+        if self.show_help {
+            // Any key closes the help overlay; `q` still quits.
+            self.show_help = false;
+            if key == Key::Char('q') {
+                self.quit = true;
+            }
+            return None;
+        }
+
+        // A pending commit confirmation is answered by Enter/c (confirm) or Esc (cancel);
+        // any other key cancels it, so a confirmation can never outlive the user's intent.
+        if self.confirm_commit {
+            match key {
+                Key::Enter | Key::Char('c') => {
+                    // `accept` consumes the flag when the commit really proceeds.
+                    return Some(Action::Commit);
+                }
+                Key::Esc => {
+                    self.confirm_commit = false;
+                    self.set_notice("commit cancelled");
+                    return None;
+                }
+                _ => {
+                    self.confirm_commit = false;
+                }
+            }
+        }
+
+        match self.focus {
+            Focus::Message => self.handle_message_key(key),
+            Focus::Actions => self.handle_action_key(key),
+        }
+    }
+
+    fn handle_message_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Char(c) if !c.is_control() => {
+                self.message.push(c);
+                None
+            }
+            Key::Backspace => {
+                self.message.pop();
+                None
+            }
+            Key::Tab | Key::Esc => {
+                self.focus = Focus::Actions;
+                None
+            }
+            Key::BackTab => {
+                self.focus = Focus::Actions;
+                None
+            }
+            Key::Enter => Some(Action::Commit),
+            Key::Down | Key::PageDown => {
+                self.scroll_by(1);
+                None
+            }
+            Key::Up | Key::PageUp => {
+                self.scroll_by(-1);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_action_key(&mut self, key: Key) -> Option<Action> {
+        match key {
+            Key::Char('?') => {
+                self.show_help = true;
+                None
+            }
+            Key::Char('q') => {
+                self.quit = true;
+                None
+            }
+            Key::Char('r') => Some(Action::Refresh),
+            Key::Char('d') => {
+                self.dry_run = !self.dry_run;
+                self.set_notice(if self.dry_run {
+                    "dry run on: operations report what they would do and change nothing"
+                } else {
+                    "dry run off: operations change repositories"
+                });
+                None
+            }
+            Key::Char('s') => Some(Action::StageAll),
+            Key::Char('c') => Some(Action::Commit),
+            Key::Char('p') => Some(Action::Pull),
+            Key::Char('P') => Some(Action::Push),
+            Key::Tab | Key::BackTab => {
+                self.focus = Focus::Message;
+                None
+            }
+            Key::Left => {
+                self.button = (self.button + BUTTONS.len() - 1) % BUTTONS.len();
+                None
+            }
+            Key::Right => {
+                self.button = (self.button + 1) % BUTTONS.len();
+                None
+            }
+            Key::Enter => Some(BUTTONS[self.button].action),
+            Key::Up => {
+                self.scroll_by(-1);
+                None
+            }
+            Key::Down => {
+                self.scroll_by(1);
+                None
+            }
+            Key::PageUp => {
+                self.scroll_by(-10);
+                None
+            }
+            Key::PageDown => {
+                self.scroll_by(10);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        let max = self.changes.len().saturating_sub(1) as isize;
+        let next = (self.scroll as isize + delta).clamp(0, max.max(0));
+        self.scroll = next as usize;
+    }
+
+    fn set_notice(&mut self, text: &str) {
+        self.result = Some(ResultView {
+            title: text.to_string(),
+            lines: Vec::new(),
+            problems: false,
+        });
+    }
+
+    /// Decide what happens for an action requested by the user. Returns the action to run
+    /// now, or `None` when the request was refused or needs confirmation first.
+    ///
+    /// This is separate from [`run_action`](Self::run_action) so that the checks are
+    /// visible in tests and so the event loop can draw "working…" before the operation.
+    pub fn accept(&mut self, action: Action) -> Option<Action> {
+        if self.project.is_none() {
+            self.set_notice("no project is open: run `gitmesh init` in your project first");
+            return None;
+        }
+        match action {
+            Action::Commit => {
+                if self.message.trim().is_empty() {
+                    self.focus = Focus::Message;
+                    self.set_notice("write a commit message first");
+                    return None;
+                }
+                let (files, repos) = self.staged_summary();
+                if files == 0 {
+                    self.set_notice(
+                        "nothing is staged: press s (Stage all) to stage the changes first",
+                    );
+                    return None;
+                }
+                if !self.confirm_commit {
+                    self.confirm_commit = true;
+                    self.set_notice(&format!(
+                        "press Enter or c to commit {files} staged file(s) in {repos} repositor{} with this message, Esc to cancel",
+                        if repos == 1 { "y" } else { "ies" }
+                    ));
+                    return None;
+                }
+                self.confirm_commit = false;
+                Some(Action::Commit)
+            }
+            other => Some(other),
+        }
+    }
+
+    /// Apply one key and return the action that is ready to run, if any.
+    ///
+    /// This is the single entry point the event loop uses: [`handle_key`](Self::handle_key)
+    /// followed by [`accept`](Self::accept), so the checks (message, staging, confirmation)
+    /// always apply.
+    pub fn dispatch(&mut self, key: Key) -> Option<Action> {
+        let requested = self.handle_key(key)?;
+        self.accept(requested)
+    }
+
+    /// Run one accepted action through the core and store its result.
+    pub fn run_action(&mut self, action: Action) -> Result<()> {
+        self.busy = Some(action);
+        let outcome = self.execute(action);
+        self.busy = None;
+        outcome
+    }
+
+    fn execute(&mut self, action: Action) -> Result<()> {
+        let Some(project) = self.project.clone() else {
+            return Ok(());
+        };
+        let report = match action {
+            Action::Refresh => {
+                self.result = None;
+                return self.refresh();
+            }
+            Action::StageAll => ops::stage_project(
+                &project,
+                &self.runner,
+                &StageOptions {
+                    selection: RepositorySelection::All,
+                    dry_run: self.dry_run,
+                },
+            )?,
+            Action::Commit => {
+                let options = CommitOptions {
+                    selection: RepositorySelection::All,
+                    dry_run: self.dry_run,
+                    ..CommitOptions::staged(self.message.clone())
+                };
+                let report = ops::commit_project(&project, &self.runner, &options)?;
+                if !self.dry_run && report.is_success() && report.counts().0 > 0 {
+                    self.message.clear();
+                }
+                report
+            }
+            Action::Pull => {
+                let mut options = SyncOptions::new();
+                options.dry_run = self.dry_run;
+                ops::pull_project(&project, &self.runner, &options)?
+            }
+            Action::Push => {
+                let options = PushOptions {
+                    selection: RepositorySelection::All,
+                    dry_run: self.dry_run,
+                    set_upstream: true,
+                    default_remote: "origin".to_string(),
+                };
+                ops::push_project(&project, &self.runner, &options)?
+            }
+        };
+        self.result = Some(result_view(action, &report));
+        self.refresh()
+    }
+
+    /// Convenience for tests and simple callers: accept and run in one step.
+    pub fn press(&mut self, action: Action) -> Result<()> {
+        if let Some(accepted) = self.accept(action) {
+            self.run_action(accepted)?;
+        }
+        Ok(())
+    }
+
+    /// True when the last operation had problems (for the exit state of the UI).
+    pub fn last_operation_had_problems(&self) -> bool {
+        self.result.as_ref().is_some_and(|r| r.problems)
     }
 }
 
-/// Flatten the scanned tree into visible rows, annotating configured ownership.
-fn collect_rows(
-    node: &DirectoryNode,
-    depth: usize,
-    project: Option<&GitMeshProject>,
-    rows: &mut Vec<TreeRow>,
-) {
-    let owner = project.and_then(|project| {
-        project
-            .repository_for_relative(&node.relative_path)
-            .filter(|repo| !repo.is_root() || node.relative_path == Path::new("."))
-    });
-    rows.push(TreeRow {
-        depth,
-        name: node.name.clone(),
-        relative_path: node.relative_path.clone(),
-        is_repository_root: node.is_repository_root,
-        repository_id: owner.map(|repo| repo.id.clone()),
-        is_external: owner.is_some_and(|repo| repo.role == RepositoryRole::External),
-        file_count: node.file_count,
-        truncated: node.truncated,
-    });
-    for child in &node.children {
-        collect_rows(child, depth + 1, project, rows);
+/// Two-character git-style code for a status entry.
+fn two_letter_code(entry: &crate::git::StatusEntry) -> String {
+    if entry.untracked {
+        return "??".to_string();
+    }
+    if entry.unmerged.is_some() {
+        return "UU".to_string();
+    }
+    let letter = |kind: Option<ChangeKind>| match kind {
+        Some(ChangeKind::Added) => 'A',
+        Some(ChangeKind::Modified) => 'M',
+        Some(ChangeKind::Deleted) => 'D',
+        Some(ChangeKind::Renamed) => 'R',
+        Some(ChangeKind::Copied) => 'C',
+        Some(ChangeKind::TypeChanged) => 'T',
+        Some(ChangeKind::Unmerged) => 'U',
+        _ => ' ',
+    };
+    format!("{}{}", letter(entry.index), letter(entry.worktree))
+}
+
+/// Build the result panel content for one operation's report.
+pub fn result_view(action: Action, report: &OperationReport) -> ResultView {
+    let (ok, skipped, conflict, failed) = report.counts();
+    let problems_count = conflict + failed;
+    let total = report.outcomes.len();
+    let problems = problems_count > 0;
+
+    let verdict = if report.dry_run {
+        "dry run: nothing was changed".to_string()
+    } else if problems {
+        format!(
+            "NOT everything succeeded: {problems_count} of {total} repositor{} need attention",
+            if total == 1 { "y" } else { "ies" }
+        )
+    } else if ok == 0 {
+        "nothing to do".to_string()
+    } else {
+        format!(
+            "done in {ok} repositor{}",
+            if ok == 1 { "y" } else { "ies" }
+        )
+    };
+    let title = format!("{}: {verdict}", action.label());
+
+    let mut lines = Vec::new();
+    for outcome in &report.outcomes {
+        lines.push(format!(
+            "{} {}  {}",
+            outcome.kind.symbol(),
+            outcome.id,
+            outcome.summary
+        ));
+        for detail in &outcome.details {
+            lines.push(format!("    {detail}"));
+        }
+    }
+    if skipped > 0 && ok + problems_count == 0 {
+        lines.push("skipped repositories are not failures: they have no remote to use".to_string());
+    }
+    ResultView {
+        title,
+        lines,
+        problems,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_advertised_button_key_is_bound() {
+        // The action bar advertises these keys; each must map to its action.
+        for button in BUTTONS {
+            let mut app = fake_app();
+            let action = app.handle_key(Key::Char(button.key));
+            assert_eq!(action, Some(button.action), "key {}", button.key);
+        }
+    }
+
+    #[test]
+    fn every_advertised_shortcut_has_a_binding() {
+        for (keys, _) in SHORTCUTS
+            .iter()
+            .filter(|(k, _)| k.len() == 1 && !k.contains(' '))
+        {
+            let c = keys.chars().next().unwrap();
+            let mut app = fake_app();
+            app.show_help = false;
+            // `q` quits, `?` opens help; everything else returns an action or changes state.
+            let before = (app.dry_run, app.show_help, app.quit);
+            let action = app.handle_key(Key::Char(c));
+            let after = (app.dry_run, app.show_help, app.quit);
+            assert!(
+                action.is_some() || before != after,
+                "advertised key '{c}' does nothing"
+            );
+        }
+    }
+
+    pub(crate) fn fake_app() -> App {
+        App {
+            runner: GitRunner::detect().expect("git is installed for tests"),
+            start_dir: PathBuf::from("."),
+            project: None,
+            status: None,
+            changes: Vec::new(),
+            scroll: 0,
+            message: String::new(),
+            focus: Focus::Actions,
+            button: 0,
+            dry_run: false,
+            show_help: false,
+            quit: false,
+            result: None,
+            confirm_commit: false,
+            busy: None,
+            open_error: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    //! Key-driven workflows over real temporary repositories.
+    use super::*;
     use crate::testkit::RepoFixture;
 
-    fn app_for(fixture: &RepoFixture) -> App {
-        App::new(fixture.path(), false).expect("app")
+    /// Open the fixture project in the state machine.
+    fn open(fixture: &RepoFixture, dry_run: bool) -> App {
+        App::new(fixture.path(), dry_run).expect("open project")
     }
 
-    #[test]
-    fn opens_an_existing_project() {
+    /// Press one key and run whatever it asks for, as the event loop does.
+    fn press(app: &mut App, key: Key) {
+        if let Some(action) = app.dispatch(key) {
+            app.run_action(action).expect("operation");
+        }
+    }
+
+    /// Focus the message field, type, and leave it again (as a user would).
+    fn type_text(app: &mut App, text: &str) {
+        press(app, Key::Tab);
+        for c in text.chars() {
+            press(app, Key::Char(c));
+        }
+        press(app, Key::Tab);
+    }
+
+    fn commits(fixture: &RepoFixture, repo: &str) -> usize {
+        fixture
+            .git_ok(repo, &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A project with a root and one nested repository, both with uncommitted changes.
+    fn two_repo_fixture() -> RepoFixture {
         let fixture = RepoFixture::new();
         fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let app = app_for(&fixture);
-        assert_eq!(app.screen, Screen::Project);
-        assert!(!app.project.as_ref().unwrap().name.is_empty());
-        assert_eq!(app.project.as_ref().unwrap().root_repository().id, "root");
-        assert!(app.status.is_some());
+        fixture.write("README.md", "root\n");
+        fixture.write("engine/src/lib.rs", "engine\n");
+        fixture
     }
 
     #[test]
-    fn starts_in_setup_when_no_project_exists() {
-        let fixture = RepoFixture::new();
-        std::fs::create_dir_all(fixture.path().join("engine")).unwrap();
-        assert!(!fixture.path().join(".gitmesh").exists());
-        let app = app_for(&fixture);
-        assert_eq!(app.screen, Screen::Setup);
-        assert!(app.scan.is_some());
-        // The tree is visible so the user can inspect it before configuring anything.
+    fn stage_all_then_commit_commits_each_repository_with_one_message() {
+        let fixture = two_repo_fixture();
+        let before_root = commits(&fixture, ".");
+        let before_engine = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
+        assert_eq!(app.change_count(), 2, "{:?}", app.changes);
+        press(&mut app, Key::Char('s'));
+        assert_eq!(
+            app.staged_summary().1,
+            2,
+            "both repositories have staged work"
+        );
+
+        type_text(&mut app, "tidy");
+        press(&mut app, Key::Char('c'));
+        assert!(app.confirm_commit, "commit asks for confirmation first");
+        assert_eq!(
+            commits(&fixture, "engine"),
+            before_engine,
+            "nothing committed before confirming"
+        );
+
+        press(&mut app, Key::Enter);
+        assert!(!app.confirm_commit);
+        assert_eq!(commits(&fixture, "engine"), before_engine + 1);
+        assert_eq!(commits(&fixture, "."), before_root + 1);
+        assert_eq!(
+            fixture
+                .git_ok("engine", &["log", "-1", "--pretty=%s"])
+                .trim(),
+            "tidy"
+        );
+        assert_eq!(
+            fixture.git_ok(".", &["log", "-1", "--pretty=%s"]).trim(),
+            "tidy"
+        );
+        let result = app.result.as_ref().unwrap();
+        assert!(!result.problems, "{result:?}");
+        assert!(
+            result.title.starts_with("Commit: done in 2 repositories"),
+            "{}",
+            result.title
+        );
+        assert!(
+            app.message.is_empty(),
+            "the message is cleared after a successful commit"
+        );
+    }
+
+    #[test]
+    fn an_empty_message_never_commits() {
+        let fixture = two_repo_fixture();
+        let before = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Char('s'));
+        press(&mut app, Key::Char('c'));
+        assert!(!app.confirm_commit);
+        assert_eq!(
+            app.focus,
+            Focus::Message,
+            "the empty field is where the user must go"
+        );
+        press(&mut app, Key::Enter);
+        assert_eq!(commits(&fixture, "engine"), before);
         assert!(app
-            .rows
-            .iter()
-            .any(|row| row.relative_path == Path::new("engine")));
+            .result
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("write a commit message"));
+
+        // Whitespace only is still empty.
+        type_text(&mut app, "   ");
+        press(&mut app, Key::Char('c'));
+        assert!(!app.confirm_commit);
+        assert_eq!(commits(&fixture, "engine"), before);
     }
 
     #[test]
-    fn setup_creates_a_project_and_marks_repositories() {
-        let fixture = RepoFixture::new();
-        fixture.init_repo("engine");
-        fixture.write("engine/README.md", "# engine\n");
-        fixture.commit("engine", "initial commit");
-        let mut app = app_for(&fixture);
-        assert_eq!(app.screen, Screen::Setup);
-
-        // Saving the configuration creates the manifest and switches to the project.
-        app.create_project_from_scan().unwrap();
-        assert_eq!(app.screen, Screen::Project);
-        assert!(fixture.path().join(".gitmesh/project.toml").exists());
-
-        // Select the engine directory and mark it as an external repository.
-        let index = app
-            .rows
-            .iter()
-            .position(|row| row.relative_path == Path::new("engine"))
-            .unwrap();
-        app.selected = index;
-        app.assign_selected().unwrap();
-
-        let project = app.project.as_ref().unwrap();
-        let engine = project
-            .repository_for_relative(Path::new("engine"))
-            .unwrap();
-        assert_eq!(engine.id, "engine");
-        assert!(!engine.is_root());
-        // The decision is persisted.
-        let reloaded = manifest::load_from_root(fixture.path()).unwrap();
-        assert!(reloaded.repository("engine").is_some());
+    fn commit_without_staged_changes_explains_how_to_proceed() {
+        let fixture = two_repo_fixture();
+        let before = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
+        type_text(&mut app, "nothing staged yet");
+        press(&mut app, Key::Char('c'));
+        assert!(!app.confirm_commit);
+        let title = &app.result.as_ref().unwrap().title;
+        assert!(title.contains("nothing is staged"), "{title}");
+        assert_eq!(commits(&fixture, "engine"), before);
     }
 
     #[test]
-    fn unassigning_returns_the_directory_to_the_root_repository() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let mut app = app_for(&fixture);
-        let index = app
-            .rows
-            .iter()
-            .position(|row| row.relative_path == Path::new("engine"))
-            .unwrap();
-        app.selected = index;
-        app.unassign_selected().unwrap();
-        let project = app.project.as_ref().unwrap();
-        assert!(project.repository("engine").is_none());
-        assert!(
-            fixture.path().join("engine/.git").exists(),
-            "files untouched"
-        );
+    fn cancelling_or_any_other_key_drops_the_pending_commit() {
+        let fixture = two_repo_fixture();
+        let before = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Char('s'));
+        type_text(&mut app, "maybe");
+        press(&mut app, Key::Char('c'));
+        assert!(app.confirm_commit);
+        press(&mut app, Key::Esc);
+        assert!(!app.confirm_commit);
+        assert_eq!(commits(&fixture, "engine"), before);
+
+        // Any non-confirming key cancels too, so the confirmation cannot go stale.
+        press(&mut app, Key::Char('c'));
+        assert!(app.confirm_commit);
+        press(&mut app, Key::Right);
+        assert!(!app.confirm_commit);
+        assert_eq!(commits(&fixture, "engine"), before);
     }
 
     #[test]
-    fn unassigning_refuses_when_files_would_go_back_to_the_root_repository() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", ".")]);
-        // The root repository starts by tracking a file that later belongs to the external
-        // repository (the order a real project grows in). Removing the external entry would
-        // hand that file back to the root repository, which needs an explicit confirmation.
-        fixture.write("engine/lib.rs", "pub fn go() {}\n");
-        fixture.add_all(".");
-        fixture.commit(".", "root tracks engine/lib.rs");
-        fixture.init_repo("engine");
-        let project = fixture.load_project();
-        let options = discovery::AssignOptions {
-            id: None,
-            remote_url: None,
-            init_git: false,
-            branch: None,
-        };
-        let updated =
-            discovery::assign_repository(&project, Path::new("engine"), &options, fixture.runner())
-                .unwrap();
-        manifest::save_project(&updated).unwrap();
-
-        let mut app = app_for(&fixture);
-        let index = app
-            .rows
-            .iter()
-            .position(|row| row.relative_path == Path::new("engine"))
-            .unwrap();
-        app.selected = index;
-        app.unassign_selected().unwrap();
-
-        // The terminal refuses: the repository stays configured, and the reason and the
-        // explicit way to confirm it are on screen.
-        assert!(
-            app.project.as_ref().unwrap().repository("engine").is_some(),
-            "a refused removal changes nothing"
-        );
-        assert!(
-            app.log
-                .iter()
-                .any(|line| line.contains("cannot remove 'engine'") && line.contains("1 file(s)")),
-            "{:?}",
-            app.log
-        );
-        assert!(
-            app.log
-                .iter()
-                .any(|line| line.contains("--confirm-takeover")),
-            "{:?}",
-            app.log
-        );
-        assert!(
-            fixture.path().join("engine/.git").exists(),
-            "files untouched"
-        );
-        assert_eq!(
-            fixture.git_ok(".", &["ls-files", "--", "engine"]).trim(),
-            "engine/lib.rs",
-            "and the root repository still owns it"
-        );
-        let manifest_now = manifest::load_from_root(fixture.path()).unwrap();
-        assert!(
-            manifest_now.repository("engine").is_some(),
-            "the manifest is unchanged"
-        );
-    }
-
-    #[test]
-    fn commit_from_the_ui_commits_every_repository() {
+    fn a_conflicted_repository_is_reported_and_never_called_a_success() {
         let fixture = RepoFixture::new();
         fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        fixture.write("src/main.rs", "root");
-        fixture.write("engine/src/lib.rs", "engine");
+        fixture.create_conflict("engine", "src/shared.txt");
+        fixture.write("README.md", "root\n");
+        let before_root = commits(&fixture, ".");
+        let before_engine = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
 
-        let mut app = app_for(&fixture);
-        app.run_commit("ui commit").unwrap();
-        assert!(fixture
-            .git_ok(".", &["log", "-1", "--pretty=%s"])
-            .contains("ui commit"));
-        assert!(fixture
-            .git_ok("engine", &["log", "-1", "--pretty=%s"])
-            .contains("ui commit"));
-        assert!(!app.last_operation_had_problems());
+        press(&mut app, Key::Char('s'));
+        let result = app.result.clone().unwrap();
+        assert!(result.problems);
+        assert!(
+            result.title.contains("NOT everything succeeded"),
+            "{}",
+            result.title
+        );
+        assert!(
+            result.lines.iter().any(|l| l.starts_with("! engine")),
+            "{:?}",
+            result.lines
+        );
+
+        type_text(&mut app, "partial");
+        press(&mut app, Key::Char('c'));
+        press(&mut app, Key::Enter);
+        let result = app.result.clone().unwrap();
+        assert!(result.problems);
+        assert!(
+            result.title.contains("NOT everything succeeded"),
+            "{}",
+            result.title
+        );
+        assert!(
+            result.lines.iter().any(|l| l.starts_with("! engine")),
+            "{:?}",
+            result.lines
+        );
+        // The root committed its staged file; the conflicted repository did not.
+        assert_eq!(commits(&fixture, "."), before_root + 1);
+        assert_eq!(commits(&fixture, "engine"), before_engine);
     }
 
     #[test]
-    fn dry_run_mode_changes_nothing() {
+    fn a_local_only_repository_is_skipped_for_push_not_failed() {
         let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", ".")]);
-        fixture.write("src/main.rs", "content");
-        let before = fixture.git_ok(".", &["rev-parse", "HEAD"]);
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.publish(".", "root.git");
+        fixture.write_and_commit("README.md", "root commit\n");
+        let mut app = open(&fixture, false);
 
-        let mut app = App::new(fixture.path(), true).unwrap();
-        app.run_commit("dry ui commit").unwrap();
-        assert_eq!(fixture.git_ok(".", &["rev-parse", "HEAD"]), before);
+        press(&mut app, Key::Char('P'));
+        let result = app.result.clone().unwrap();
+        assert!(!result.problems, "{result:?}");
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.starts_with("- engine") && l.contains("no remote")),
+            "{:?}",
+            result.lines
+        );
+    }
+
+    #[test]
+    fn a_failed_push_next_to_a_successful_one_is_a_partial_failure() {
+        let fixture = RepoFixture::new();
+        fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.publish(".", "root.git");
+        fixture.publish("engine", "engine.git");
+        fixture.write_and_commit("README.md", "root\n");
+        fixture.write_and_commit("engine/src/lib.rs", "engine\n");
+        // The engine's remote disappears: its push must fail and be reported as such.
+        fixture.git_ok(
+            "engine",
+            &["remote", "set-url", "origin", "/nonexistent/gone.git"],
+        );
+        let mut app = open(&fixture, false);
+
+        press(&mut app, Key::Char('P'));
+        let result = app.result.clone().unwrap();
+        assert!(result.problems, "{result:?}");
+        assert!(
+            result.title.contains("NOT everything succeeded"),
+            "{}",
+            result.title
+        );
+        assert!(
+            result.lines.iter().any(|l| l.starts_with("✓ root")),
+            "{:?}",
+            result.lines
+        );
+        assert!(
+            result.lines.iter().any(|l| l.starts_with("✗ engine")),
+            "{:?}",
+            result.lines
+        );
+    }
+
+    #[test]
+    fn dry_run_commit_changes_nothing() {
+        let fixture = two_repo_fixture();
+        let before = commits(&fixture, "engine");
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Char('s'));
+        let staged_before = fixture.git_ok("engine", &["diff", "--cached", "--name-only"]);
+
+        press(&mut app, Key::Char('d'));
         assert!(app.dry_run);
-    }
-
-    #[test]
-    fn push_and_pull_are_available_from_the_ui() {
-        let fixture = RepoFixture::new();
-        let project = fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        fixture.publish(".", "remotes/root.git");
-        fixture.publish("engine", "remotes/engine.git");
-        let mut app = app_for(&fixture);
-
-        fixture.write_and_commit("src/main.rs", "x");
-        app.run_push().unwrap();
-        assert!(!app.last_operation_had_problems(), "{:?}", app.log);
-
-        app.run_pull().unwrap();
-        assert!(!app.last_operation_had_problems(), "{:?}", app.log);
-        assert!(project.repository("engine").is_some());
-    }
-
-    #[test]
-    fn branch_workflow_from_the_ui() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let mut app = app_for(&fixture);
-        app.run_branch(BranchAction::Checkout {
-            name: "feature/ui".into(),
-            create: true,
-        })
-        .unwrap();
-        assert_eq!(
-            fixture
-                .git_ok(".", &["symbolic-ref", "--short", "HEAD"])
-                .trim(),
-            "feature/ui"
+        type_text(&mut app, "dry");
+        press(&mut app, Key::Char('c'));
+        press(&mut app, Key::Enter);
+        let result = app.result.clone().unwrap();
+        assert!(
+            result.title.starts_with("Commit: dry run"),
+            "{}",
+            result.title
         );
+        assert!(!result.problems);
+        assert_eq!(commits(&fixture, "engine"), before);
         assert_eq!(
-            fixture
-                .git_ok("engine", &["symbolic-ref", "--short", "HEAD"])
-                .trim(),
-            "feature/ui"
-        );
-        assert_eq!(app.logical_branch(), "feature/ui");
-    }
-
-    #[test]
-    fn reports_split_branches_clearly() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        fixture.git_ok("engine", &["checkout", "-q", "-b", "side"]);
-        let app = app_for(&fixture);
-        // The root repository decides the project branch; engine is reported as out of
-        // step in the label itself.
-        assert_eq!(app.logical_branch(), "main (engine on side)");
-        let outliers = app.branch_outliers();
-        assert_eq!(outliers.len(), 1, "{outliers:?}");
-        assert!(outliers[0].contains("engine"));
-    }
-
-    #[test]
-    fn status_shows_which_repository_owns_a_change() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        fixture.write("engine/src/lib.rs", "changed");
-        let mut app = app_for(&fixture);
-        app.refresh_status().unwrap();
-        let project = app.project.as_ref().unwrap();
-        let analyzer = Analyzer::new(project, &app.runner);
-        let status = app.status.as_ref().unwrap();
-        let changes = analyzer.owned_changes(status);
-        assert!(changes
-            .iter()
-            .any(|c| c.repository_id == "engine" && c.logical_path == "engine/src/lib.rs"));
-    }
-
-    #[test]
-    fn input_flow_applies_a_remote_url() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let mut app = app_for(&fixture);
-        let index = app
-            .rows
-            .iter()
-            .position(|row| row.relative_path == Path::new("engine"))
-            .unwrap();
-        app.selected = index;
-
-        app.begin_input(InputKind::RemoteUrl);
-        app.input = "git@github.com:acme/engine.git".into();
-        app.submit_input().unwrap();
-
-        let reloaded = manifest::load_from_root(fixture.path()).unwrap();
-        assert_eq!(
-            reloaded.repository("engine").unwrap().remote_url.as_deref(),
-            Some("git@github.com:acme/engine.git")
+            fixture.git_ok("engine", &["diff", "--cached", "--name-only"]),
+            staged_before
         );
     }
 
     #[test]
-    fn invalid_input_is_reported_without_panicking() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", ".")]);
-        let mut app = app_for(&fixture);
-        app.begin_input(InputKind::Directory);
-        app.input = "/definitely/not/a/directory".into();
-        app.submit_input().unwrap();
-        assert!(app.log.iter().any(|l| l.contains("not a directory")));
-        assert_eq!(app.screen, Screen::Project);
-    }
-
-    #[test]
-    fn excluded_repositories_are_left_alone() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[
-            ("root", "."),
-            ("engine", "engine"),
-            ("renderer", "renderer"),
-        ]);
-        let mut app = app_for(&fixture);
-        app.excluded = vec!["engine".into()];
-        app.run_branch(BranchAction::Create {
-            name: "feature/skip".into(),
-        })
-        .unwrap();
-        assert!(!fixture
-            .git_ok("engine", &["branch", "--list", "feature/skip"])
-            .contains("feature/skip"));
+    fn dry_run_stage_all_changes_nothing() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, true);
+        press(&mut app, Key::Char('s'));
+        let result = app.result.clone().unwrap();
+        assert!(
+            result.title.starts_with("Stage all: dry run"),
+            "{}",
+            result.title
+        );
+        assert_eq!(app.staged_summary().0, 0);
         assert!(fixture
-            .git_ok("renderer", &["branch", "--list", "feature/skip"])
-            .contains("feature/skip"));
+            .git_ok("engine", &["diff", "--cached", "--name-only"])
+            .trim()
+            .is_empty());
+    }
+
+    #[test]
+    fn toggling_dry_run_is_visible_state() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Char('d'));
+        assert!(app.dry_run);
+        press(&mut app, Key::Char('d'));
+        assert!(!app.dry_run);
+    }
+
+    #[test]
+    fn keys_are_refused_while_an_operation_is_running() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        app.busy = Some(Action::Push);
+        assert_eq!(app.dispatch(Key::Char('s')), None);
+        assert_eq!(app.dispatch(Key::Char('q')), None);
+        assert!(!app.quit);
+        assert_eq!(app.staged_summary().0, 0);
+    }
+
+    #[test]
+    fn typing_in_the_message_never_triggers_shortcuts() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Tab);
+        assert_eq!(app.focus, Focus::Message);
+        for c in "spscpdq".chars() {
+            press(&mut app, Key::Char(c));
+        }
+        assert_eq!(app.message, "spscpdq");
+        assert!(!app.quit && !app.dry_run);
+        assert_eq!(
+            app.staged_summary().0,
+            0,
+            "letters typed in the message stage nothing"
+        );
+        press(&mut app, Key::Esc);
+        assert_eq!(app.focus, Focus::Actions);
+    }
+
+    #[test]
+    fn focus_and_buttons_navigate_without_side_effects() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        assert_eq!(app.focus, Focus::Actions);
+        press(&mut app, Key::Right);
+        press(&mut app, Key::Right);
+        assert_eq!(BUTTONS[app.button].action, Action::Pull);
+        press(&mut app, Key::Left);
+        press(&mut app, Key::Left);
+        press(&mut app, Key::Left);
+        assert_eq!(
+            BUTTONS[app.button].action,
+            Action::Push,
+            "left wraps around"
+        );
+        assert_eq!(app.staged_summary().0, 0);
+    }
+
+    #[test]
+    fn enter_on_a_selected_button_runs_that_button() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Right); // Commit
+        press(&mut app, Key::Enter);
+        assert!(app
+            .result
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("write a commit message"));
+        assert_eq!(app.focus, Focus::Message);
+        press(&mut app, Key::Tab);
+        press(&mut app, Key::Left); // Stage all
+        press(&mut app, Key::Enter);
+        assert!(app.staged_summary().0 > 0);
+    }
+
+    #[test]
+    fn the_change_list_groups_files_by_owning_repository() {
+        let fixture = two_repo_fixture();
+        let app = open(&fixture, false);
+        let headers = app
+            .changes
+            .iter()
+            .filter(|l| matches!(l, ChangeLine::Repository { .. }))
+            .count();
+        assert_eq!(headers, 2);
+        let engine_index = app
+            .changes
+            .iter()
+            .position(|l| matches!(l, ChangeLine::Repository { id, .. } if id == "engine"))
+            .unwrap();
+        match &app.changes[engine_index + 1] {
+            ChangeLine::File { code, path, staged } => {
+                assert_eq!(code, "??");
+                assert_eq!(path, "src/lib.rs");
+                assert!(!staged);
+            }
+            other => panic!("expected a file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_closes_on_any_key_and_q_quits_only_from_the_main_screen() {
+        let fixture = two_repo_fixture();
+        let mut app = open(&fixture, false);
+        press(&mut app, Key::Char('?'));
+        assert!(app.show_help);
+        press(&mut app, Key::Char('s'));
+        assert!(!app.show_help);
+        assert_eq!(
+            app.staged_summary().0,
+            0,
+            "the key that closed help did nothing else"
+        );
+        press(&mut app, Key::Char('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn opening_outside_a_project_explains_instead_of_failing() {
+        let fixture = RepoFixture::new();
+        let app = App::new(fixture.path(), false).unwrap();
+        assert!(app.project.is_none());
+        assert!(app
+            .open_error
+            .as_deref()
+            .unwrap()
+            .contains("no GitMesh project"));
     }
 }

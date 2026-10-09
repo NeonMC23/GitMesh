@@ -34,6 +34,11 @@ pub struct CommitOptions {
     pub include_untracked: bool,
     /// Skip the "nothing to commit" repositories entirely instead of listing them.
     pub quiet_clean: bool,
+    /// Commit only what is already staged; never stage automatically.
+    ///
+    /// Used by front ends that stage explicitly (see [`stage_project`](super::stage_project)),
+    /// so the user sees the staged set before committing.
+    pub staged_only: bool,
 }
 
 impl CommitOptions {
@@ -45,6 +50,15 @@ impl CommitOptions {
             dry_run: false,
             include_untracked: true,
             quiet_clean: false,
+            staged_only: false,
+        }
+    }
+
+    /// Options that commit only the changes already staged in each repository.
+    pub fn staged(message: impl Into<String>) -> Self {
+        CommitOptions {
+            staged_only: true,
+            ..CommitOptions::new(message)
         }
     }
 }
@@ -146,17 +160,27 @@ fn commit_one(
             }
         })
         .filter(|entry| options.include_untracked || !entry.untracked)
+        .filter(|entry| !options.staged_only || entry.staged)
         .map(|entry| entry.path.clone())
         .collect();
 
     if owned.is_empty() {
-        return base(OutcomeKind::Skipped, "nothing to commit".to_string());
+        let message = if options.staged_only {
+            "nothing staged to commit"
+        } else {
+            "nothing to commit"
+        };
+        return base(OutcomeKind::Skipped, message.to_string());
     }
 
     if options.dry_run {
         return base(
             OutcomeKind::Success,
-            format!("would stage and commit {} file(s)", owned.len()),
+            if options.staged_only {
+                format!("would commit {} staged file(s)", owned.len())
+            } else {
+                format!("would stage and commit {} file(s)", owned.len())
+            },
         )
         .with_details(
             owned
@@ -168,9 +192,11 @@ fn commit_one(
     }
 
     // ---- stage -------------------------------------------------------------
-    if let Err(err) = stage_all(project, repo, git) {
-        return base(OutcomeKind::Failed, "staging failed".to_string())
-            .with_detail(err.to_string());
+    if !options.staged_only {
+        if let Err(err) = stage_all(project, repo, git) {
+            return base(OutcomeKind::Failed, "staging failed".to_string())
+                .with_detail(err.to_string());
+        }
     }
 
     let mut details: Vec<String> = Vec::new();
@@ -570,5 +596,55 @@ mod tests {
         };
         let err = commit_project(&project, fixture.runner(), &options).unwrap_err();
         assert!(err.to_string().contains("unknown repository id"));
+    }
+
+    #[test]
+    fn staged_only_commits_what_is_staged_and_leaves_the_rest_alone() {
+        let fixture = RepoFixture::new();
+        let project = fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.write("engine/src/a.rs", "a\n");
+        fixture.write("engine/src/b.rs", "b\n");
+        fixture.git_ok("engine", &["add", "src/a.rs"]);
+
+        let report =
+            commit_project(&project, fixture.runner(), &CommitOptions::staged("only a")).unwrap();
+        assert!(report.is_success(), "{report:?}");
+        let engine = report.outcomes.iter().find(|o| o.id == "engine").unwrap();
+        assert_eq!(engine.kind, OutcomeKind::Success);
+        assert!(engine.summary.contains("1 file(s)"), "{}", engine.summary);
+
+        // a.rs is committed; b.rs was never staged and stays untracked.
+        let files = fixture.git_ok("engine", &["show", "--name-only", "--pretty=", "HEAD"]);
+        assert_eq!(files.trim(), "src/a.rs");
+        let status = fixture.git_ok("engine", &["status", "--porcelain"]);
+        assert!(status.contains("?? src/b.rs"), "{status}");
+    }
+
+    #[test]
+    fn staged_only_skips_repositories_with_nothing_staged() {
+        let fixture = RepoFixture::new();
+        let project = fixture.project_with(&[("root", "."), ("engine", "engine")]);
+        fixture.write("engine/src/a.rs", "a\n");
+        fixture.write("README.md", "root\n");
+
+        let report = commit_project(
+            &project,
+            fixture.runner(),
+            &CommitOptions::staged("nothing"),
+        )
+        .unwrap();
+        assert!(report.is_success());
+        assert_eq!(report.counts().0, 0, "{report:?}");
+        for outcome in &report.outcomes {
+            assert_eq!(outcome.kind, OutcomeKind::Skipped);
+            assert_eq!(outcome.summary, "nothing staged to commit");
+        }
+        // Nothing was committed anywhere.
+        assert_eq!(
+            fixture
+                .git_ok("engine", &["rev-list", "--count", "HEAD"])
+                .trim(),
+            "1"
+        );
     }
 }

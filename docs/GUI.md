@@ -56,17 +56,20 @@ MyProject                          branch  main        modified
     tools/            1 file     [repo]
 ```
 
-* **Status** — the project tree with the repository boundaries marked, and a table with
+* **Overview** — one line that says what to do next (for example *5 changed files not
+  committed yet* with a button that opens Changes), a collapsed note explaining the
+  project model, the project tree with the repository boundaries marked, and a table with
   one row per repository: id, branch, state, and what is going on in it.
 * **Changes** — one list of changed files with their *logical* path (`engine/src/lib.rs`),
   their change type, and the physical repository that owns them. Optional grouping by
-  repository makes the mapping explicit without making it the default.
-* **Commit** — the repositories that will receive a commit, the ones that cannot (with
-  the reason), one message box, one button.
+  repository makes the mapping explicit without making it the default. The **Commit** card
+  sits directly below the list it commits: the repositories that will receive a commit, the
+  ones that cannot (with the reason), one message box, one button.
 * **Branches** — the logical branch, every branch across the project (which repositories
   have it, which have it checked out), and create / switch / merge / delete actions.
-* **Pull / Push** — the pull strategy selector plus fetch, pull and push, with the
-  ahead/behind state of every repository.
+* **Sync** — the pull strategy selector plus fetch, pull and push, with the
+  ahead/behind state of every repository. Repositories without a remote are reported as
+  skipped, not as failures.
 * **Project** — read-only project information: name, root, manifest, repositories, paths,
   remotes, and any notices GitMesh produced.
 * **Repositories** — the project's physical boundaries, and the place where they are
@@ -250,11 +253,13 @@ every 15 seconds while it is visible and no operation is running.
 
 ## How the unified commit works
 
-Pressing *Commit the project*:
+Pressing *Commit the project* (in the Changes view) records every change listed there:
 
 1. analyses every repository,
 2. stages the changes of each affected repository (never the files of another
-   repository),
+   repository; the same stage-all that `gitmesh commit` uses, so the CLI and the graphical
+   interface agree). The terminal interface differs on purpose: it commits only what you
+   have staged with *Stage all*, see [TUI.md](TUI.md),
 3. runs one real `git commit` per affected repository with the message you typed,
 4. reports the outcome per repository: `✓ committed`, `– nothing to commit`,
    `✗ failed`, and lists repositories that cannot be committed (conflicts, missing

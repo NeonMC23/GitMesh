@@ -777,6 +777,39 @@ function sampleInspection() {
   equal(GitMesh.managementResultText(null), null, 'no result, nothing to show');
 })();
 
+// --------------------------------------------------------------- overview --
+
+(function nextStepPrioritisesWhatNeedsAttention() {
+  var clean = { repositories: [{ id: 'root', state: { key: 'clean' }, sync: { ahead: 0 } }],
+    changes: [] };
+  var nothing = GitMesh.nextStep(clean);
+  equal(nothing.target, null, 'nothing to do offers no action');
+  equal(nothing.tone, 'ok', 'and is labelled as ok');
+  contains(nothing.text, 'Nothing to do', 'in plain words');
+
+  var changed = { repositories: [{ id: 'root', state: { key: 'modified' }, sync: { ahead: 0 } }],
+    changes: [{ path: 'a.txt' }, { path: 'b.txt' }] };
+  var commit = GitMesh.nextStep(changed);
+  equal(commit.target, 'changes', 'uncommitted changes point to the Changes tab');
+  equal(commit.action, 'Review and commit', 'with the commit action');
+  contains(commit.text, '2 changed files not committed yet', 'counted');
+
+  var pushable = { repositories: [
+    { id: 'root', state: { key: 'clean' }, sync: { ahead: 2, upstream: 'origin/main' } },
+    { id: 'lib', state: { key: 'clean' }, sync: { ahead: 0 } }], changes: [] };
+  var push = GitMesh.nextStep(pushable);
+  equal(push.target, 'sync', 'commits waiting to be pushed point to Sync');
+  contains(push.text, '1 repository with commits waiting', 'counted per repository');
+
+  var conflicted = { repositories: [
+    { id: 'engine', state: { key: 'conflicted' }, sync: { ahead: 1 } }],
+    changes: [{ path: 'x' }] };
+  var conflict = GitMesh.nextStep(conflicted);
+  equal(conflict.tone, 'bad', 'a conflict outranks changes and pushes');
+  equal(conflict.target, 'changes', 'and sends the user to resolve it');
+  contains(conflict.text, '1 repository has conflicts', 'stating the problem');
+})();
+
 // ----------------------------------------------------------------- result --
 
 if (failures.length) {

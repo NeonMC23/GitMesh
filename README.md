@@ -157,10 +157,9 @@ Git repository is *adopted* with its history and remote left exactly as they are
 repository's logical id or recorded remote can be changed; and a repository can be
 **removed from GitMesh without its directory, its `.git`, its history or its remote being
 touched** — a removal that hands files back to the root repository says so and asks for
-confirmation first. `gitmesh ui` offers the same operations in the terminal (a removal that
-would hand files back to the root repository is refused there, and the command that
-confirms it is shown), and
-`gitmesh configure` on the command line — all three drive one service and one plan.
+confirmation first. Repository management is done with `gitmesh configure` on the command
+line or in the graphical interface — both drive one service and one plan. The terminal
+interface (`gitmesh ui`) is deliberately limited to the everyday workflow.
 
 To see the whole workflow run end to end against real repositories and local bare remotes
 (including a genuine cross-repository conflict), use the demo script:
@@ -187,7 +186,7 @@ $ ./examples/demo.sh /tmp/gitmesh-demo
 | `gitmesh fetch` / `gitmesh pull [--strategy ff-only\|merge\|rebase]` | Synchronise the project |
 | `gitmesh push [--dry-run] [--no-set-upstream]` | Push every repository that has commits to push |
 | `gitmesh remotes` | Remotes per repository, provider and GitHub coordinates |
-| `gitmesh ui` | Interactive terminal interface (can also edit the configuration) |
+| `gitmesh ui` | Interactive terminal interface for the everyday workflow: stage, commit, pull, push (see [docs/TUI.md](docs/TUI.md)) |
 | `gitmesh gui [--port N] [--host A] [--allow-host NAME] [--open] [--dry-run]` | Graphical interface served locally in a browser |
 
 Global flags: `-C <path>` (project directory), `--json` (machine-readable output),
@@ -230,7 +229,7 @@ problems in their output but exit `0` as long as the project itself could be rea
 
 GitMesh implements the complete local multi-repository workflow — project creation,
 discovery, configuration, status/ownership, commit, branch/checkout/merge,
-fetch/pull/push — with a command line, a full-screen terminal interface and a local
+fetch/pull/push — with a command line, a minimal full-screen terminal interface and a local
 graphical interface, over a GitHub-aware (but GitHub-independent) provider foundation.
 Creating a project from an ordinary folder is part of the flow now: `gitmesh init` and the
 graphical wizard are two front ends of the same plan-driven setup service, which previews

@@ -129,7 +129,8 @@ Rules that keep the layering honest:
 | `src/setup.rs` | Project creation service: `inspect` (facts about a directory), `SetupRequest` → `SetupPlan` → `SetupResult` → `ValidationReport`, `FirstPublish` (a plan entry the caller runs through the ordinary commit/push), `SetupObserver` for progress |
 | `src/manage.rs` | Repository management after creation: `inspect` (configuration + state on disk + candidates), `RepositoryIntent` (`add` / `remove` / `rename` / `set-remote`) → `RepositoryPlan` → `RepositoryManagementResult`, `RepositoryObserver` for progress, and the safety rules (never delete a `.git`, never move a file, never replace a remote or the manifest silently) |
 | `src/service.rs` | Application layer: `ProjectSession` (open, status, changes, operations), shared presentation vocabulary (`ChangeState`, `RepositoryStateKind`, `ProjectStateKind`, `PendingWork`, `ProjectBranch`), JSON view models (`status_view_json`, `operation_view_json`), `*_observed` operation entry points |
-| `src/ui/` | `app.rs` state machine (terminal-independent), `render.rs` ratatui drawing, `mod.rs` event loop |
+| `src/ui/` | `app.rs` state machine (terminal-independent, one table of keys and actions), `render.rs` ratatui drawing (layout, size fallback), `mod.rs` event loop and key translation |
+| `src/ops/stage.rs` | Repository-scoped *Stage all*: refuses conflicted repositories and repositories with an open merge/rebase |
 | `src/gui/` | `editor.rs` builds the model the interface renders from the service layer, `server.rs` is a minimal HTTP/SSE transport, `asset.rs` embeds the three front-end files, `static/` holds them (page, stylesheet, script, and the script's pure-logic tests) |
 | `src/testkit.rs` | Temporary project/repository fixtures used by unit and integration tests |
 
@@ -184,7 +185,7 @@ spawning per operation, which is irrelevant at project scale.
 
 **Explicit configuration.** GitMesh refuses to guess boundaries because guessing is
 irreversible from the user's point of view. Discovery only *reports*; assignment is an
-explicit action (`gitmesh configure add`, or `A` in the UI), and the result is persisted
+explicit action (`gitmesh configure add`, or the GUI's Repositories tab), and the result is persisted
 in the manifest.
 
 **Manifest as the single source of truth.** Once configured, ownership never depends on

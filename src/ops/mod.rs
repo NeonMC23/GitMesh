@@ -16,6 +16,7 @@
 pub mod branch;
 pub mod commit;
 pub mod push;
+pub mod stage;
 pub mod sync;
 pub mod util;
 
@@ -25,6 +26,7 @@ use crate::model::{PhysicalRepository, RepositoryRole};
 pub use branch::{branch_operation, branch_operation_observed, BranchAction, BranchOptions};
 pub use commit::{commit_project, commit_project_observed, CommitOptions};
 pub use push::{push_project, push_project_observed, PushOptions};
+pub use stage::{stage_project, StageOptions};
 pub use sync::{
     fetch_project, fetch_project_observed, pull_project, pull_project_observed, PullStrategy,
     SyncOptions,

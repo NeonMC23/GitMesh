@@ -332,6 +332,39 @@ var GitMesh = (function () {
 
   // ------------------------------------------------------------------- push --
 
+  // The one most useful next action on the overview, from facts the core already
+  // reported. `target` is the tab the action opens; null when there is nothing to do.
+  function nextStep(model) {
+    var conflicted = (model.repositories || []).filter(function (repo) {
+      return (repo.state || {}).key === 'conflicted';
+    }).length;
+    if (conflicted) {
+      return {
+        tone: 'bad',
+        text: countLabel(conflicted, 'repository', 'repositories') + (conflicted === 1 ? ' has' : ' have') +
+          ' conflicts. Resolve them with Git, then refresh.',
+        target: 'changes', action: 'Open Changes'
+      };
+    }
+    var changes = (model.changes || []).length;
+    if (changes) {
+      return {
+        tone: 'accent',
+        text: countLabel(changes, 'changed file', 'changed files') + ' not committed yet. Review them, write a message, then commit.',
+        target: 'changes', action: 'Review and commit'
+      };
+    }
+    var ahead = pushSummary(model).rows.filter(function (row) { return row.ahead > 0; }).length;
+    if (ahead) {
+      return {
+        tone: 'accent',
+        text: countLabel(ahead, 'repository', 'repositories') + ' with commits waiting to be pushed.',
+        target: 'sync', action: 'Go to Sync'
+      };
+    }
+    return { tone: 'ok', text: 'Nothing to do: every repository matches its last commit.', target: null, action: null };
+  }
+
   function pushSummary(model) {
     var rows = (model.repositories || []).map(function (repo) {
       var sync = repo.sync || {};
@@ -936,6 +969,7 @@ var GitMesh = (function () {
     resultTitle: resultTitle,
     conflictGuidance: conflictGuidance,
     pushSummary: pushSummary,
+    nextStep: nextStep,
     repositoryDetails: repositoryDetails,
     settingsRows: settingsRows,
     inspectionSummary: inspectionSummary,
@@ -1042,6 +1076,7 @@ if (typeof document !== 'undefined') {
       $('project-notices').textContent = notices.join('\n');
 
       renderTree();
+      renderNextStep();
       renderStatus();
       renderChanges();
       renderCommit();
@@ -1077,6 +1112,18 @@ if (typeof document !== 'undefined') {
         html += '<div class="tree-node">' + indent + name + tag + files + truncated + '</div>';
       });
       $('tree').innerHTML = html;
+    }
+
+    function renderNextStep() {
+      var step = GitMesh.nextStep(model);
+      var node = $('next-step');
+      var html = '<span class="text">' + escapeHtml(step.text) + '</span>';
+      if (step.target) {
+        html += '<button class="primary" data-go="' + escapeHtml(step.target) + '">' +
+          escapeHtml(step.action) + '</button>';
+      }
+      node.className = 'next-step tone-' + step.tone;
+      node.innerHTML = html;
     }
 
     function renderStatus() {
@@ -1154,7 +1201,7 @@ if (typeof document !== 'undefined') {
             escapeHtml(repo.path) + '</span> — ' +
             (repo.conflicts ? repo.conflicts + ' conflict(s)' : 'unavailable') + '</li>';
         });
-        html += '</ul><p class="hint">Resolve these with Git (see the Status tab) and refresh; ' +
+        html += '</ul><p class="hint">Resolve these with Git (see the Overview tab) and refresh; ' +
           'the other repositories are unaffected.</p>';
       }
       $('commit-targets').innerHTML = html;
@@ -2653,6 +2700,14 @@ if (typeof document !== 'undefined') {
         // its state when it is opened rather than on every refresh.
         if (tab.dataset.tab === 'repos') { loadRepositories(); }
       });
+    });
+
+    // The overview's next-step button opens the tab it names, through the same tab wiring.
+    $('next-step').addEventListener('click', function (event) {
+      var target = event.target.closest ? event.target.closest('[data-go]') : null;
+      if (target) {
+        document.querySelector('.tab[data-tab="' + target.dataset.go + '"]').click();
+      }
     });
 
     $('btn-refresh').addEventListener('click', refresh);

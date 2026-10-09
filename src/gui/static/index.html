@@ -15,7 +15,7 @@
     <span class="brand-name">GitMesh</span>
     <span class="tagline">one project, many repositories</span>
   </div>
-  <div class="topbar-right">
+  <div class="topbar-right" role="toolbar" aria-label="Project actions">
     <span id="dry-run-badge" class="badge badge-warn" hidden>dry run</span>
     <button id="btn-refresh" class="ghost" title="Re-read the project (R)">Refresh</button>
     <button id="btn-open" class="ghost" title="Open another GitMesh project">Open…</button>
@@ -46,25 +46,32 @@
     <p id="project-notices" class="notices" hidden></p>
 
     <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="status" role="tab" aria-selected="true">Status</button>
+      <button class="tab active" data-tab="status" role="tab" aria-selected="true">Overview</button>
       <button class="tab" data-tab="changes" role="tab" aria-selected="false">Changes <span id="changes-count" class="pill">0</span></button>
-      <button class="tab" data-tab="commit" role="tab" aria-selected="false">Commit</button>
       <button class="tab" data-tab="branches" role="tab" aria-selected="false">Branches</button>
-      <button class="tab" data-tab="sync" role="tab" aria-selected="false">Pull / Push</button>
+      <button class="tab" data-tab="sync" role="tab" aria-selected="false">Sync</button>
       <button class="tab" data-tab="repos" role="tab" aria-selected="false">Repositories</button>
       <button class="tab" data-tab="settings" role="tab" aria-selected="false">Project</button>
     </nav>
 
     <section id="panel-status" class="panel">
+      <p id="next-step" class="next-step" role="status"></p>
+      <details class="concept">
+        <summary>How a GitMesh project works</summary>
+        <p>A GitMesh project is one folder. Some directories inside it are separate Git
+          repositories (marked <span class="tag">repo</span> below); everything else belongs to
+          the <strong>root repository</strong>. GitMesh shows them as one project, so you commit,
+          pull and push once. Each repository still gets its own real Git commit, and Git itself
+          makes every change.</p>
+      </details>
       <div class="split">
         <div class="card">
           <h2>Project tree</h2>
-          <p class="hint">Directories marked <span class="tag">repo</span> are independent Git
-            repositories. Everything else is part of the project.</p>
+          <p class="hint">Every line is a directory of the project. Repositories are marked.</p>
           <div id="tree" class="tree"></div>
         </div>
         <div class="card">
-          <h2>Repository status</h2>
+          <h2>Repositories</h2>
           <div id="status-table"></div>
         </div>
       </div>
@@ -79,13 +86,11 @@
         <p id="staging-note" class="hint"></p>
         <div id="changes-table"></div>
       </div>
-    </section>
-
-    <section id="panel-commit" class="panel" hidden>
-      <div class="card">
-        <h2>One commit for the whole project</h2>
-        <p class="hint">GitMesh commits every change below with one message. Each affected
-          repository receives its own real Git commit — there is no synthetic global commit.</p>
+      <div class="card" id="commit-card">
+        <h2>Commit</h2>
+        <p class="hint">Commit records every change listed above. Each affected repository is staged and
+          committed separately with this one message; repositories without changes are skipped.
+          There is no combined commit.</p>
         <div id="commit-targets"></div>
         <label class="field">
           <span>Commit message</span>
@@ -119,7 +124,7 @@
 
     <section id="panel-sync" class="panel" hidden>
       <div class="card">
-        <h2>Synchronise the project</h2>
+        <h2>Sync every repository</h2>
         <p class="hint">Pull defaults to fast-forward only: GitMesh never merges or rebases
           behind your back. Repositories that cannot be updated are reported, the others still
           complete.</p>

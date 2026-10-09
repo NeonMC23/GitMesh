@@ -4,15 +4,17 @@
 //!   gitmesh ui           (alias: gitmesh tui)
 //! ```
 //!
+//! The interface is a minimal everyday workflow: see the changes grouped by repository,
+//! stage all, commit with one message, pull and push. See `docs/TUI.md` for the
+//! keyboard reference.
+//!
 //! Guarantees of this module:
 //!
-//! * **No Git logic.** Every action calls [`crate::ops`] / [`crate::analyzer`], exactly
-//!   like the CLI. There is one implementation of every operation.
-//! * **No terminal requirement for tests.** The state machine in
-//!   [`app`](self::app) is independent of `ratatui`/`crossterm`; [`run`] only adds the
-//!   event loop and drawing.
-//! * **Graceful degradation.** Without a terminal (pipes, CI, the sandboxed preview)
-//!   the command explains how to use the CLI instead of failing or hanging.
+//! * **No Git logic.** Every action calls [`crate::ops`], exactly like the CLI.
+//! * **Testable without a terminal.** [`app`] is independent of `ratatui`/`crossterm`;
+//!   this module only translates terminal events and runs the event loop.
+//! * **Graceful degradation.** Without a terminal (pipes, CI) the command explains how to
+//!   use the CLI instead of failing or hanging. Too-small terminals get a resize notice.
 
 pub mod app;
 pub mod render;
@@ -31,7 +33,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::error::Result;
-use app::{App, InputKind, Screen};
+use app::{Action, App, Key};
 
 /// Run the terminal interface.
 pub fn run(start: &Path, dry_run: bool) -> Result<()> {
@@ -64,9 +66,7 @@ fn event_loop<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> Result<()> {
     loop {
-        terminal
-            .draw(|frame| render::draw(frame, app))
-            .map_err(|e| crate::Error::Other(format!("could not draw: {e}")))?;
+        draw(terminal, app)?;
         if app.quit {
             return Ok(());
         }
@@ -77,110 +77,66 @@ fn event_loop<B: ratatui::backend::Backend>(
         }
         let event =
             event::read().map_err(|e| crate::Error::Other(format!("terminal event error: {e}")))?;
-        if let Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                handle_key(app, key)?;
-            }
+        let Event::Key(key) = event else {
+            // Resize and other events: the next loop iteration redraws at the new size.
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if let Some(action) = handle_key(app, key) {
+            // Show "working…" before the operation blocks the loop.
+            app.busy = Some(action);
+            draw(terminal, app)?;
+            app.run_action(action)?;
         }
     }
 }
 
-/// Apply one keypress to the application state.
-pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    // ---- modal input ------------------------------------------------------
-    if let Some(kind) = app.mode {
-        match key.code {
-            KeyCode::Esc => app.cancel_input(),
-            KeyCode::Enter => app.submit_input()?,
-            KeyCode::Backspace => {
-                app.input.pop();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.input.clear()
-            }
-            KeyCode::Char(c) => {
-                // `r` is only special outside input mode, so every character is typed.
-                app.input.push(c);
-            }
-            _ => {}
-        }
-        let _ = kind;
-        return Ok(());
-    }
-
-    match key.code {
-        KeyCode::Char('q') => app.quit = true,
-        KeyCode::Char('?') => app.show_help = !app.show_help,
-        KeyCode::Esc => app.show_help = false,
-        KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
-        KeyCode::Char('d') => {
-            app.dry_run = !app.dry_run;
-            let state = if app.dry_run { "on" } else { "off" };
-            app.log(format!("dry-run mode {state}"));
-        }
-        KeyCode::Char('s') => {
-            app.refresh_scan()?;
-            app.refresh_status()?;
-            app.log("refreshed");
-        }
-        KeyCode::Char('r') => {
-            if let Err(err) = app.reload_project() {
-                app.log(format!("could not reload: {err}"));
-            }
-        }
-        KeyCode::Char('w') => {
-            if let Err(err) = app.create_project_from_scan() {
-                app.log(format!("could not save the configuration: {err}"));
-            }
-        }
-        KeyCode::Char('a') => {
-            if let Err(err) = app.assign_selected() {
-                app.log(format!("{err}"));
-            }
-        }
-        KeyCode::Char('i') => app.begin_input(InputKind::RepositoryId),
-        KeyCode::Char('u') => app.begin_input(InputKind::RemoteUrl),
-        KeyCode::Char('c') => app.begin_input(InputKind::CommitMessage),
-        KeyCode::Char('b') => app.begin_input(InputKind::CheckoutBranch),
-        KeyCode::Char('n') => app.begin_input(InputKind::NewBranch),
-        KeyCode::Char('m') => app.begin_input(InputKind::MergeBranch),
-        KeyCode::Char('f') => {
-            if let Err(err) = app.run_fetch() {
-                app.log(format!("{err}"));
-            }
-        }
-        KeyCode::Char('p') => {
-            if let Err(err) = app.run_pull() {
-                app.log(format!("{err}"));
-            }
-        }
-        KeyCode::Char('P') => {
-            if let Err(err) = app.run_push() {
-                app.log(format!("{err}"));
-            }
-        }
-        KeyCode::Enter => match app.screen {
-            Screen::Setup => app.begin_input(InputKind::Directory),
-            Screen::Project => {
-                if let Err(err) = app.refresh_status() {
-                    app.log(format!("{err}"));
-                }
-            }
-        },
-        KeyCode::Char('e') => app.begin_input(InputKind::Directory),
-        _ => {}
-    }
-    Ok(())
+fn draw<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<()> {
+    terminal
+        .draw(|frame| render::draw(frame, app))
+        .map(|_| ())
+        .map_err(|e| crate::Error::Other(format!("could not draw: {e}")))
 }
 
-/// Printed when there is no terminal to draw on.
+/// Translate one terminal key event and apply it. Returns the action to run now, if any.
+///
+/// The action is accepted through [`App::accept`] (which checks the message, staging and
+/// confirmation) before it is returned, so a `Some` result is always ready to run.
+pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Action> {
+    let key = translate(key)?;
+    app.dispatch(key)
+}
+
+/// Map a terminal key event to a [`Key`], or `None` for keys the interface does not use.
+pub fn translate(key: KeyEvent) -> Option<Key> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match key.code {
+        KeyCode::Char('c') if ctrl => Key::CtrlC,
+        KeyCode::Char(_) if ctrl => return None,
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        _ => return None,
+    })
+}
+
 fn print_fallback(app: &App) {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "gitmesh: no interactive terminal available.");
     let _ = writeln!(out);
-    match (&app.project, app.screen) {
-        (Some(project), _) => {
+    match &app.project {
+        Some(project) => {
             let _ = writeln!(
                 out,
                 "Project '{}' is available at {}.",
@@ -188,7 +144,7 @@ fn print_fallback(app: &App) {
                 project.root.display()
             );
         }
-        _ => {
+        None => {
             let _ = writeln!(
                 out,
                 "No GitMesh project found at or above {}.",
@@ -202,12 +158,6 @@ fn print_fallback(app: &App) {
     );
     let _ = writeln!(out, "through the command line:");
     let _ = writeln!(out);
-    let _ = writeln!(out, "  gitmesh init                     create a project");
-    let _ = writeln!(out, "  gitmesh discover                 inspect the tree");
-    let _ = writeln!(
-        out,
-        "  gitmesh configure add <dir>      mark an external repository"
-    );
     let _ = writeln!(out, "  gitmesh status                   unified status");
     let _ = writeln!(
         out,
@@ -222,107 +172,16 @@ fn print_fallback(app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::RepoFixture;
-
-    fn press(app: &mut App, code: KeyCode) {
-        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
-    }
 
     #[test]
-    fn navigation_and_quit_work() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let mut app = App::new(fixture.path(), false).unwrap();
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.selected, 0);
-        press(&mut app, KeyCode::Char('?'));
-        assert!(app.show_help);
-        press(&mut app, KeyCode::Char('?'));
-        assert!(!app.show_help);
-        press(&mut app, KeyCode::Char('q'));
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn commit_flow_through_keystrokes() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        fixture.write("src/main.rs", "x");
-        fixture.write("engine/a.rs", "y");
-        let mut app = App::new(fixture.path(), false).unwrap();
-
-        press(&mut app, KeyCode::Char('c'));
-        assert_eq!(app.mode, Some(InputKind::CommitMessage));
-        for c in "typed message".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(app.mode, None);
-        assert!(fixture
-            .git_ok(".", &["log", "-1", "--pretty=%s"])
-            .contains("typed message"));
-        assert!(fixture
-            .git_ok("engine", &["log", "-1", "--pretty=%s"])
-            .contains("typed message"));
-    }
-
-    #[test]
-    fn input_can_be_cancelled() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", ".")]);
-        let mut app = App::new(fixture.path(), false).unwrap();
-        press(&mut app, KeyCode::Char('c'));
-        press(&mut app, KeyCode::Char('x'));
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.mode, None);
-        assert!(app.input.is_empty());
-    }
-
-    #[test]
-    fn dry_run_toggle_is_visible_in_state() {
-        let fixture = RepoFixture::new();
-        fixture.project_with(&[("root", "."), ("engine", "engine")]);
-        let mut app = App::new(fixture.path(), false).unwrap();
-        assert!(!app.dry_run);
-        press(&mut app, KeyCode::Char('d'));
-        assert!(app.dry_run);
-        fixture.write("src/a.rs", "x");
-        press(&mut app, KeyCode::Char('c'));
-        for c in "dry".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter);
-        // The commit was simulated, not performed.
-        let log = fixture.git_ok(".", &["log", "--oneline"]);
-        assert!(!log.contains("dry"));
-    }
-
-    #[test]
-    fn setup_screen_flow_assigns_a_repository() {
-        let fixture = RepoFixture::new();
-        fixture.init_repo("engine");
-        fixture.write("engine/README.md", "# engine\n");
-        fixture.commit("engine", "init");
-        let mut app = App::new(fixture.path(), false).unwrap();
-        assert_eq!(app.screen, Screen::Setup);
-        press(&mut app, KeyCode::Char('w')); // save configuration
-        assert_eq!(app.screen, Screen::Project);
-
-        let index = app
-            .rows
-            .iter()
-            .position(|row| row.relative_path == std::path::Path::new("engine"))
-            .unwrap();
-        app.selected = index;
-        press(&mut app, KeyCode::Char('a')); // mark as repository
-        assert!(app.project.as_ref().unwrap().repository("engine").is_some());
-
-        // Renaming through the input flow works too.
-        press(&mut app, KeyCode::Char('i'));
-        press(&mut app, KeyCode::Char('e'));
-        press(&mut app, KeyCode::Char('x'));
-        press(&mut app, KeyCode::Enter);
-        assert!(app.project.as_ref().unwrap().repository("ex").is_some());
+    fn translates_only_the_keys_the_interface_uses() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(translate(plain(KeyCode::Char('s'))), Some(Key::Char('s')));
+        assert_eq!(translate(plain(KeyCode::Enter)), Some(Key::Enter));
+        assert_eq!(translate(plain(KeyCode::F(5))), None);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(translate(ctrl_c), Some(Key::CtrlC));
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(translate(ctrl_s), None);
     }
 }
