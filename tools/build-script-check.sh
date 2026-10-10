@@ -182,6 +182,15 @@ for f in build.sh tools/toolchain.sh tools/rust-env.sh tools/build-script-check.
 done
 [ -x "$here/build.sh" ] && [ -x "$here/tools/rust-env.sh" ] && [ -x "$here/tools/build-script-check.sh" ]
 check "build.sh, rust-env.sh and this check are executable" $?
+# The working-tree bit is lost when a snapshot or archive drops modes, so the mode that
+# matters for a fresh checkout is the one recorded in Git's index.
+if git -C "$here" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  idx_mode="$(git -C "$here" ls-files --stage -- build.sh | cut -d' ' -f1)"
+  [ "$idx_mode" = 100755 ]
+  check "build.sh is recorded as mode 100755 in the Git index" $? "index mode is '${idx_mode:-missing}'"
+else
+  note_skip "build.sh index mode" "not inside a Git work tree"
+fi
 ! grep -v '^[[:space:]]*#' "$here/build.sh" "$here/tools/toolchain.sh" "$here/tools/rust-env.sh" | grep -q '/usr/local'
 check "no executable line refers to /usr/local (comments excluded)" $?
 ! grep -nE '^[[:space:]]*sudo[[:space:]]' "$here/build.sh" "$here/tools/toolchain.sh" "$here/tools/rust-env.sh" >/dev/null

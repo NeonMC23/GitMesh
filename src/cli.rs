@@ -101,8 +101,11 @@ pub enum Command {
     /// Show remotes, hosting providers and GitHub coordinates.
     Remotes,
 
-    /// Open the interactive terminal interface.
-    #[command(alias = "tui")]
+    /// Open the interactive terminal interface for a project.
+    #[command(
+        alias = "tui",
+        after_help = "EXAMPLES:\n  gitmesh ui                    open the project at or above the current directory\n  gitmesh ui ~/work/demo        open the project at or above that directory\n  gitmesh -C ../demo ui         the same, selected with the global -C/--project\n\n`tui` is an alias. Relative paths are resolved from the current directory."
+    )]
     Ui(UiArgs),
 
     /// Open the graphical interface in a browser (served locally by GitMesh).
@@ -370,9 +373,10 @@ pub struct PushArgs {
 
 #[derive(Debug, Args)]
 pub struct UiArgs {
-    /// Directory to open (defaults to the current directory).
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
+    /// Directory inside the project to open (defaults to the current directory).
+    /// Same as the global -C/--project; give one or the other, not both.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
     /// Start in dry-run mode: operations are simulated.
     #[arg(long)]
     pub dry_run: bool,
@@ -380,9 +384,10 @@ pub struct UiArgs {
 
 #[derive(Debug, Args)]
 pub struct GuiArgs {
-    /// Directory to open (defaults to the current directory).
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
+    /// Directory to open (defaults to the current directory). Same as the global
+    /// -C/--project; give one or the other, not both.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
     /// Port of the local interface.
     #[arg(long, default_value_t = 7345)]
     pub port: u16,
@@ -513,6 +518,21 @@ mod tests {
             panic!()
         };
         assert_eq!(args.sync_options().strategy, PullStrategy::FastForwardOnly);
+    }
+
+    #[test]
+    fn ui_takes_an_optional_path_or_the_global_project_flag() {
+        let cli = Cli::try_parse_from(["gitmesh", "ui", "some/dir"]).unwrap();
+        match cli.command {
+            Some(Command::Ui(args)) => assert_eq!(args.path, Some(PathBuf::from("some/dir"))),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["gitmesh", "-C", "some/dir", "ui"]).unwrap();
+        assert_eq!(cli.project, Some(PathBuf::from("some/dir")));
+        match cli.command {
+            Some(Command::Ui(args)) => assert_eq!(args.path, None),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -700,3 +700,139 @@ fn configure_clone_clones_into_a_new_directory_and_refuses_a_non_empty_one() {
     );
     assert!(!f.path().join("libs/busy/.git").exists());
 }
+
+// ------------------------------------------------------- ui directory handling --
+//
+// `gitmesh ui` opens an existing project. The directory comes from the positional
+// PATH or the global `-C`, never both; relative paths resolve from the current
+// directory; nothing is created. These tests run only in temporary projects.
+
+#[test]
+fn ui_explicit_path_opens_the_project_from_a_cwd_outside_it() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let outside = Cli::new(fixture.outside_path());
+    let abs = fixture.path().to_string_lossy().to_string();
+
+    let (stdout, stderr, code) = outside.out(&["ui", &abs]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("is available at"), "{stdout}");
+    assert!(stdout.contains("gitmesh-"), "{stdout}");
+    // Nothing is written next to the caller.
+    assert!(!fixture.outside_path().join(".gitmesh").exists());
+}
+
+#[test]
+fn ui_global_project_flag_selects_the_project_from_outside() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let outside = Cli::new(fixture.outside_path());
+    let abs = fixture.path().to_string_lossy().to_string();
+
+    for args in [vec!["-C", &abs, "ui"], vec!["ui", "-C", &abs]] {
+        let (stdout, stderr, code) = outside.out(&args);
+        assert_eq!(code, 0, "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(stdout.contains("is available at"), "{args:?}: {stdout}");
+    }
+}
+
+#[test]
+fn ui_relative_path_resolves_from_the_current_directory() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    fixture.mkdir("sub/deep");
+    let cli = Cli::new(fixture.path());
+
+    // A sub-directory of the project opens the project that contains it.
+    for args in [
+        vec!["ui", "sub/deep"],
+        vec!["ui", "./sub/../sub"],
+        vec!["-C", "sub", "ui"],
+    ] {
+        let (stdout, stderr, code) = cli.out(&args);
+        assert_eq!(code, 0, "{args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(stdout.contains("is available at"), "{args:?}: {stdout}");
+    }
+}
+
+#[test]
+fn ui_missing_path_is_reported_with_the_base_directory() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let cli = Cli::new(fixture.path());
+
+    let (stdout, stderr, code) = cli.out(&["ui", "no-such-dir"]);
+    assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("directory does not exist"), "{stderr}");
+    assert!(stderr.contains("no-such-dir"), "{stderr}");
+    assert!(stderr.contains("current directory"), "{stderr}");
+}
+
+#[test]
+fn ui_file_path_is_rejected() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let cli = Cli::new(fixture.path());
+
+    let (_, stderr, code) = cli.out(&["ui", "README.md"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("not a directory"), "{stderr}");
+}
+
+#[test]
+fn ui_directory_without_a_project_fails_and_creates_nothing() {
+    let fixture = RepoFixture::new();
+    // The fixture's remote directory is not a GitMesh project.
+    let plain = fixture.outside_path();
+    assert!(!plain.join(".gitmesh").exists());
+    let cli = Cli::new(fixture.path());
+    let abs = plain.to_string_lossy().to_string();
+
+    let (stdout, stderr, code) = cli.out(&["ui", &abs]);
+    assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("no GitMesh project found"), "{stderr}");
+    assert!(stderr.contains("gitmesh init"), "{stderr}");
+    assert!(
+        !plain.join(".gitmesh").exists(),
+        "ui must never init a project"
+    );
+}
+
+#[test]
+fn ui_path_and_project_flag_together_are_rejected() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let outside = Cli::new(fixture.outside_path());
+    let abs = fixture.path().to_string_lossy().to_string();
+
+    let (_, stderr, code) = outside.out(&["-C", &abs, "ui", &abs]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("not both"), "{stderr}");
+    // The same rule applies to `gui`, which is rejected before any server starts.
+    let (_, stderr, code) = outside.out(&["-C", &abs, "gui", &abs]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("not both"), "{stderr}");
+}
+
+#[test]
+fn ui_broken_manifest_is_reported_before_the_terminal_starts() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    fixture.write(".gitmesh/project.toml", "this is = not [valid toml\n");
+    let cli = Cli::new(fixture.path());
+
+    let (stdout, stderr, code) = cli.out(&["ui"]);
+    assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("gitmesh:"), "{stderr}");
+}
+
+#[test]
+fn ui_tui_alias_accepts_the_same_directory_forms() {
+    let fixture = RepoFixture::new();
+    fixture.project_with(&[("root", ".")]);
+    let outside = Cli::new(fixture.outside_path());
+    let abs = fixture.path().to_string_lossy().to_string();
+    let (stdout, stderr, code) = outside.out(&["tui", &abs]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("is available at"), "{stdout}");
+}

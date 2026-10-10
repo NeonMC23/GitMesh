@@ -52,6 +52,9 @@ $ ./build.sh            # builds the release executable
 $ target/release/gitmesh --help
 ```
 
+If `./build.sh` reports `Permission denied`, the executable bit was lost (some archives and
+copies drop it). Run `bash build.sh`, or restore it with `chmod +x build.sh`.
+
 `build.sh` works from any directory, takes no configuration, and never starts GitMesh. It
 prints the exact path of the executable when it finishes.
 
@@ -180,6 +183,7 @@ Prefer an interface? GitMesh ships two, and both drive the same core as the CLI:
 ```console
 $ gitmesh gui                    # graphical interface in your browser (local only)
 $ gitmesh ui                     # full-screen terminal interface (alias: tui)
+$ gitmesh ui ~/work/demo         # ...for a project elsewhere (or: gitmesh -C ~/work/demo ui)
 ```
 
 The graphical interface shows the project as **one** project — one tree, one status, one

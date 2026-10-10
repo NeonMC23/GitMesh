@@ -89,6 +89,11 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// The command line asked for something impossible (bad path, conflicting
+    /// options). Reported with the usage exit code.
+    #[error("{0}")]
+    Usage(String),
+
     /// Anything that does not fit the categories above.
     #[error("{0}")]
     Other(String),
@@ -112,6 +117,7 @@ impl Error {
                 | Error::InvalidConfiguration(_)
                 | Error::UnknownRepository(_)
                 | Error::OutsideProject { .. }
+                | Error::Usage(_)
         )
     }
 }

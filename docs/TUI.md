@@ -28,6 +28,27 @@ GitMesh  MyProject  branch main
 s stage all  c commit  p pull  P push  Tab message/actions  d dry run  ? help  q quit
 ```
 
+## Opening a project
+
+```console
+$ cd ~/work/demo && gitmesh ui                 # the project at or above the current directory
+$ gitmesh ui ~/work/demo                       # from anywhere: an explicit directory
+$ gitmesh -C ~/work/demo ui                    # the same, with the global -C/--project flag
+$ gitmesh ui ../demo                           # a relative path, resolved from the current directory
+```
+
+* The directory is the positional `PATH` or the global `-C/--project`. Give one or the
+  other: both together is a usage error (exit code 2).
+* A relative path is resolved from the directory you run the command in, not from the
+  project. Paths are shown in the error messages so you can see the base that was used.
+* The directory must exist and be a directory. It may be the project root or any directory
+  inside it; the project is the one at or above it, as for every other command.
+* The terminal interface never creates a project. If there is no project there, or its
+  manifest is invalid, `gitmesh ui` stops before the screen opens and says what is wrong
+  (run `gitmesh init` in the directory to create a project). Nothing is written.
+* `gitmesh gui` accepts the same directory forms. It does not need a project yet, because
+  the graphical interface can create or clone one.
+
 ## Keys
 
 The action-bar keys and the single-character shortcuts come from the same tables as the key

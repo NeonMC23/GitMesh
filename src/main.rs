@@ -147,8 +147,8 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Remotes => cmd_remotes(&global, &runner),
         Command::Gui(args) => cmd_gui(&global, &args),
         Command::Ui(args) => {
-            let path = resolve_start_path(&global, &args.path);
-            match gitmesh::ui::run(&path, args.dry_run) {
+            let root = resolve_ui_project(&global, args.path.as_deref())?;
+            match gitmesh::ui::run(&root, args.dry_run) {
                 Ok(()) => Ok(EXIT_OK),
                 Err(Error::Unsupported(message)) => {
                     println!("{message}");
@@ -163,12 +163,9 @@ fn run(cli: Cli) -> Result<u8> {
 // --------------------------------------------------------------------- gui --
 
 fn cmd_gui(global: &GlobalOptions, args: &gitmesh::cli::GuiArgs) -> Result<u8> {
-    // `gui` takes the project directory the same way every other command does: the
-    // path argument, or the global `-C` when it is set.
-    let start = match &global.project {
-        Some(path) => path.clone(),
-        None => args.path.clone(),
-    };
+    // `gui` takes the directory the same way `ui` does (see `resolve_directory`). It
+    // does not require a project yet: the graphical interface can set one up.
+    let start = resolve_directory(global, args.path.as_deref())?;
     let options = gitmesh::gui::GuiOptions {
         start: Some(start),
         host: args.host.clone(),
@@ -199,6 +196,48 @@ fn load_project(global: &GlobalOptions, runner: &GitRunner) -> Result<GitMeshPro
 /// Resolve a path argument to an absolute path (without requiring existence).
 fn absolute(path: &Path) -> Result<PathBuf> {
     gitmesh::paths::absolute(path)
+}
+
+/// Resolve the directory given to `ui` or `gui`: the positional PATH, or the global
+/// `-C/--project`, never both. Relative paths resolve against the current directory.
+/// The directory must exist; nothing is created.
+fn resolve_directory(global: &GlobalOptions, positional: Option<&Path>) -> Result<PathBuf> {
+    let given = match (&global.project, positional) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Usage(
+                "give the directory either as PATH or with -C/--project, not both".to_string(),
+            ));
+        }
+        (Some(path), None) => path.clone(),
+        (None, Some(path)) => path.to_path_buf(),
+        (None, None) => PathBuf::from("."),
+    };
+    let dir = absolute(&given)?;
+    if !dir.exists() {
+        return Err(Error::Usage(format!(
+            "directory does not exist: {} (relative paths are resolved from the current directory, {})",
+            dir.display(),
+            std::env::current_dir()
+                .map(|cwd| cwd.display().to_string())
+                .unwrap_or_else(|_| "?".to_string())
+        )));
+    }
+    if !dir.is_dir() {
+        return Err(Error::Usage(format!("not a directory: {}", dir.display())));
+    }
+    Ok(dir)
+}
+
+/// Resolve the project root for `ui`. Unlike `gui`, the terminal interface only opens
+/// an existing project: it never creates a manifest. The project is the one at or
+/// above the directory, as for every other command, and its manifest must load.
+fn resolve_ui_project(global: &GlobalOptions, positional: Option<&Path>) -> Result<PathBuf> {
+    let dir = resolve_directory(global, positional)?;
+    let root = manifest::find_project_root(&dir)
+        .ok_or_else(|| Error::ProjectNotFound { root: dir.clone() })?;
+    // Fail here, before the terminal is taken over, with the manifest's own message.
+    manifest::load_from_root(&root)?;
+    Ok(root)
 }
 
 /// Where a command that works on a *directory* (rather than a project) starts.
