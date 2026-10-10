@@ -2,7 +2,7 @@
 
 ## 1. Prerequisites
 
-* Rust 1.74 or newer (`rustup toolchain install stable`)
+* Rust 1.88 or newer (the minimum is `rust-version` in `Cargo.toml`). `./build.sh` can install it for you, or use `rustup toolchain install stable`
 * Git 2.25+ on `PATH` (GitMesh spawns the real `git`)
 * `rustfmt` and `clippy` components (used by the validation commands below)
 
@@ -20,7 +20,7 @@ $ cargo fmt --all -- --check      # verify formatting (CI)
 $ cargo clippy --all-targets -- -D warnings   # lint, warnings are errors
 $ cargo build --release           # optimised binary: target/release/gitmesh
 $ ./build.sh                      # the same release build, from any directory, with checks
-$ ./tools/build-script-check.sh   # fast checks for build.sh (fake toolchains, no build)
+$ ./tools/build-script-check.sh   # offline checks for build.sh and the toolchain discovery (no real build)
 ```
 
 The full validation sequence used for every milestone:
@@ -238,7 +238,8 @@ gitmesh/
 │   │   └── static/                index.html, app.css, app.js (embedded at build time)
 │   └── testkit.rs                 test fixtures (temporary repositories)
 ├── tools/
-│   ├── rust-env.sh                reproducible local toolchain bootstrap
+│   ├── toolchain.sh               shared Rust discovery and checks (sourced by build.sh)
+│   ├── rust-env.sh                run a command with the discovered toolchain (never installs)
 │   ├── gui-workflow.py            end-to-end validation of the graphical interface
 │   ├── setup-workflow.py          end-to-end validation of project creation (the wizard)
 │   └── repository-workflow.py     end-to-end validation of repository management

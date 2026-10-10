@@ -41,6 +41,53 @@ renderer     ✓ committed 3 file(s) [91b0d47]
 commit: 2 succeeded, 1 skipped, 0 conflicted, 0 failed
 ```
 
+## Quick start
+
+You need **Git** (to run GitMesh) and **Rust 1.88 or newer** with a **C linker** (`cc`) to
+build it. You do not need to know Cargo or Rust's file layout.
+
+```console
+$ cd gitmesh            # the source tree (cloned or unpacked)
+$ ./build.sh            # builds the release executable
+$ target/release/gitmesh --help
+```
+
+`build.sh` works from any directory, takes no configuration, and never starts GitMesh. It
+prints the exact path of the executable when it finishes.
+
+**Rust, on the first run**
+
+* If a suitable Rust is already installed (from your system packages or from rustup),
+  `build.sh` uses it and installs nothing.
+* If no Rust is installed, `build.sh` explains what it will install and asks first. In a
+  script, use `./build.sh --install-rust` to allow it without the prompt. It downloads the
+  official rustup installer, checks it against its published SHA-256 checksum, and installs
+  stable Rust into `~/.cargo` and `~/.rustup`. It needs no administrator rights and does not
+  edit your shell start-up files.
+* If an installed Rust is too old or not working, `build.sh` says why and does not overwrite it.
+* **Network and disk.** The first build needs internet access: crates are downloaded from
+  crates.io (and, if Rust is installed by `build.sh`, the installer from static.rust-lang.org).
+  Plan for about 1 GB of free disk space for Rust and the first build; the finished
+  executable is a few megabytes.
+
+**C linker.** Rust links programs with `cc`. If it is missing, `build.sh` stops before any
+download and prints the command for your system, for example `sudo dnf install gcc` (Fedora,
+Nobara), `sudo apt install build-essential` (Debian, Ubuntu), `sudo pacman -S base-devel`
+(Arch) or `xcode-select --install` (macOS). `build.sh` never runs these itself.
+
+**Platforms.** GitMesh has no native library dependencies (every crate is pure Rust), so the only system
+requirement to build is the C linker. `build.sh` needs bash. It is written for Linux and macOS; Windows is not
+supported by `build.sh`.
+
+| Platform | Status |
+|---|---|
+| Linux x86_64 (Debian 13) | built and tested: `cargo test`, the build-script checks, and a first run from an empty home |
+| Fedora, Nobara, Ubuntu, Arch | not tested here; the matching C-compiler package is listed above |
+| Linux aarch64, macOS (Apple silicon or Intel) | not tested here |
+| Windows | not supported by `build.sh` (WSL is untested) |
+
+`cargo build --release` produces the same executable if you prefer to run Cargo yourself.
+
 ## Why GitMesh exists
 
 Splitting a project into several GitHub repositories is often required by *hosting*
@@ -84,19 +131,16 @@ thin orchestration layer that makes them behave like one project for everyday wo
 19. The implementation stays lightweight and maintainable.
 20. The architecture stays extensible without becoming a Git replacement.
 
-## Installation
+## Installing for your user account (optional)
+
+Building does not install GitMesh anywhere. To make the executable available as `gitmesh`
+for your user account, copy it to a directory on your `PATH` (for example `~/.local/bin`):
 
 ```console
-$ ./build.sh                                                  # release build; no arguments; works from any directory
-$ target/release/gitmesh --help                               # run it (build.sh does not start GitMesh)
-$ install -m755 target/release/gitmesh ~/.local/bin/gitmesh   # optional: or copy it anywhere on PATH
+$ install -m755 target/release/gitmesh ~/.local/bin/gitmesh
 ```
 
-`build.sh` runs `cargo build --release` through `tools/rust-env.sh` and checks that the
-executable was produced.
-
-Requirements: Rust (edition 2021, Rust 1.74+) to build, and Git on `PATH` at runtime.
-GitMesh is a single binary with no runtime dependencies beyond Git itself.
+GitMesh is a single binary. At runtime it needs Git on `PATH`.
 
 ## Getting started
 
