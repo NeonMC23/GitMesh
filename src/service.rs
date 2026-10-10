@@ -1595,6 +1595,22 @@ pub fn management_plan_view_json(plan: &manage::RepositoryPlan) -> Json {
             Json::array(plan.blockers.iter().map(|line| Json::from(line.as_str()))),
         ),
         (
+            "recovery",
+            Json::array(plan.recovery.iter().map(|action| {
+                let (path, id, remote) = match action {
+                    manage::PlanRecovery::CloneRemote { path, id, remote } => (path, id, remote),
+                };
+                Json::object([
+                    ("kind", Json::from(action.label())),
+                    ("sentence", Json::from(action.sentence())),
+                    ("command", Json::from(action.command(&plan.root))),
+                    ("path", Json::from(path.as_str())),
+                    ("id", Json::from(id.as_str())),
+                    ("remote", Json::from(remote.as_str())),
+                ])
+            })),
+        ),
+        (
             "warnings",
             Json::array(plan.warnings.iter().map(|line| Json::from(line.as_str()))),
         ),

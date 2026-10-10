@@ -454,6 +454,12 @@ new directory (relative to the project), the remote URL or local path, and optio
 in GitMesh. The review shows the plan the service built, exactly as for the other actions; the
 remote is read before anything is cloned, and a directory that already has files is refused
 without being touched. The same operation is `gitmesh configure clone` on the command line.
+
+When an **Add repository** is refused because the directory is empty and its remote already has
+history, the review offers **Clone repository** under *The way forward*. It fills the clone form
+with the suggested directory, name and remote, and reviews that clone. Change the fields if you
+want, review again, tick the confirmation, and apply; **Cancel** changes nothing.
+
 See [REPOSITORIES.md](REPOSITORIES.md) for the rules and the sync error messages.
 
 ## Repository history checks

@@ -14,7 +14,7 @@ with the commands and interfaces below, not by editing the file.
 |---|---|---|---|
 | Register a directory that is already a repository | Change one repository → candidate check | `gitmesh configure add <dir>` | not offered |
 | Create a repository in a directory | Candidate check → initialise | `gitmesh configure add <dir> --git-init` | not offered |
-| **Clone a remote into a new directory** | Change one repository → *clone a remote into a new directory* | `gitmesh configure clone <dir> --remote <url>` | not offered |
+| **Clone a remote into a new directory** | Change one repository → *clone a remote into a new directory*, or **Clone repository** on a refused add | `gitmesh configure clone <dir> --remote <url>` | not offered |
 | Record or change a remote | Change one repository → *record another remote* | `gitmesh configure remote <id> --url <url> [--set-git-remote]` | not offered |
 | Commit, pull, push, see status | yes | yes | yes (daily workflow) |
 
@@ -31,7 +31,8 @@ states it distinguishes are:
 - **Missing directory**: GitMesh does not create it. The check points to clone, which creates
   the directory from a remote.
 - **Empty directory**: a folder with no entries. GitMesh can `git init` it, but a remote that
-  already has history is never merged into it (see below). To bring that history in, clone.
+  already has history is never merged into it. The refusal offers **Clone repository** (GUI)
+  or prints the exact `gitmesh configure clone` command (CLI); see "Recovering a refused add".
 - **Uninitialised directory**: a folder with files. It can be initialised as a new repository.
 - **Initialised, no commits**: a repository with no commit yet. Commit-dependent operations
   (pull, push) are skipped with "repository has no commits yet". When its remote already has
@@ -66,6 +67,62 @@ Rules:
   repository with its own `.git`.
 - Running the same command twice is refused with "already the GitMesh repository", and changes
   nothing.
+
+## Recovering a refused add
+
+Adding an **empty directory** whose remote already has history is refused, because GitMesh
+never merges that history into a directory of its own. The refusal names the way forward and
+offers it:
+
+- **GUI**: the refused plan shows the reason, the exact command, and a **Clone repository**
+  button. The button fills the clone form (directory, remote, name) and asks the core for a
+  clone plan. You can change the directory or the name first; any change drops the plan. The
+  clone plan is reviewed like every other change, and it runs only after you tick the
+  confirmation and press **Apply the change**. **Cancel** changes nothing.
+- **CLI**: the refusal prints the command to run, for example:
+
+```sh
+gitmesh configure clone RAMforge --remote /srv/git/ramforge.git --id RAMforge -C /path/to/project
+```
+
+The offer is made only when the clone would itself be accepted. The offer is planned with the
+same clone planner the command uses, so GitMesh never suggests a command it would then refuse.
+For example, a remote that another repository of the project already uses is not offered; the
+refusal gives that reason instead.
+
+When the existing repository has its own history and the remote's history shares no commit with
+it, the offer is a clone into a sibling directory named `<dir>-remote` (when that name is free).
+Your existing repository is left exactly as it was; see "Recovering from unrelated histories".
+
+## Root and child repositories: where things live
+
+GitMesh has one **project root** and any number of **child repositories** inside it.
+
+- **Project root**: the directory that holds `.gitmesh/project.toml`. There is no `.root`
+  directory. The **root repository** is the Git repository at the project root, when there is
+  one. It is always listed first in the manifest with the id `root` and the path `.`.
+- **Child repository**: a Git repository in its own directory below the root (for example
+  `RAMforge/`), listed in the manifest with its own id and path. Its `.git` directory is its
+  own, and its sources exist only in its directory.
+- **Manifest**: `.gitmesh/project.toml`, at the project root. It is the only place GitMesh
+  records the repositories. The root repository tracks it like any other file of the root.
+
+The rules, in plain terms and as the tests check them:
+
+| Question | Answer |
+|---|---|
+| Where do a child's files live? | Only in the child's directory. Cloning or adding a child never copies its sources into the root. |
+| Which history owns a child's files? | The child's. The root's commits never contain them. |
+| Does a root commit include a child's changes? | No. The root stages and commits only its own files, the paths of every child directory are excluded from its `git add`. |
+| Does a root commit record a child as a gitlink? | No, for registered children (excluded by path) and for unregistered nested repositories (left out of the root's staging; a nested repository already staged by hand is unstaged and reported, not committed). |
+| Does a child commit include the root's changes? | No. Each repository is committed in its own history, with its own commit. |
+| Do root and child share commits or history? | No. Their histories are independent; a child's commit is not in the root's history and the reverse. |
+| What does staging do? | Stages each repository's own files. Staging the root never stages a child's files, and staging a child never stages the root's files. |
+| Can a root operation delete, move or overwrite a child's files? | No. Root operations never delete, move or overwrite a child's files. Removing a child, or stopping tracking, never deletes files. |
+| What if the root already tracks files inside a new child? | GitMesh adds them as a warning that two repositories would own them. Nothing is untracked unless you choose "stop tracking these files in the root repository". |
+
+Ignore rules are not changed by GitMesh: a nested repository is left out of the root by
+pathspec, and ignored paths stay ignored.
 
 ## Connecting a directory that already is a repository
 
@@ -216,3 +273,9 @@ cleans, force-pushes or overwrites your changes.
 - A remote that is unreachable at `configure add` time is recorded with a warning; GitMesh
   does not block it.
 - The TUI does not clone; this is a GUI and CLI operation.
+- A nested repository that is not in the manifest is left out of the root's commits, but it is
+  not listed as a repository in the project status; register it with `configure add` to manage
+  it.
+- If the root already tracks files inside a child directory, the child is added with a warning,
+  not refused. Choose "stop tracking these files in the root repository" to remove the shared
+  ownership without deleting anything.

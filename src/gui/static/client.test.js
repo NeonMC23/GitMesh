@@ -762,6 +762,33 @@ function sampleInspection() {
   equal(blocked.blockers.length, 1, 'the reason is on screen');
 })();
 
+(function managementRecoveryTests() {
+  // A refused add that has a way forward: the clone is offered with its exact inputs, and the
+  // page shows it as an action, never as a plan that can be applied.
+  var refused = GitMesh.managementPlanSummary({
+    id: 'rec123', ready: false, noop: false, summary: '1 problem(s) must be fixed',
+    manifest: { after: '', changes: false }, changes: [], actions: [], counts: {},
+    safety: [], warnings: [], notices: [],
+    blockers: ["'RAMforge' is an empty directory and the remote already has history"],
+    recovery: [{ kind: 'clone-remote', sentence: 'clone git@host:team/RAMforge.git into \'RAMforge\'',
+      command: 'gitmesh configure clone RAMforge --remote git@host:team/RAMforge.git --id RAMforge -C /p',
+      path: 'RAMforge', id: 'RAMforge', remote: 'git@host:team/RAMforge.git' }]
+  });
+  equal(refused.state, 'blocked', 'a refused plan is still not applicable');
+  equal(refused.recovery.length, 1, 'the way forward is carried to the page');
+  equal(refused.recovery[0].path, 'RAMforge', 'with the destination it would clone into');
+  equal(refused.recovery[0].id, 'RAMforge', 'and the name it would use');
+  equal(refused.recovery[0].remote, 'git@host:team/RAMforge.git', 'and the remote');
+  contains(refused.recovery[0].command, 'configure clone RAMforge', 'and the exact command');
+
+  var plain = GitMesh.managementPlanSummary({
+    id: 'rec456', ready: false, noop: false, summary: '1 problem(s) must be fixed',
+    manifest: { after: '', changes: false }, changes: [], actions: [], counts: {},
+    safety: [], blockers: ['no'], warnings: [], notices: []
+  });
+  equal(plain.recovery.length, 0, 'a refusal without a way forward offers nothing');
+})();
+
 (function managementResultTests() {
   var result = {
     kind: 'result', flow: 'repository', planId: 'abc123', dryRun: false, status: 'complete',

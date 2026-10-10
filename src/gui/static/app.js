@@ -894,6 +894,18 @@ var GitMesh = (function () {
     changes.forEach(function (change) {
       if (change.id && touched.indexOf(change.id) === -1) { touched.push(change.id); }
     });
+    // Actions that resolve a refusal. The core decided they would be accepted; the page only
+    // offers them, and the offer is reviewed like any other change.
+    var recovery = (plan.recovery || []).map(function (action) {
+      return {
+        kind: action.kind || '',
+        sentence: action.sentence || '',
+        command: action.command || '',
+        path: action.path || '',
+        id: action.id || '',
+        remote: action.remote || ''
+      };
+    });
     return {
       id: plan.id,
       ready: !!plan.ready,
@@ -908,6 +920,7 @@ var GitMesh = (function () {
       touched: touched,
       safety: plan.safety || [],
       blockers: plan.blockers || [],
+      recovery: recovery,
       warnings: plan.warnings || [],
       notices: plan.notices || [],
       manifestChanges: !!manifest.changes,
@@ -2633,6 +2646,13 @@ if (typeof document !== 'undefined') {
       summary.blockers.forEach(function (line) {
         html += '<p class="blocker">' + escapeHtml('✗ ' + line) + '</p>';
       });
+      summary.recovery.forEach(function (action, index) {
+        html += '<div class="plan-block"><h3>The way forward</h3>' +
+          '<p>' + escapeHtml(action.sentence.charAt(0).toUpperCase() + action.sentence.slice(1) + '.') + '</p>' +
+          '<p class="hint mono">' + escapeHtml(action.command) + '</p>' +
+          '<button type="button" class="primary" data-recovery="' + index + '">Clone repository</button>' +
+          '</div>';
+      });
       summary.warnings.forEach(function (line) {
         html += '<p class="repo-flag">' + escapeHtml('! ' + line) + '</p>';
       });
@@ -2641,9 +2661,29 @@ if (typeof document !== 'undefined') {
       });
 
       $('repo-plan').innerHTML = html;
+      Array.prototype.forEach.call($('repo-plan').querySelectorAll('button[data-recovery]'),
+        function (button) {
+          button.addEventListener('click', function () {
+            offerRecoveryClone(summary.recovery[Number(button.getAttribute('data-recovery'))]);
+          });
+        });
       $('repo-review').hidden = false;
       $('repo-confirm').checked = false;
       $('btn-repo-apply').disabled = !summary.ready;
+    }
+
+    /// "Clone repository" from a refused plan. It only fills the clone form with the suggested
+    /// directory, name and remote and asks the core for a reviewed clone plan: the directory can
+    /// be changed first (a change drops the plan, as for every field), and nothing is cloned until
+    /// the reviewed plan is applied with confirmation.
+    function offerRecoveryClone(action) {
+      $('repo-intent').value = 'clone';
+      renderRepoIntent();
+      $('repo-clone-path').value = action.path;
+      $('repo-clone-id').value = action.id;
+      $('repo-clone-remote').value = action.remote;
+      repoMessage('Review the clone below. Change the directory or name first if you want.');
+      reviewRepoChange(repoCloneRequest());
     }
 
     /// A plan belongs to the configuration it was made from: typing in a field drops it, so
@@ -2756,9 +2796,10 @@ if (typeof document !== 'undefined') {
     $('btn-repo-apply').addEventListener('click', applyRepoChange);
     $('btn-repo-discard').addEventListener('click', function () {
       invalidateRepoPlan();
-      repoMessage('');
+      repoMessage('Cancelled. Nothing was changed.');
     });
-    ['repo-id', 'repo-remote-url', 'repo-branch', 'repo-new-id', 'repo-edit-remote'].forEach(
+    ['repo-id', 'repo-remote-url', 'repo-branch', 'repo-new-id', 'repo-edit-remote',
+      'repo-clone-path', 'repo-clone-id', 'repo-clone-remote'].forEach(
       function (id) { $(id).addEventListener('change', invalidateRepoPlan); });
     ['repo-initialize', 'repo-configure-remote', 'repo-untrack', 'repo-configure-git',
       'repo-takeover'].forEach(function (id) {

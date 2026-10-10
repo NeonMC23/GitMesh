@@ -1499,6 +1499,140 @@ mod tests {
         body
     }
 
+    /// A bare remote whose `main` already has one commit, built outside the project.
+    fn seeded_remote(outside: &std::path::Path) -> std::path::PathBuf {
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let bare = outside.join("ramforge.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare", "-b", "main", "."]);
+        let seed = outside.join("ramforge-seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        std::fs::write(seed.join("README.md"), "# RAMforge\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-q", "-m", "RAMforge initial"]);
+        git(&seed, &["push", "-q", bare.to_str().unwrap(), "HEAD:main"]);
+        bare
+    }
+
+    #[test]
+    fn a_refused_add_offers_clone_repository_and_applying_it_keeps_the_remote_history() {
+        let fixture = project_with_a_candidate();
+        let bare = seeded_remote(fixture.outside_path());
+        let remote = bare.to_str().unwrap().to_string();
+        fixture.mkdir("RAMforge");
+        let (_gui, port) = open_gui(&fixture);
+        let manifest_before =
+            std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap();
+
+        // The add is refused, and the refusal carries the clone that resolves it.
+        let add = add_body(&[
+            ("path", "RAMforge"),
+            ("id", "RAMforge"),
+            ("remote", &remote),
+            ("initialize", "true"),
+            ("configureRemote", "true"),
+        ]);
+        let (status, body) = post(port, "/api/repository/plan", &add, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": false"), "{body}");
+        assert!(body.contains("\"kind\": \"clone-remote\""), "{body}");
+        assert!(
+            body.contains("gitmesh configure clone RAMforge --remote"),
+            "{body}"
+        );
+
+        // "Clone repository" sends the clone form; the core plans it and it is ready to review.
+        let clone = format!(
+            "intent=clone&path=RAMforge&id=RAMforge&remote={}",
+            url_encode(&remote)
+        );
+        let (status, body) = post(port, "/api/repository/plan", &clone, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": true"), "{body}");
+        assert!(body.contains("\"kind\": \"clone-repository\""), "{body}");
+        let plan_id = plan_id_from(&body);
+
+        // Confirmed, it runs: the directory is a clone of the remote, the manifest lists it.
+        let confirmed = format!("{clone}&planId={}", url_encode(&plan_id));
+        let (status, body) = post(port, "/api/repository/apply", &confirmed, None);
+        assert_eq!(status, 202, "{body}");
+        // The operation runs in the background; its event stream ends when it is complete.
+        let id = id_from(&body);
+        let (status, events) = get(port, &format!("/api/events/{id}"));
+        assert_eq!(status, 200);
+        assert!(events.contains("\"kind\":\"complete\""), "{events}");
+        let child = fixture.path().join("RAMforge");
+        assert!(child.join(".git").is_dir(), "the clone is there");
+        assert!(child.join("README.md").is_file());
+        let remote_head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        let child_head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&child)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            remote_head.stdout, child_head.stdout,
+            "the remote's history is kept"
+        );
+        let manifest =
+            std::fs::read_to_string(fixture.path().join(".gitmesh/project.toml")).unwrap();
+        assert_ne!(manifest, manifest_before);
+        assert!(manifest.contains("id = \"RAMforge\""), "{manifest}");
+        // The root repository does not track the child's files: the child is its own history.
+        let root_files = std::process::Command::new("git")
+            .arg("-C")
+            .arg(fixture.path())
+            .arg("ls-files")
+            .output()
+            .unwrap();
+        let root_files = String::from_utf8_lossy(&root_files.stdout).to_string();
+        assert!(!root_files.contains("RAMforge/"), "{root_files}");
+    }
+
+    #[test]
+    fn a_non_empty_destination_is_refused_by_the_gui_plan_with_its_files_kept() {
+        let fixture = project_with_a_candidate();
+        let bare = seeded_remote(fixture.outside_path());
+        let remote = bare.to_str().unwrap().to_string();
+        fixture.write("RAMforge/notes.txt", "keep me\n");
+        let (_gui, port) = open_gui(&fixture);
+
+        let clone = format!(
+            "intent=clone&path=RAMforge&id=RAMforge&remote={}",
+            url_encode(&remote)
+        );
+        let (status, body) = post(port, "/api/repository/plan", &clone, None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"ready\": false"), "{body}");
+        assert!(body.contains("not empty"), "{body}");
+        assert!(body.contains("\"recovery\": []"), "{body}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("RAMforge/notes.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(!fixture.path().join("RAMforge/.git").exists());
+    }
+
     #[test]
     fn refresh_rereads_the_project_so_outside_changes_appear_without_a_restart() {
         let fixture = RepoFixture::named("refresh");

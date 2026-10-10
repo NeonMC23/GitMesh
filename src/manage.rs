@@ -925,6 +925,8 @@ pub struct RepositoryPlan {
     pub removals: Vec<PlannedRemoval>,
     /// Reasons the whole plan cannot be applied.
     pub blockers: Vec<String>,
+    /// Actions that resolve a refusal (offered, never run by the plan itself).
+    pub recovery: Vec<PlanRecovery>,
     /// Things worth knowing before confirming.
     pub warnings: Vec<String>,
     /// Remarks that are not warnings (nothing to do, kept as it is, ...).
@@ -933,6 +935,62 @@ pub struct RepositoryPlan {
     pub safety: Vec<String>,
     /// Ids whose recorded remote the plan guarantees is `origin` after the run.
     pub expected_origins: Vec<String>,
+}
+
+/// An action that resolves a refused plan. It is offered next to the refusal and never runs by
+/// itself: it is a new request, reviewed and confirmed like any other change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRecovery {
+    /// Clone `remote` into `path` (missing, or an empty directory) as the repository `id`.
+    CloneRemote {
+        path: String,
+        id: String,
+        remote: String,
+    },
+}
+
+impl PlanRecovery {
+    /// Stable machine-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PlanRecovery::CloneRemote { .. } => "clone-remote",
+        }
+    }
+
+    /// One sentence, for people.
+    pub fn sentence(&self) -> String {
+        match self {
+            PlanRecovery::CloneRemote { path, id, remote } => {
+                format!("clone {remote} into '{path}' as repository '{id}'")
+            }
+        }
+    }
+
+    /// The exact command line that does the same thing, for the project at `project_root`.
+    pub fn command(&self, project_root: &Path) -> String {
+        match self {
+            PlanRecovery::CloneRemote { path, id, remote } => format!(
+                "gitmesh configure clone {} --remote {} --id {} -C {}",
+                shell_word(path),
+                shell_word(remote),
+                shell_word(id),
+                shell_word(&project_root.to_string_lossy())
+            ),
+        }
+    }
+}
+
+/// Quote one word for a POSIX shell, unless it is plainly safe as it is.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@+=,".contains(c));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 impl RepositoryPlan {
@@ -1127,6 +1185,7 @@ struct Planner {
     actions: Vec<RepositoryAction>,
     removals: Vec<PlannedRemoval>,
     blockers: Vec<String>,
+    recovery: Vec<PlanRecovery>,
     warnings: Vec<String>,
     notices: Vec<String>,
     expected_origins: Vec<String>,
@@ -1151,6 +1210,7 @@ pub fn plan(
         actions: Vec::new(),
         removals: Vec::new(),
         blockers: Vec::new(),
+        recovery: Vec::new(),
         warnings: Vec::new(),
         notices: Vec::new(),
         expected_origins: Vec::new(),
@@ -1302,6 +1362,7 @@ pub fn plan(
         actions: planner.actions,
         removals: planner.removals,
         blockers: planner.blockers,
+        recovery: planner.recovery,
         warnings: planner.warnings,
         notices: planner.notices,
         safety,
@@ -1516,6 +1577,9 @@ fn plan_add(
 
     let absolute = planner.project.root.join(&relative);
     if !absolute.is_dir() {
+        if let Some(url) = clean_url(remote) {
+            let _ = offer_clone(planner, path_label.clone(), id.clone(), url, runner);
+        }
         refuse(
             planner,
             RepositoryChangeKind::AddRepository,
@@ -1560,17 +1624,31 @@ fn plan_add(
                          will publish it"
                     ));
                 } else if !is_repository && discovery::is_empty_directory(&absolute) {
+                    let reason = match offer_clone(
+                        planner,
+                        path_label.clone(),
+                        id.clone(),
+                        url.clone(),
+                        runner,
+                    ) {
+                        None => format!(
+                            "'{path_label}' is an empty directory and the remote {url} already has \
+                             history; clone it instead, so the history is brought in rather than an \
+                             unrelated repository being created (the command is given below)"
+                        ),
+                        Some(why) => format!(
+                            "'{path_label}' is an empty directory and the remote {url} already has \
+                             history, so GitMesh will not create an unrelated repository there; a \
+                             clone is not possible either: {why}"
+                        ),
+                    };
                     refuse(
                         planner,
                         RepositoryChangeKind::AddRepository,
                         &id,
                         &path_label,
                         format!("add '{path_label}' as repository '{id}'"),
-                        format!(
-                            "'{path_label}' is an empty directory and the remote {url} already has \
-                             history; clone it instead (configure clone), so the history is brought \
-                             in rather than an unrelated repository being created"
-                        ),
+                        reason,
                     );
                     return;
                 }
@@ -2371,6 +2449,44 @@ fn plan_set_remote(
     }
 }
 
+/// Offer a clone as the way out of a refusal, but only if the clone itself would be accepted.
+///
+/// The offer is planned with the same planner the user would run, so a recovery can never be
+/// a command that GitMesh then refuses (for example, when another repository already uses the
+/// same remote). Nothing is changed by this check: it only plans.
+///
+/// Returns `None` when the clone was offered, and otherwise the reason it is not possible.
+fn offer_clone(
+    planner: &mut Planner,
+    path: String,
+    id: String,
+    remote: String,
+    runner: &GitRunner,
+) -> Option<String> {
+    let intent = RepositoryIntent::Clone {
+        path: path.clone(),
+        id: id.clone(),
+        remote: remote.clone(),
+        branch: None,
+    };
+    let candidate = match plan(
+        &planner.project,
+        &RepositoryManagementRequest::one(intent),
+        runner,
+    ) {
+        Ok(candidate) => candidate,
+        Err(err) => return Some(err.to_string()),
+    };
+    if candidate.is_ready() {
+        planner
+            .recovery
+            .push(PlanRecovery::CloneRemote { path, id, remote });
+        None
+    } else {
+        Some(candidate.blockers.join("; "))
+    }
+}
+
 /// Compare a repository with the history its remote already has, and plan the adoption when the
 /// repository has no commits yet.
 ///
@@ -2409,6 +2525,23 @@ fn plan_remote_history(
         format!("'{path_label}'")
     };
     let found = history::findings(&check, &label, url, newly_configured);
+    if !found.blockers.is_empty() && has_commits && path_label != "." {
+        // The recommended way out of unrelated histories is a clone of the remote into a new
+        // directory. The existing repository is left exactly as it is.
+        let sibling = format!("{path_label}-remote");
+        let sibling_path = Path::new(&sibling);
+        // An exact match only: the root repository contains every path.
+        let taken = planner.target.repositories.iter().any(|repo| {
+            !repo.is_root()
+                && paths::lexical_normalize(&repo.relative_path)
+                    == paths::lexical_normalize(sibling_path)
+        });
+        let free = !taken && !planner.project.root.join(sibling_path).exists();
+        if free {
+            let id = discovery::suggest_id(sibling_path, &planner.target);
+            let _ = offer_clone(planner, sibling, id, url.to_string(), runner);
+        }
+    }
     planner.blockers.extend(found.blockers);
     planner.warnings.extend(found.warnings);
     planner.notices.extend(found.notices);

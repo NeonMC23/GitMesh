@@ -748,7 +748,16 @@ fn run_repository_intent(
         eprintln!("gitmesh: note: {notice}");
     }
     if !plan.is_ready() {
-        return Err(Error::InvalidConfiguration(plan.blockers.clone()));
+        // A refusal says what to do next, with the exact command, not only what is wrong.
+        let mut lines = plan.blockers.clone();
+        for action in &plan.recovery {
+            lines.push(format!(
+                "to {} instead, run: {}",
+                action.sentence(),
+                action.command(&plan.root)
+            ));
+        }
+        return Err(Error::InvalidConfiguration(lines));
     }
     if dry_run {
         println!("{}", as_cli_sentence(&plan.summary()));

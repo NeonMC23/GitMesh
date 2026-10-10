@@ -96,11 +96,21 @@ fn stage_one(
         return base(OutcomeKind::Failed, "status could not be read".to_string());
     };
 
+    // Nested repositories that GitMesh does not manage are never staged here.
+    let entry_paths: Vec<&str> = status
+        .entries
+        .iter()
+        .filter(|entry| !entry.ignored)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let nested = util::nested_repositories(&repo.absolute_path, &entry_paths);
+
     let owned: Vec<&str> = status
         .entries
         .iter()
         .filter(|entry| !entry.ignored)
         .filter(|entry| !entry.staged || entry.unstaged || entry.untracked)
+        .filter(|entry| !util::is_within_nested(&nested, &entry.path))
         .filter(|entry| {
             !util::needs_exclusions(project, repo)
                 || util::relative_owned_by_external(project, &entry.path).is_none()
@@ -125,7 +135,7 @@ fn stage_one(
         );
     }
 
-    if let Err(err) = stage_owned(project, repo, git) {
+    if let Err(err) = stage_owned(project, repo, git, &nested) {
         return base(OutcomeKind::Failed, "staging failed".to_string())
             .with_detail(util::concise_git_error(&err.to_string()));
     }
@@ -145,7 +155,10 @@ fn stage_one(
         .unwrap_or_default();
     let stray: Vec<String> = staged
         .iter()
-        .filter(|p| util::relative_owned_by_external(project, p).is_some())
+        .filter(|p| {
+            util::relative_owned_by_external(project, p).is_some()
+                || util::is_within_nested(&nested, p)
+        })
         .cloned()
         .collect();
     if !stray.is_empty() {
@@ -170,11 +183,10 @@ fn stage_owned(
     project: &GitMeshProject,
     repo: &PhysicalRepository,
     git: &GitRepo<'_>,
+    nested: &[String],
 ) -> Result<()> {
     let mut args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-    if util::needs_exclusions(project, repo) {
-        args.extend(util::exclusion_pathspecs(project));
-    }
+    args.extend(util::staging_exclusions(project, repo, nested));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     git.run_checked(&args)?;
     Ok(())

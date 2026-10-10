@@ -254,6 +254,47 @@ pub fn relative_owned_by_external<'a>(
     })
 }
 
+/// Repositories nested in a repository's working tree that GitMesh does not manage.
+///
+/// `entries` are repository-relative paths from `git status` (untracked directories and
+/// tracked gitlinks come out as one entry each). An entry is nested when the directory holds a
+/// `.git` of its own. Ignored paths are never passed in, so no ignore rule is added or changed,
+/// and a nested repository is never staged into the repository that contains it.
+pub fn nested_repositories(repo_path: &Path, entries: &[&str]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.trim_end_matches('/'))
+        .filter(|entry| !entry.is_empty() && *entry != ".")
+        .filter(|entry| {
+            let dir = repo_path.join(entry);
+            dir.is_dir() && dir.join(".git").exists()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Is `path` (repository-relative) the nested repository `nested`, or inside one?
+pub fn is_within_nested(nested: &[String], path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    nested
+        .iter()
+        .any(|n| path == n || path.starts_with(&format!("{n}/")))
+}
+
+/// `git add` pathspec exclusions for one repository: its nested repositories, and in the root
+/// repository also the external repositories of the project.
+pub fn staging_exclusions(
+    project: &GitMeshProject,
+    repo: &PhysicalRepository,
+    nested: &[String],
+) -> Vec<String> {
+    let mut specs: Vec<String> = nested.iter().map(|n| format!(":(exclude){n}")).collect();
+    if needs_exclusions(project, repo) {
+        specs.extend(exclusion_pathspecs(project));
+    }
+    specs
+}
+
 /// Like [`concise_git_error`], but `None` when Git printed nothing useful.
 pub fn concise_git_error_opt(stderr: &str) -> Option<String> {
     let cleaned: Vec<String> = stderr
@@ -397,5 +438,71 @@ mod tests {
         assert!(relative_owned_by_external(&project, "engine/").is_some());
         assert!(relative_owned_by_external(&project, "engine/src/lib.rs").is_some());
         assert!(relative_owned_by_external(&project, "src/lib.rs").is_none());
+    }
+}
+
+#[cfg(test)]
+mod nested_repository_tests {
+    use super::*;
+    use crate::testkit::TempDir;
+
+    #[test]
+    fn a_directory_with_its_own_git_is_nested_and_others_are_not() {
+        let tmp = TempDir::new("util-nested").unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("scratch/.git")).unwrap();
+        std::fs::create_dir_all(root.join("plain/src")).unwrap();
+        std::fs::write(root.join("notes.md"), "x").unwrap();
+
+        let entries = ["scratch/", "plain/", "notes.md", "."];
+        assert_eq!(
+            nested_repositories(root, &entries),
+            vec!["scratch".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_git_file_marks_a_nested_repository_too() {
+        // Worktrees and submodule checkouts use a `.git` file rather than a directory.
+        let tmp = TempDir::new("util-nested-file").unwrap();
+        std::fs::create_dir_all(tmp.path().join("linked")).unwrap();
+        std::fs::write(tmp.path().join("linked/.git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(
+            nested_repositories(tmp.path(), &["linked"]),
+            vec!["linked".to_string()]
+        );
+    }
+
+    #[test]
+    fn paths_inside_a_nested_repository_are_recognised() {
+        let nested = vec!["scratch".to_string()];
+        assert!(is_within_nested(&nested, "scratch"));
+        assert!(is_within_nested(&nested, "scratch/"));
+        assert!(is_within_nested(&nested, "scratch/src/a.rs"));
+        assert!(!is_within_nested(&nested, "scratchpad/a.rs"));
+        assert!(!is_within_nested(&nested, "notes.md"));
+    }
+
+    #[test]
+    fn staging_excludes_nested_repositories_in_every_repository() {
+        let project = crate::model::GitMeshProject {
+            name: "p".into(),
+            root: PathBuf::from("/p"),
+            repositories: vec![crate::model::PhysicalRepository {
+                id: "engine".into(),
+                role: RepositoryRole::External,
+                relative_path: PathBuf::from("engine"),
+                remote_url: None,
+                branch: None,
+                absolute_path: PathBuf::from("/p/engine"),
+            }],
+        };
+        let nested = vec!["vendor/lib".to_string()];
+        let engine = project.repository("engine").unwrap();
+        assert_eq!(
+            staging_exclusions(&project, engine, &nested),
+            vec![":(exclude)vendor/lib".to_string()]
+        );
+        assert!(staging_exclusions(&project, engine, &[]).is_empty());
     }
 }

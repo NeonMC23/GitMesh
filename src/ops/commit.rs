@@ -146,12 +146,23 @@ fn commit_one(
         return base(OutcomeKind::Failed, "status could not be read".to_string());
     };
 
+    // Repositories nested in this working tree that GitMesh does not manage are never part of
+    // this repository's commits (a nested `.git` would otherwise be recorded as a gitlink).
+    let entry_paths: Vec<&str> = status
+        .entries
+        .iter()
+        .filter(|entry| !entry.ignored)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let nested = util::nested_repositories(&repo.absolute_path, &entry_paths);
+
     // Changes this repository owns, excluding anything that belongs to an external
-    // repository (only possible in the root repository).
+    // repository (only possible in the root repository) or to a nested repository.
     let owned: Vec<String> = status
         .entries
         .iter()
         .filter(|entry| !entry.ignored)
+        .filter(|entry| !util::is_within_nested(&nested, &entry.path))
         .filter(|entry| {
             if util::needs_exclusions(project, repo) {
                 util::relative_owned_by_external(project, &entry.path).is_none()
@@ -193,18 +204,28 @@ fn commit_one(
 
     // ---- stage -------------------------------------------------------------
     if !options.staged_only {
-        if let Err(err) = stage_all(project, repo, git) {
+        if let Err(err) = stage_all(project, repo, git, &nested) {
             return base(OutcomeKind::Failed, "staging failed".to_string())
                 .with_detail(err.to_string());
         }
     }
 
     let mut details: Vec<String> = Vec::new();
+    if !nested.is_empty() {
+        details.push(format!(
+            "left out {} nested repository(ies) that GitMesh does not manage: {}",
+            nested.len(),
+            nested.join(", ")
+        ));
+    }
     if let Ok(Some(staged)) = git.run_optional(&["diff", "--cached", "--name-only", "-z"]) {
         let stray: Vec<String> = staged
             .split('\0')
             .filter(|p| !p.is_empty())
-            .filter(|p| util::relative_owned_by_external(project, p).is_some())
+            .filter(|p| {
+                util::relative_owned_by_external(project, p).is_some()
+                    || util::is_within_nested(&nested, p)
+            })
             .map(str::to_string)
             .collect();
         if !stray.is_empty() {
@@ -273,11 +294,14 @@ fn commit_one(
 }
 
 /// Stage every change of a repository, excluding directories owned elsewhere.
-fn stage_all(project: &GitMeshProject, repo: &PhysicalRepository, git: &GitRepo<'_>) -> Result<()> {
+fn stage_all(
+    project: &GitMeshProject,
+    repo: &PhysicalRepository,
+    git: &GitRepo<'_>,
+    nested: &[String],
+) -> Result<()> {
     let mut args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-    if util::needs_exclusions(project, repo) {
-        args.extend(util::exclusion_pathspecs(project));
-    }
+    args.extend(util::staging_exclusions(project, repo, nested));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     git.run_checked(&args)?;
     Ok(())
