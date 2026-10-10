@@ -455,3 +455,7 @@ in GitMesh. The review shows the plan the service built, exactly as for the othe
 remote is read before anything is cloned, and a directory that already has files is refused
 without being touched. The same operation is `gitmesh configure clone` on the command line.
 See [REPOSITORIES.md](REPOSITORIES.md) for the rules and the sync error messages.
+
+## Repository history checks
+
+Project setup and "Add repository" show a **Repository history** step when a remote is connected. Its role is "History". The step is planned by the Rust core and only displayed here: an empty repository adopting its remote's history, a remote that cannot be read (a warning), or an unrelated history (the plan is blocked, and the review shows the blocker and the recovery options from [REPOSITORIES.md](REPOSITORIES.md)). A push that the preflight refuses shows the refusal and its guidance in the repository's result; the GUI never offers a force-push.

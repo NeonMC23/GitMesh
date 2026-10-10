@@ -11,6 +11,7 @@
 
 use crate::analyzer::Analyzer;
 use crate::error::Result;
+use crate::git::history::{self, PushVerdict};
 use crate::git::GitRepo;
 use crate::model::{GitMeshProject, PhysicalRepository, RepositoryState};
 use crate::ops::sync::classify_transport_hint;
@@ -157,6 +158,16 @@ fn push_one(
                 .map(|r| format!("configured remote: {}", r.name))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    // Check the destination before anything is pushed. Unrelated or advanced remote histories
+    // and branch-name mismatches are explained here, with the way out, instead of by a rejected
+    // push. The remote is fetched first (remote-tracking refs only), so the check sees what the
+    // remote really has now.
+    if let PushVerdict::Refuse { summary, guidance } =
+        history::push_preflight(git, &remote_name, &branch, upstream.as_deref())
+    {
+        return base(OutcomeKind::Failed, summary).with_details(guidance);
     }
 
     let commit_count = ahead.max(if upstream.is_none() { 1 } else { 0 });

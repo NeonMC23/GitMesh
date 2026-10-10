@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 
 use crate::discovery::{self, OriginChange};
 use crate::error::{Error, Result};
+use crate::git::history;
 use crate::git::GitRunner;
 use crate::manifest;
 use crate::model::{GitMeshProject, PhysicalRepository, RepositoryRole};
@@ -491,7 +492,8 @@ pub fn inspect_candidate(
     let empty_directory = exists && !is_repository && discovery::is_empty_directory(&absolute);
     if is_repository && !has_commits {
         warnings.push(format!(
-            "'{}' has no commits yet: pull and push skip it until its first commit",
+            "'{}' has no commits yet: pull and push skip it until it has a commit (a remote \
+             that already has history is adopted when it is connected)",
             to_slash(&relative)
         ));
     }
@@ -772,6 +774,8 @@ pub enum RepositoryActionKind {
     UpdateRemote,
     /// Stop tracking a directory's files in the root repository.
     UntrackFromRoot,
+    /// Check out the remote's existing history into a repository that has no commits yet.
+    AdoptRemoteHistory,
     /// Write the configuration to `.gitmesh/project.toml`.
     UpdateManifest,
     /// Re-open the project and check every repository after the change.
@@ -788,6 +792,7 @@ impl RepositoryActionKind {
             RepositoryActionKind::ConfigureRemote => "configure-remote",
             RepositoryActionKind::UpdateRemote => "update-remote",
             RepositoryActionKind::UntrackFromRoot => "untrack-from-root",
+            RepositoryActionKind::AdoptRemoteHistory => "adopt-remote-history",
             RepositoryActionKind::UpdateManifest => "update-manifest",
             RepositoryActionKind::VerifyProject => "verify-project",
         }
@@ -800,6 +805,7 @@ impl RepositoryActionKind {
             | RepositoryActionKind::InitializeRepository
             | RepositoryActionKind::CloneRepository => "Repositories",
             RepositoryActionKind::ConfigureRemote | RepositoryActionKind::UpdateRemote => "Remotes",
+            RepositoryActionKind::AdoptRemoteHistory => "Repositories",
             RepositoryActionKind::UntrackFromRoot => "Ownership",
             RepositoryActionKind::UpdateManifest => "Configuration",
             RepositoryActionKind::VerifyProject => "Validation",
@@ -824,6 +830,7 @@ impl RepositoryActionKind {
             | RepositoryActionKind::InitializeRepository
             | RepositoryActionKind::CloneRepository => "Repository",
             RepositoryActionKind::ConfigureRemote | RepositoryActionKind::UpdateRemote => "Remote",
+            RepositoryActionKind::AdoptRemoteHistory => "History",
             RepositoryActionKind::UntrackFromRoot => "Root index",
             RepositoryActionKind::UpdateManifest => "Manifest",
             RepositoryActionKind::VerifyProject => "Validation",
@@ -1590,21 +1597,6 @@ fn plan_add(
     }
 
     // ---- the repository itself -------------------------------------------------
-    if is_repository && !has_commits {
-        if let Some(url) = clean_url(remote) {
-            if let crate::git::RemoteProbe::Reachable { branches, .. } =
-                crate::git::probe_remote(runner, &url)
-            {
-                if !branches.is_empty() {
-                    planner.notices.push(format!(
-                        "'{path_label}' has no commits, but {url} already has history: GitMesh \
-                         does not merge that history into an empty repository. Make the first \
-                         commit here, or clone the remote into a new directory instead"
-                    ));
-                }
-            }
-        }
-    }
     if is_repository {
         let mut detail = if has_commits {
             format!(
@@ -1678,8 +1670,20 @@ fn plan_add(
         &id,
         &path_label,
         clean_url(remote),
-        origin,
+        origin.clone(),
         configure_remote,
+    );
+    plan_remote_history(
+        planner,
+        &id,
+        &path_label,
+        &absolute,
+        has_commits,
+        recorded.as_deref(),
+        configure_remote,
+        origin.as_deref(),
+        clean_text(branch),
+        runner,
     );
 
     // ---- ownership -------------------------------------------------------------
@@ -2343,7 +2347,20 @@ fn plan_set_remote(
         ));
     }
 
-    let recorded = plan_remote_change(planner, id, &path_label, wanted, origin, configure);
+    let has_commits = is_repository && runner.repo(&absolute).head_oid().ok().flatten().is_some();
+    let recorded = plan_remote_change(planner, id, &path_label, wanted, origin.clone(), configure);
+    plan_remote_history(
+        planner,
+        id,
+        &path_label,
+        &absolute,
+        has_commits,
+        recorded.as_deref(),
+        configure,
+        origin.as_deref(),
+        repo.branch.clone(),
+        runner,
+    );
     if let Some(target) = planner
         .target
         .repositories
@@ -2351,6 +2368,61 @@ fn plan_set_remote(
         .find(|candidate| candidate.id == id)
     {
         target.remote_url = recorded;
+    }
+}
+
+/// Compare a repository with the history its remote already has, and plan the adoption when the
+/// repository has no commits yet.
+///
+/// `recorded` is the remote the plan records. Git is only checked against it when `origin` will
+/// really be that URL: configured by this plan, or already there. A remote that is only recorded
+/// is not compared, because nothing would be pushed to it. `newly_configured` is true when this
+/// plan adds or replaces `origin`; that is what makes a conflict block the plan (see
+/// [`history::findings`]).
+#[allow(clippy::too_many_arguments)]
+fn plan_remote_history(
+    planner: &mut Planner,
+    id: &str,
+    path_label: &str,
+    absolute: &Path,
+    has_commits: bool,
+    recorded: Option<&str>,
+    configure: bool,
+    origin: Option<&str>,
+    wanted_branch: Option<String>,
+    runner: &GitRunner,
+) {
+    let Some(url) = recorded else {
+        return;
+    };
+    let git_origin_will_be = configure || origin == Some(url);
+    if !git_origin_will_be {
+        return;
+    }
+    let newly_configured = origin != Some(url);
+    let dir = has_commits.then_some(absolute);
+    let check =
+        history::check_remote_history(runner, dir, has_commits, url, wanted_branch.as_deref());
+    let label = if path_label == "." {
+        "the project root".to_string()
+    } else {
+        format!("'{path_label}'")
+    };
+    let found = history::findings(&check, &label, url, newly_configured);
+    planner.blockers.extend(found.blockers);
+    planner.warnings.extend(found.warnings);
+    planner.notices.extend(found.notices);
+    if let Some(branch) = found.adopt_branch {
+        planner.actions.push(RepositoryAction {
+            kind: RepositoryActionKind::AdoptRemoteHistory,
+            target: id.to_string(),
+            path: path_label.to_string(),
+            detail: format!(
+                "check out origin's '{branch}' branch as the history of '{path_label}'; local files \
+                 are kept and Git refuses to overwrite one"
+            ),
+            state: StepState::Planned,
+        });
     }
 }
 
@@ -3027,6 +3099,45 @@ fn run_action(
                 };
                 RepositoryActionOutcome::new(action, OutcomeKind::Success, summary)
             })
+        }
+        RepositoryActionKind::AdoptRemoteHistory => {
+            let wanted = plan
+                .target
+                .repository(&action.target)
+                .and_then(|repo| repo.branch.clone());
+            let url = discovery::origin_url(&path, runner)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let branch = match crate::git::probe_remote(runner, &url) {
+                crate::git::RemoteProbe::Reachable {
+                    default_branch,
+                    branches,
+                } => history::adoption_branch(
+                    default_branch.as_deref(),
+                    &branches,
+                    wanted.as_deref(),
+                ),
+                crate::git::RemoteProbe::Unreachable { .. } => None,
+            };
+            match branch {
+                None => Err(Error::Other(format!(
+                    "{url} has no branch to adopt; nothing was changed"
+                ))),
+                Some(branch) => discovery::adopt_remote_history(&path, &branch, runner).map(|adopted| {
+                    match adopted {
+                        Some(head) => RepositoryActionOutcome::new(
+                            action,
+                            OutcomeKind::Success,
+                            format!("checked out origin's '{branch}' branch ({head}); local files were kept"),
+                        ),
+                        None => RepositoryActionOutcome::new(
+                            action,
+                            OutcomeKind::Skipped,
+                            "the repository already has commits; its history is kept as it is",
+                        ),
+                    }
+                }),
+            }
         }
         RepositoryActionKind::UntrackFromRoot => {
             let relative = plan

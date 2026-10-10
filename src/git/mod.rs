@@ -4,6 +4,7 @@
 //! knows about GitMesh projects, manifests or orchestration.
 
 pub mod command;
+pub mod history;
 pub mod remote;
 pub mod status;
 

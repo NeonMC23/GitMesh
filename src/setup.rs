@@ -34,6 +34,7 @@ use crate::discovery::{
     self, DirectoryNode, DiscoveredRepository, OriginChange, ProjectScan, ScanOptions,
 };
 use crate::error::{Error, Result};
+use crate::git::history;
 use crate::git::GitRunner;
 use crate::manifest;
 use crate::model::{GitMeshProject, PhysicalRepository, RepositoryRole};
@@ -521,6 +522,8 @@ pub enum SetupStepKind {
     CreateRepository,
     /// Add or update the `origin` remote.
     ConfigureRemote,
+    /// Check out the remote's existing history into a repository that has no commits yet.
+    AdoptRemoteHistory,
     /// Stop tracking a directory in the root repository (files stay on disk).
     UntrackFromRoot,
     /// Write `.gitmesh/project.toml`.
@@ -534,6 +537,7 @@ impl SetupStepKind {
             SetupStepKind::CreateMetadataDir => "create-metadata",
             SetupStepKind::CreateRepository => "create-repository",
             SetupStepKind::ConfigureRemote => "configure-remote",
+            SetupStepKind::AdoptRemoteHistory => "adopt-remote-history",
             SetupStepKind::UntrackFromRoot => "untrack-from-root",
             SetupStepKind::WriteManifest => "write-manifest",
         }
@@ -545,6 +549,7 @@ impl SetupStepKind {
             SetupStepKind::CreateMetadataDir => "Project metadata",
             SetupStepKind::CreateRepository => "Repositories",
             SetupStepKind::ConfigureRemote => "Remote configuration",
+            SetupStepKind::AdoptRemoteHistory => "Repository history",
             SetupStepKind::UntrackFromRoot => "Repository ownership",
             SetupStepKind::WriteManifest => "Manifest",
         }
@@ -671,6 +676,9 @@ pub struct PlannedRepository {
     pub tracked_by_root: usize,
     /// True when the plan untracks those files from the root repository.
     pub untrack: bool,
+    /// The remote branch whose history this repository adopts, when it has no commits yet and
+    /// its remote already has history. `None` when nothing is adopted.
+    pub adopt_branch: Option<String>,
 }
 
 impl PlannedRepository {
@@ -692,6 +700,9 @@ impl PlannedRepository {
             (RemoteAction::None, _) => actions.push("no remote".to_string()),
             (action, None) => actions.push(format!("remote {}", action.label())),
         }
+        if let Some(branch) = &self.adopt_branch {
+            actions.push(format!("adopt the history of origin's '{branch}'"));
+        }
         if self.untrack {
             actions.push("stop tracking it in the root repository".to_string());
         }
@@ -705,6 +716,7 @@ impl PlannedRepository {
         self.create
             || matches!(self.remote_action, RemoteAction::Add | RemoteAction::Update)
             || self.untrack
+            || self.adopt_branch.is_some()
     }
 }
 
@@ -1002,6 +1014,7 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
         ),
         tracked_by_root: 0,
         untrack: false,
+        adopt_branch: None,
     }];
 
     if !root_is_repository && !request.create_root_repository {
@@ -1224,7 +1237,50 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
             remote_action: action,
             tracked_by_root,
             untrack,
+            adopt_branch: None,
         });
+    }
+
+    // ---- remote history ------------------------------------------------
+    // Every repository that gets (or keeps) an `origin` is compared with the history that
+    // origin already has, before anything is created. The root repository is checked the same
+    // way. See `git::history` for the rules.
+    // Iterate over a snapshot: the loop writes the adoption branch back into `repositories`.
+    for (index, planned) in repositories.clone().into_iter().enumerate() {
+        let Some(url) = planned.remote.clone() else {
+            continue;
+        };
+        let newly_configured = match planned.remote_action {
+            RemoteAction::Add | RemoteAction::Update => true,
+            RemoteAction::Keep => false,
+            RemoteAction::None | RemoteAction::Record => continue,
+        };
+        if planned.remote_action == RemoteAction::Update && !request.overwrite_remotes {
+            continue; // already refused above
+        }
+        let wanted = project
+            .repositories
+            .iter()
+            .find(|repo| repo.id == planned.id)
+            .and_then(|repo| repo.branch.clone());
+        let dir = root.join(&planned.path);
+        let check = history::check_remote_history(
+            runner,
+            planned.has_commits.then_some(dir.as_path()),
+            planned.has_commits,
+            &url,
+            wanted.as_deref(),
+        );
+        let label = if planned.path == "." {
+            "the project root".to_string()
+        } else {
+            format!("'{}'", planned.path)
+        };
+        let found = history::findings(&check, &label, &url, newly_configured);
+        blockers.extend(found.blockers);
+        warnings.extend(found.warnings);
+        notices.extend(found.notices);
+        repositories[index].adopt_branch = found.adopt_branch;
     }
 
     // ---- the configuration itself --------------------------------------
@@ -1357,6 +1413,19 @@ pub fn plan(request: &SetupRequest, runner: &GitRunner) -> Result<SetupPlan> {
             RemoteAction::Record | RemoteAction::None => {}
         }
 
+        if let Some(branch) = &repo.adopt_branch {
+            steps.push(SetupStep {
+                kind: SetupStepKind::AdoptRemoteHistory,
+                target: repo.id.clone(),
+                path: repo.path.clone(),
+                detail: format!(
+                    "check out origin's '{branch}' branch as the history of {label}; local files \
+                     are kept and Git refuses to overwrite one"
+                ),
+                state: StepState::Planned,
+            });
+        }
+
         if repo.untrack {
             steps.push(SetupStep {
                 kind: SetupStepKind::UntrackFromRoot,
@@ -1486,6 +1555,13 @@ fn safety_statements(
         "no existing .git directory is deleted or re-initialised".to_string(),
         "no file is moved, renamed or deleted".to_string(),
     ];
+    if repositories.iter().any(|repo| repo.adopt_branch.is_some()) {
+        lines.push(
+            "no commit is discarded and no local file is overwritten: an existing remote history \
+             is only checked out, and Git refuses a checkout that would overwrite a file"
+                .to_string(),
+        );
+    }
     let updates: Vec<&str> = repositories
         .iter()
         .filter(|repo| repo.remote_action == RemoteAction::Update)
@@ -1846,7 +1922,9 @@ pub fn apply(
         // manifest is only written once, at the end of the plan.
         if matches!(
             step.kind,
-            SetupStepKind::ConfigureRemote | SetupStepKind::UntrackFromRoot
+            SetupStepKind::ConfigureRemote
+                | SetupStepKind::AdoptRemoteHistory
+                | SetupStepKind::UntrackFromRoot
         ) && failed_repositories.contains(&step.target)
         {
             let outcome = SetupStepOutcome::new(
@@ -1934,6 +2012,27 @@ pub fn apply(
                                 .to_string(),
                         )
                     })
+            }
+            SetupStepKind::AdoptRemoteHistory => {
+                let path = plan.root.join(&step.path);
+                let branch = plan
+                    .repositories
+                    .iter()
+                    .find(|repo| repo.id == step.target)
+                    .and_then(|repo| repo.adopt_branch.clone())
+                    .unwrap_or_default();
+                discovery::adopt_remote_history(&path, &branch, runner).map(|adopted| match adopted {
+                    Some(head) => SetupStepOutcome::new(
+                        step,
+                        OutcomeKind::Success,
+                        format!("checked out origin's '{branch}' branch ({head}); local files were kept"),
+                    ),
+                    None => SetupStepOutcome::new(
+                        step,
+                        OutcomeKind::Skipped,
+                        "the repository already has commits; its history is kept as it is".to_string(),
+                    ),
+                })
             }
             SetupStepKind::WriteManifest => match manifest::save_project(&plan.project) {
                 Ok(path) => {

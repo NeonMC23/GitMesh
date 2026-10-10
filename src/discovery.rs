@@ -827,6 +827,54 @@ pub fn clone_repository(url: &str, path: &Path, runner: &GitRunner) -> Result<Op
     }
 }
 
+/// Adopt the history of `origin/<branch>` into a repository that has no commits yet.
+///
+/// This is the remote-first path: the repository's first commit is the remote's, so a later
+/// commit and push build on it instead of starting an unrelated history. Only an unborn branch
+/// is changed. The checkout is Git's own: a file the checkout would overwrite is refused, the
+/// refusal names the file, and nothing is changed. Files that are not in the remote's history
+/// stay exactly where they are.
+///
+/// Returns `None` when the repository already has commits (its history is kept as it is), and
+/// otherwise the short id of the adopted commit.
+pub fn adopt_remote_history(
+    path: &Path,
+    branch: &str,
+    runner: &GitRunner,
+) -> Result<Option<String>> {
+    let repo = runner.repo(path);
+    if repo.head_oid()?.is_some() {
+        return Ok(None);
+    }
+    repo.run_checked(&["fetch", "--quiet", "origin"])?;
+    let remote_ref = format!("origin/{branch}");
+    let exists = repo
+        .run_optional(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote_ref}^{{commit}}"),
+        ])?
+        .is_some();
+    if !exists {
+        return Err(Error::Other(format!(
+            "origin has no branch '{branch}' to adopt; nothing was changed"
+        )));
+    }
+    // `-B` on an unborn branch only names it. Git refuses, without changing anything, when a
+    // local file is in the way.
+    let out = repo.run(&["checkout", "-q", "-B", branch, "--track", &remote_ref])?;
+    if !out.success() {
+        return Err(Error::Other(format!(
+            "could not check out {remote_ref}: {}. Nothing was changed and local files are kept; \
+             move the files Git names out of the way, then run the same command again",
+            crate::git::condense_git_error(&out.stderr)
+        )));
+    }
+    let head = repo.run_checked(&["rev-parse", "--short", "HEAD"])?;
+    Ok(Some(head.trim().to_string()))
+}
+
 /// Point `origin` of the repository at `repo_path` to `url`, adding it when missing.
 ///
 /// Only the remote itself is touched: no fetch, no push, no branch is created. An

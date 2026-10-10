@@ -298,6 +298,17 @@ fn cmd_init(
     // Re-check after the setup: the answer must describe the directory as it now is.
     let is_repository = discovery::is_repository_root(&root, true, runner);
 
+    // A repository that had no commits adopted its remote's history: say so, in both views.
+    let adopted: Vec<String> = result
+        .outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome.kind == setup::SetupStepKind::AdoptRemoteHistory
+                && outcome.outcome == OutcomeKind::Success
+        })
+        .map(|outcome| format!("{}: {}", outcome.target, outcome.summary))
+        .collect();
+
     if global.json {
         println!(
             "{}",
@@ -310,6 +321,10 @@ fn cmd_init(
                     "warnings",
                     Json::array(plan.warnings.iter().map(|w| Json::from(w.as_str())))
                 ),
+                (
+                    "adopted_history",
+                    Json::array(adopted.iter().map(|line| Json::from(line.as_str())))
+                ),
             ])
             .to_pretty_string()
         );
@@ -319,6 +334,9 @@ fn cmd_init(
     println!("Created GitMesh project '{}'", project.name);
     println!("  root:     {}", project.root.display());
     println!("  manifest: {}", path.display());
+    for line in &adopted {
+        println!("  history:  {line}");
+    }
     // What the plan decided to leave alone is part of the answer, not a footnote the user
     // has to discover later.
     for warning in &plan.warnings {

@@ -253,3 +253,14 @@ operations must keep working with no network at all.
 ## 9. Remote and lifecycle checks
 
 `src/git/remote.rs` reads remotes without changing anything: `probe_remote` (`git ls-remote`), push refusals from `git push --porcelain`, divergence and shared-history checks (`git rev-list --left-right --count` and `git merge-base`), and whether a tracked branch still exists after a fetch. Planning (`manage.rs`) probes the remote before recording or cloning it; execution (`discovery::clone_repository`) refuses a non-empty destination before Git runs. Sync (`ops/push.rs`, `ops/sync.rs`) classifies refusals from structured status, not English message text. See [REPOSITORIES.md](REPOSITORIES.md).
+
+### Repository lifecycle rules (`src/git/history.rs`)
+
+One module decides how a repository meets its remote. Setup (`setup.rs`), repository management (`manage.rs`) and push (`ops/push.rs`) all call it; the GUI, TUI and CLI reach these through the same planners, so no interface has its own rules.
+
+- `check_remote_history` lists the remote's branches (`git ls-remote`) and fetches exactly those names with `--no-write-fetch-head`. It writes no branch and no `FETCH_HEAD`, and it does not change the working tree.
+- The result is classified: empty remote, unreachable remote, adopt (unborn local plus remote history), related or descended history, or unrelated history (blocker when the connection is new).
+- Adoption (`discovery::adopt_remote_history`) runs only after the remote is configured and only on a repository without commits: `git fetch`, then `git checkout -B <branch> --track origin/<branch>`. Git refuses the checkout when a local file would be overwritten, and nothing is changed in that case.
+- `push_preflight` runs before any push and refuses an unrelated history, a diverged or advanced branch, an unreadable remote, and a branch-name mismatch. It never force-pushes.
+- Nothing merges, resets, or rewrites history automatically. The only merge is one the user starts with `pull --strategy merge`, or with Git directly.
+

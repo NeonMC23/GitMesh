@@ -1192,6 +1192,7 @@ fn setup_step_role(kind: SetupStepKind) -> &'static str {
         SetupStepKind::CreateMetadataDir => "Metadata",
         SetupStepKind::CreateRepository => "Repository",
         SetupStepKind::ConfigureRemote => "Remote",
+        SetupStepKind::AdoptRemoteHistory => "History",
         SetupStepKind::UntrackFromRoot => "Root index",
         SetupStepKind::WriteManifest => "Manifest",
     }

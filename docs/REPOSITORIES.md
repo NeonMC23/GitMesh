@@ -78,15 +78,33 @@ If the remote is unreachable at that point, the directory is still added with a 
 that a temporary network problem does not block the setup. Check the remote before the next
 sync.
 
-If the remote is empty, the plan says so. Pushing the first commits publishes the repository.
+If the remote is empty, the plan says so. Pushing the first commits publishes the repository
+on the branch the project is configured for.
 
-**Do not connect an empty folder to a remote that has history.** GitMesh refuses to `git init`
-an empty folder whose remote already has commits, because the result would be an unrelated
-history. Clone the remote into a new or empty directory instead (`configure clone`).
+**Before anything is connected, GitMesh reads the remote's history** (a read-only fetch of its
+branches). The result decides what happens:
 
-**A repository without commits does not receive its remote's history.** Connecting it records
-the remote, and the review says that the history is not merged in. Pull skips the repository
-until it has a commit. To work from the remote's history, clone it into a new directory.
+- **The repository has no commits and the remote has history.** GitMesh adopts the remote's
+  history: it checks out the remote's branch over the empty repository and keeps your untracked
+  files. The branch is the one configured for the repository, otherwise the remote's default
+  branch, so a remote whose default branch is `master` is adopted as `master`. If one of your
+  files has the same name as a file in the remote, the step stops, nothing is overwritten, and
+  Git's message names the file. Move or rename it, then run the command again.
+- **The repository has its own commits and the remote shares no commit with them.** The plan is
+  **blocked**. Nothing is configured, committed or pushed. You have two ways forward:
+  1. keep this history and connect an **empty** remote (or a new one), or
+  2. clone the remote into a new directory with `configure clone`, then copy your files across
+     and commit there.
+
+  GitMesh does not merge unrelated histories. See "Recovering from unrelated histories" below.
+- **The repository's history already descends from the remote.** It is kept as it is; nothing
+  is adopted or rewritten.
+- **The remote cannot be read** (wrong URL, missing path, no network, no access). The repository
+  is still recorded with a warning, so a temporary network problem does not block setup. The
+  next push refuses until the remote is readable.
+
+Running the same command again does not add a second `origin`, a second commit or a second
+history. A repeated configuration with the same URL plans nothing.
 
 A directory that does not exist yet is refused with a pointer to `configure clone`, not
 created silently.
@@ -108,6 +126,55 @@ created silently.
   because it is broken whatever the upstream is. A reachable remote is reported as "no upstream",
   with the one command that fits (if there is exactly one reading).
 - Fetch never changes your branches or working files. Pull is a separate step.
+
+## Push preflight
+
+Before a push, GitMesh fetches the remote and checks the destination branch. Nothing is pushed
+when a check fails, and the reason is given in the summary and the details:
+
+| Situation | Result | What to do |
+| --- | --- | --- |
+| The remote cannot be read (URL, network, authentication, permission) | Refused, with the Git error and hints for each cause | Fix the URL, check your credentials or access, then push again |
+| The branch has no counterpart on the remote, and the remote has no branches | Pushed as the first publication | none |
+| The remote's branch is ahead of yours | Refused: "pull first" | `gitmesh pull --strategy merge` (or `rebase`), then push |
+| Your history and the remote's diverged | Refused: "diverged" | Integrate deliberately (`pull --strategy merge` or `rebase`), then push |
+| Your history shares no commit with the remote's branch | Refused: "unrelated histories" | See below |
+| The remote has branches, none with your history, and your branch's name is not on it | Refused: "no commits in common" with a branch-name hint | Push under the name the remote uses, or rename your local branch to match (`git branch -m <name>`) |
+
+The preflight never force-pushes and never rewrites history. A refused push leaves your
+branch and the remote exactly as they were.
+
+## Recovering from unrelated histories
+
+A repository's history and its remote's history share no commit. Two common causes: a project
+was created with its own first commit before the remote was connected, or the remote was
+initialised with its own README. Choose one of these:
+
+**A. Clone the remote and bring your files over (recommended).**
+
+```sh
+gitmesh configure clone libs/core-new --remote <url>   # or: git clone <url> libs/core-new
+# copy your files into libs/core-new, then:
+cd libs/core-new && gitmesh commit -m "Import local work" && gitmesh push
+```
+
+Your original directory is not changed by this. Once you have checked the new clone, remove the
+old entry with `gitmesh configure remove <id>`. It never deletes files. If the root repository
+tracks files inside the old directory, the removal asks for `--confirm-takeover`, which gives
+those files back to the root.
+
+**B. Keep your history and join the two (a deliberate merge, outside GitMesh).** This creates one
+merge commit that contains both histories. Do it only when you intend both histories to be
+kept together:
+
+```sh
+git fetch origin
+git merge --allow-unrelated-histories origin/main   # resolve any conflicts, then commit
+gitmesh push
+```
+
+Review the merge before pushing. GitMesh does not run this for you, and it never pushes a merge
+you have not made.
 
 ## Sync errors and what to do
 
@@ -141,7 +208,9 @@ cleans, force-pushes or overwrites your changes.
   automatically.
 - Only same-name branches are tracked and pushed (see "Same-name rule"). Renaming a branch
   to match the remote is not done by GitMesh.
-- A repository without commits is not given its remote's history by GitMesh; pull skips it.
+- GitMesh never merges unrelated histories and never force-pushes. Unrelated histories are
+  refused; the recovery is a deliberate step you take in Git (see below). GitMesh has no
+  in-app merge-with-confirmation step.
 - After a clone, tracking follows the remote's `HEAD`. If the remote has no `HEAD` branch
   recorded, the clone may have no upstream; pull then reports it as above.
 - A remote that is unreachable at `configure add` time is recorded with a warning; GitMesh
