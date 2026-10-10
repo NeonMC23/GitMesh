@@ -56,10 +56,11 @@ MyProject                          branch  main        modified
     tools/            1 file     [repo]
 ```
 
-* **Overview** — one line that says what to do next (for example *5 changed files not
-  committed yet* with a button that opens Changes), a collapsed note explaining the
-  project model, the project tree with the repository boundaries marked, and a table with
-  one row per repository: id, branch, state, and what is going on in it.
+* **Overview** — the header shows the project name, its root, its state and its branch. One
+  sentence says what to do next (for example *5 changed files not committed yet* with a
+  button that opens Changes). Below it, one line per repository shows its name, branch, state
+  and number of changes. A line opens on click to its path, remote, sync position and any
+  problem; nothing else is shown until asked for.
 * **Changes** — one list of changed files with their *logical* path (`engine/src/lib.rs`),
   their change type, and the physical repository that owns them. Optional grouping by
   repository makes the mapping explicit without making it the default. The **Commit** card
@@ -71,7 +72,8 @@ MyProject                          branch  main        modified
   ahead/behind state of every repository. Repositories without a remote are reported as
   skipped, not as failures.
 * **Project** — read-only project information: name, root, manifest, repositories, paths,
-  remotes, and any notices GitMesh produced.
+  remotes, and any notices GitMesh produced; the project tree, and the explanation of the
+  project model (collapsed).
 * **Repositories** — the project's physical boundaries, and the place where they are
   edited after creation: inspect a directory, review the change as a plan, confirm it,
   watch it run, read the evidence that it happened.
@@ -320,6 +322,13 @@ whether the rest of the project succeeded.
 
 ## Operation progress
 
+While an operation runs, the dock at the foot of the window shows its progress, above the
+status bar, wherever you are in the interface. The page reserves room for the dock, so a
+control near the bottom can still be scrolled clear of it. The dock can be hidden with its
+close button; a hidden operation keeps running and is not cancelled. The controls that would
+start another operation are disabled while one runs, and a second click cannot start a second
+operation.
+
 Git operations can take a while (a fetch over the network, a large commit). The interface
 never freezes and never blocks the whole page: an operation runs in the background on the
 server, and progress streams to the page as server-sent events.
@@ -422,7 +431,16 @@ $ cargo test --test client         # runs the interface's client logic under Nod
 $ ./tools/gui-workflow.py          # full manual workflow over the real HTTP interface
 $ ./tools/setup-workflow.py        # the setup wizard end to end, from a blank directory
 $ ./tools/repository-workflow.py   # creating a project, then managing its repositories
+$ python3 tools/gui-browser-check.py   # Chromium through Playwright: layout, navigation, the overview,
+                                       # dry run, one commit per double click, the dock
+$ python3 tools/gui-clone-check.py     # Chromium: cloning a remote into the project
+$ python3 tools/gui-recovery-check.py  # Chromium: a refused add, cancel, and the clone it offers
 ```
+
+The three browser checks need `pip install playwright` and
+`python3 -m playwright install chromium` (test tooling only; GitMesh has no browser
+dependency). They use temporary projects and a local bare remote, never GitHub or any network
+host.
 
 `tools/gui-workflow.py` builds a temporary multi-repository project with local bare
 remotes and walks the whole workflow — open, status, changes, commit, branch, pull,

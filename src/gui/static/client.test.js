@@ -863,6 +863,43 @@ function sampleInspection() {
   contains(conflict.text, '1 repository has conflicts', 'stating the problem');
 })();
 
+// ------------------------------------------------------- repository rows --
+
+(function () {
+  var clean = GitMesh.repositoryRow({ id: 'engine', role: 'external', path: 'engine', head: 'main',
+    state: { key: 'clean', label: 'clean' }, counts: {}, sync: { upstream: 'origin/main' },
+    remotes: [{ name: 'origin', url: 'git@host:acme/engine.git' }] });
+  equal(clean.stateKey, 'clean', 'the state key is kept');
+  equal(clean.tone, 'ok', 'a clean repository is the ok tone');
+  equal(clean.changesLabel, 'no changes', 'and reports no changes');
+  equal(clean.branch, 'main', 'the branch is the head');
+  contains(clean.facts[1].value, 'origin git@host:acme/engine.git', 'the remote is shown in full');
+  contains(clean.facts[2].value, 'up to date', 'an upstream that matches is up to date');
+
+  var changed = GitMesh.repositoryRow({ id: 'root', role: 'root', path: '.', head: 'main',
+    state: { key: 'changed', label: 'modified' },
+    counts: { staged: 1, unstaged: 2, untracked: 1, conflict: 0 }, sync: { upstream: 'origin/main', ahead: 2, behind: 1 },
+    remotes: [] });
+  equal(changed.tone, 'warn', 'a modified repository is the warn tone');
+  equal(changed.changesLabel, '4 changes', 'changes are counted across kinds');
+  equal(changed.facts[1].value, 'none (local only)', 'a repository without a remote says so');
+  contains(changed.facts[2].value, 'ahead 2, behind 1', 'ahead and behind are both named');
+
+  var conflicted = GitMesh.repositoryRow({ id: 'engine', role: 'external', path: 'engine', head: 'main',
+    state: { key: 'conflicted', label: 'conflicted' }, counts: { conflict: 2 }, sync: {}, remotes: [] });
+  equal(conflicted.tone, 'bad', 'a conflict is the bad tone');
+  equal(conflicted.changesLabel, '2 changes', 'conflicted files count as changes');
+  equal(conflicted.facts[2].value, 'no upstream yet', 'a repository without upstream says so');
+
+  var broken = GitMesh.repositoryRow({ id: 'tools', role: 'external', path: 'tools', head: null,
+    state: { key: 'unavailable', label: 'unavailable' }, counts: {}, sync: {}, remotes: [],
+    error: 'not a Git repository' });
+  equal(broken.branch, '—', 'a missing branch is shown as a dash');
+  equal(broken.tone, 'muted', 'an unavailable repository is muted');
+  equal(broken.facts[broken.facts.length - 1].value, 'not a Git repository',
+    'its problem is listed last and in full');
+})();
+
 // ----------------------------------------------------------------- result --
 
 if (failures.length) {

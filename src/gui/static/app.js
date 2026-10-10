@@ -412,6 +412,49 @@ var GitMesh = (function () {
     return parts.join(', ');
   }
 
+  // One line of the Overview: what a repository is, its state and the facts behind it.
+  // The details are the ones the status already established; nothing is recomputed.
+  function repositoryRow(repo) {
+    var counts = repo.counts || {};
+    var stateKey = (repo.state || {}).key || 'unknown';
+    var changes = (counts.conflict || 0) + (counts.staged || 0) + (counts.unstaged || 0) +
+      (counts.untracked || 0);
+    var sync = repo.sync || {};
+    var remotes = repo.remotes || [];
+    var syncText = sync.upstream
+      ? (sync.ahead || sync.behind
+        ? [sync.ahead ? 'ahead ' + sync.ahead : '', sync.behind ? 'behind ' + sync.behind : '']
+          .filter(Boolean).join(', ')
+        : 'up to date with ' + sync.upstream)
+      : 'no upstream yet';
+    var facts = [
+      { label: 'Path', value: repo.path || '.', mono: true },
+      { label: 'Remote', value: remotes.length
+        ? remotes.map(function (remote) { return remote.name + ' ' + remote.url; }).join(', ')
+        : 'none (local only)', mono: remotes.length > 0 },
+      { label: 'Sync', value: syncText, mono: false }
+    ];
+    var details = repositoryDetails(repo);
+    if (repo.error) { facts.push({ label: 'Problem', value: repo.error, mono: false }); }
+    if (repo.operationInProgress) {
+      facts.push({ label: 'Git', value: repo.operationInProgress + ' is in progress in Git: finish or abort it there first', mono: false });
+    }
+    if (!repo.error && details && details !== 'nothing to record' && !repo.operationInProgress) {
+      facts.push({ label: 'Details', value: details, mono: false });
+    }
+    return {
+      id: repo.id,
+      role: repo.role,
+      branch: repo.head || repo.branch || '—',
+      stateKey: stateKey,
+      stateLabel: (repo.state || {}).label || stateLabel(stateKey),
+      tone: stateKey === 'conflicted' ? 'bad' : stateKey === 'changed' ? 'warn'
+        : stateKey === 'clean' ? 'ok' : 'muted',
+      changesLabel: changes ? countLabel(changes, 'change') : 'no changes',
+      facts: facts
+    };
+  }
+
   function settingsRows(model) {
     var project = projectSummary(model);
     var rows = [
@@ -1000,6 +1043,7 @@ var GitMesh = (function () {
     pushSummary: pushSummary,
     nextStep: nextStep,
     repositoryDetails: repositoryDetails,
+    repositoryRow: repositoryRow,
     settingsRows: settingsRows,
     inspectionSummary: inspectionSummary,
     selectableDirectories: selectableDirectories,
@@ -1083,6 +1127,7 @@ if (typeof document !== 'undefined') {
         $('status-line').textContent = 'no project open';
         repositories = null;
         repoCandidate = null;
+        repoPrefilledFor = null;
         invalidateRepoPlan();
         $('repos-table').innerHTML = '';
         $('repos-summary').textContent = '';
@@ -1155,25 +1200,42 @@ if (typeof document !== 'undefined') {
       node.innerHTML = html;
     }
 
+    // The overview lists every repository on one line: name, branch, state and the number of
+    // changes. Each line opens to the facts behind it (path, remote, sync, problems).
     function renderStatus() {
       var repositories = model.repositories || [];
+      var attention = repositories.filter(function (repo) {
+        return (repo.state || {}).key === 'conflicted' || (repo.state || {}).key === 'unavailable';
+      }).length;
+      $('status-summary').textContent = repositories.length
+        ? GitMesh.countLabel(repositories.length, 'repository', 'repositories') +
+          (attention ? ' · ' + attention + ' need attention' : '')
+        : '';
       if (!repositories.length) {
-        $('status-table').innerHTML = '<p class="hint">No repositories configured.</p>';
+        $('status-table').innerHTML = '<p class="empty">No repositories are configured yet.</p>';
         return;
       }
-      var html = '<table><thead><tr><th>Repository</th><th>Branch</th><th>State</th>' +
-        '<th>Details</th></tr></thead><tbody>';
+      var html = '';
       repositories.forEach(function (repo) {
-        var state = repo.state || {};
-        html += '<tr>' +
-          '<td>' + escapeHtml(repo.id) +
-          (repo.role === 'root' ? ' <span class="owner">(root)</span>' : '') + '</td>' +
-          '<td class="mono">' + escapeHtml(repo.head || '—') + '</td>' +
-          '<td class="state state-' + escapeHtml(state.key) + '">' + escapeHtml(state.label) + '</td>' +
-          '<td class="owner">' + escapeHtml(GitMesh.repositoryDetails(repo)) + '</td>' +
-          '</tr>';
+        var row = GitMesh.repositoryRow(repo);
+        var icon = row.role === 'root' ? 'i-folder' : 'i-repo';
+        html += '<details class="repo-row tone-' + row.tone + '">' +
+          '<summary>' +
+            '<span class="repo-name"><svg class="i" aria-hidden="true"><use href="#' + icon + '"/></svg>' +
+              '<span class="name">' + escapeHtml(row.id) + '</span>' +
+              (row.role === 'root' ? ' <span class="tag">root</span>' : '') + '</span>' +
+            '<span class="repo-branch mono" title="Branch">' + escapeHtml(row.branch) + '</span>' +
+            '<span class="state-chip tone-' + row.tone + '">' + escapeHtml(row.stateLabel) + '</span>' +
+            '<span class="repo-changes">' + escapeHtml(row.changesLabel) + '</span>' +
+            '<svg class="i chevron" aria-hidden="true"><use href="#i-chevron"/></svg>' +
+          '</summary>' +
+          '<dl class="repo-facts">';
+        row.facts.forEach(function (fact) {
+          html += '<div><dt>' + escapeHtml(fact.label) + '</dt><dd' +
+            (fact.mono ? ' class="mono"' : '') + '>' + escapeHtml(fact.value) + '</dd></div>';
+        });
+        html += '</dl></details>';
       });
-      html += '</tbody></table>';
       $('status-table').innerHTML = html;
     }
 
@@ -1323,6 +1385,41 @@ if (typeof document !== 'undefined') {
       });
     }
 
+    // While an operation runs, the controls that would start another one are disabled; the
+    // previous state is restored afterwards, so controls that were off stay off.
+    var BUSY_CONTROLS = ['btn-refresh', 'btn-fetch', 'btn-pull', 'btn-push', 'btn-commit',
+      'btn-branch-start', 'btn-branch-create', 'btn-branch-checkout', 'btn-branch-merge',
+      'btn-branch-delete', 'btn-repos-refresh', 'btn-repo-check', 'btn-repo-review',
+      'btn-repo-change', 'btn-repo-apply'];
+    function setBusy(on) {
+      document.body.classList.toggle('is-busy', on);
+      BUSY_CONTROLS.forEach(function (id) {
+        var el = $(id);
+        if (!el) { return; }
+        if (on) {
+          if (!('busyPrev' in el.dataset)) { el.dataset.busyPrev = el.disabled ? '1' : '0'; }
+          el.disabled = true;
+        } else if ('busyPrev' in el.dataset) {
+          el.disabled = el.dataset.busyPrev === '1';
+          delete el.dataset.busyPrev;
+        }
+      });
+      if (!on && model) { renderCommit(); }
+    }
+
+    // The dock floats over the bottom of the window. While it is shown, the page reserves
+    // the same height, so a control near the bottom can always be scrolled clear of it.
+    function fitDock() {
+      var dock = $('operation');
+      var height = (dock && !dock.hidden) ? dock.getBoundingClientRect().height : 0;
+      document.body.style.paddingBottom = height
+        ? 'calc(var(--statusbar-h) + ' + Math.ceil(height + 16) + 'px)' : '';
+    }
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(fitDock).observe($('operation'));
+    }
+    window.addEventListener('resize', fitDock);
+
     function showOperation(rows, state) {
       $('operation').hidden = false;
       $('operation-title').textContent = GitMesh.resultTitle(state.operation, rows, state.dryRun, state.failed);
@@ -1377,10 +1474,10 @@ if (typeof document !== 'undefined') {
     // better than the generic failure panel, e.g. the fresh plan a stale apply came back with.
     function startOperation(path, body, sentence, onFinished, onRefused) {
       if (activeOperation) { return; }
+      // Claimed before the request is sent, so a second click cannot start a second operation.
+      activeOperation = 'starting';
+      setBusy(true);
       $('operation').hidden = false;
-      // The panel sits below the whole workspace: bring it into view when work starts,
-      // so progress is not started off-screen.
-      $('operation').scrollIntoView({ block: 'nearest' });
       $('operation-title').textContent = sentence || 'Working…';
       $('operation-progress').innerHTML = '<div class="progress-row progress-running">' +
         '<span class="symbol">…</span><span class="name">starting</span></div>';
@@ -1402,6 +1499,7 @@ if (typeof document !== 'undefined') {
           source.close();
           if (elapsedTimer) { clearInterval(elapsedTimer); }
           activeOperation = null;
+          setBusy(false);
           var rows = state.rows;
           showOperation(rows, state);
           showResult({ operation: state.operation, rows: rows, dryRun: state.dryRun, failed: state.failed }, payload);
@@ -1457,6 +1555,8 @@ if (typeof document !== 'undefined') {
             'before starting another action.');
         };
       }).catch(function (error) {
+        activeOperation = null;
+        setBusy(false);
         if (onRefused && onRefused(error)) { return; }
         showFailure(error.message);
       });
@@ -1467,6 +1567,7 @@ if (typeof document !== 'undefined') {
     function abandonOperation(message) {
       if (!activeOperation) { return; }
       activeOperation = null;
+      setBusy(false);
       if (elapsedTimer) { clearInterval(elapsedTimer); }
       $('operation-result').hidden = false;
       $('operation-result').innerHTML = '<p class="resolve">' + escapeHtml(message) + '</p>';
@@ -1475,6 +1576,7 @@ if (typeof document !== 'undefined') {
 
     function showFailure(message) {
       activeOperation = null;
+      setBusy(false);
       $('operation').hidden = false;
       $('operation-title').textContent = 'Operation refused';
       $('operation-progress').innerHTML = '<div class="progress-row progress-failed">' +
@@ -2414,6 +2516,7 @@ if (typeof document !== 'undefined') {
 
     var repositories = null;   // the last inspection of /api/repositories
     var repoCandidate = null;  // the last directory that was checked
+    var repoPrefilledFor = null;  // the directory whose suggestions the add form already shows
     var repoRequest = null;    // the request behind the plan on screen
     var repoPlan = null;       // the reviewed plan
 
@@ -2502,7 +2605,11 @@ if (typeof document !== 'undefined') {
       }
       api('/api/repository/inspect', { path: path }).then(function (data) {
         repoCandidate = data.candidate;
-        renderCandidate(GitMesh.candidateSummary(repoCandidate));
+        // The form takes GitMesh's suggestions only for a directory it has not filled yet:
+        // checking the same directory again must not overwrite what the user typed.
+        var prefill = path !== repoPrefilledFor;
+        repoPrefilledFor = path;
+        renderCandidate(GitMesh.candidateSummary(repoCandidate), prefill);
         repoMessage('');
       }).catch(function (error) {
         repoCandidate = null;
@@ -2511,7 +2618,7 @@ if (typeof document !== 'undefined') {
       });
     }
 
-    function renderCandidate(summary) {
+    function renderCandidate(summary, prefill) {
       if (!summary) {
         $('repo-candidate').hidden = true;
         $('repo-add-form').hidden = true;
@@ -2534,7 +2641,7 @@ if (typeof document !== 'undefined') {
       $('repo-candidate').hidden = false;
 
       $('repo-add-form').hidden = !summary.canAdd;
-      if (summary.canAdd) {
+      if (summary.canAdd && prefill !== false) {
         $('repo-id').value = summary.suggestedId;
         $('repo-remote-url').value = summary.remote;
         $('repo-branch').value = summary.branch;
@@ -2711,6 +2818,7 @@ if (typeof document !== 'undefined') {
         function (payload) {
           if (payload && payload.repository) { showRepoResult(payload.repository); }
           repoCandidate = null;
+          repoPrefilledFor = null;
           renderCandidate(null);
           $('repo-path').value = '';
           invalidateRepoPlan();
@@ -2760,6 +2868,7 @@ if (typeof document !== 'undefined') {
         document.querySelectorAll('.tab').forEach(function (other) {
           other.classList.toggle('active', other === tab);
           other.setAttribute('aria-selected', other === tab ? 'true' : 'false');
+          other.tabIndex = other === tab ? 0 : -1;
         });
         ['status', 'changes', 'commit', 'branches', 'sync', 'repos', 'settings'].forEach(function (name) {
           var panel = $('panel-' + name);
@@ -2769,6 +2878,31 @@ if (typeof document !== 'undefined') {
         // its state when it is opened rather than on every refresh.
         if (tab.dataset.tab === 'repos') { loadRepositories(); }
       });
+    });
+
+    // Arrow keys, Home and End move between tabs, as the ARIA tab pattern expects.
+    document.querySelector('.tabs').addEventListener('keydown', function (event) {
+      var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+      var index = tabs.indexOf(document.activeElement);
+      if (index < 0) { return; }
+      var next = null;
+      if (event.key === 'ArrowRight') { next = index + 1; }
+      else if (event.key === 'ArrowLeft') { next = index - 1; }
+      else if (event.key === 'Home') { next = 0; }
+      else if (event.key === 'End') { next = tabs.length - 1; }
+      if (next === null) { return; }
+      event.preventDefault();
+      next = (next + tabs.length) % tabs.length;
+      tabs[next].focus();
+      tabs[next].click();
+    });
+
+    $('btn-operation-close').addEventListener('click', function () {
+      $('operation').hidden = true;
+      fitDock();
+      if (activeOperation) {
+        $('status-line').textContent = 'operation still running: its progress is hidden, not cancelled';
+      }
     });
 
     // The overview's next-step button opens the tab it names, through the same tab wiring.
@@ -2868,7 +3002,11 @@ if (typeof document !== 'undefined') {
     $('btn-branch-start').addEventListener('click', function () { branchAction('start'); });
     $('btn-branch-create').addEventListener('click', function () { branchAction('create'); });
     $('btn-branch-checkout').addEventListener('click', function () { branchAction('checkout'); });
-    $('btn-branch-merge').addEventListener('click', function () { branchAction('merge'); });
+    $('btn-branch-merge').addEventListener('click', function () {
+      if (window.confirm('Merge the branch named above into the current branch in every repository that can merge it safely?')) {
+        branchAction('merge');
+      }
+    });
     $('btn-branch-delete').addEventListener('click', function () {
       if (window.confirm('Delete this branch in every repository that can delete it safely?')) {
         branchAction('delete');
@@ -2913,6 +3051,9 @@ if (typeof document !== 'undefined') {
     // Both the badge and the keyboard say which state is now active.
     function toggleDryRun() {
       var next = !(model && model.dryRun);
+      if (!next && !window.confirm('Turn dry run off? Operations will then change your repositories.')) {
+        return;
+      }
       api('/api/dry-run', { value: String(next) }).then(function (data) {
         model = data;
         render();

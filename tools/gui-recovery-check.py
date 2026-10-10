@@ -99,10 +99,10 @@ def refused_add(page, path, remote):
     """Check the directory and ask to add it with the remote; the refusal is shown."""
     page.click('button.tab[data-tab="repos"]')
     page.fill("#repo-path", path)
-    page.click("#btn-repo-check")
-    page.wait_for_function(
-        "() => { const c = document.getElementById('repo-candidate'); return c && !c.hidden; }",
-        timeout=15000)
+    # Wait for the answer to *this* request: a candidate left over from an earlier check
+    # would satisfy a text-based wait before the new inspection has arrived.
+    with page.expect_response(lambda r: "/api/repository/inspect" in r.url, timeout=15000):
+        page.click("#btn-repo-check")
     page.wait_for_function(
         "() => !document.getElementById('repo-add-form').hidden", timeout=15000)
     page.fill("#repo-remote-url", remote)

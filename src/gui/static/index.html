@@ -9,77 +9,88 @@
 <link rel="icon" href="data:,">
 </head>
 <body>
+<!-- Icon set: one 24×24 grid, 2px round strokes, drawn with currentColor. Used with <use>. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></symbol>
+  <symbol id="i-fetch" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5.3"/><path d="M20 12a8 8 0 0 1-14 5.3"/><path d="M18 3v4h-4"/><path d="M6 21v-4h4"/></symbol>
+  <symbol id="i-pull" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></symbol>
+  <symbol id="i-push" viewBox="0 0 24 24"><path d="M12 20V9"/><path d="m7 14 5-5 5 5"/><path d="M5 4h14"/></symbol>
+  <symbol id="i-commit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M3 12h5.5M15.5 12H21"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10"/><path d="M18 9a6 6 0 0 1-6 6H8"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-repo" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 4v16"/><path d="M13 9h3M13 13h3"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-merge" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10"/><path d="M18 14c0 3-4 5-10 5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-logo" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7.5 11 16.5M16 7.5 13 16.5M8.5 6h7"/></symbol>
+</svg>
+
 <header class="topbar">
   <div class="brand">
-    <span class="logo" aria-hidden="true">◆</span>
+    <svg class="logo i" aria-hidden="true"><use href="#i-logo"/></svg>
     <span class="brand-name">GitMesh</span>
     <span class="tagline">one project, many repositories</span>
   </div>
-  <div class="topbar-right" role="toolbar" aria-label="Project actions">
-    <span id="dry-run-badge" class="badge badge-warn" hidden>dry run</span>
-    <button id="btn-refresh" class="ghost" title="Re-read the project (R)">Refresh</button>
-    <button id="btn-open" class="ghost" title="Open another GitMesh project">Open…</button>
-    <button id="btn-setup" class="ghost" title="Create a GitMesh project in a directory">Set up…</button>
+  <div class="topbar-right" role="toolbar" aria-label="Application">
+    <span id="dry-run-badge" class="badge badge-warn" hidden title="Double-click, or press D, to turn dry run off"><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg>dry run</span>
+    <button id="btn-refresh" class="ghost" title="Re-read the project (R)"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg><span>Refresh</span></button>
+    <button id="btn-open" class="ghost" title="Open another GitMesh project"><svg class="i" aria-hidden="true"><use href="#i-folder"/></svg><span>Open</span></button>
+    <button id="btn-setup" class="ghost" title="Create a GitMesh project in a directory"><svg class="i" aria-hidden="true"><use href="#i-plus"/></svg><span>Set up</span></button>
   </div>
 </header>
 
 <main>
   <!-- Shown while a project is open. -->
-  <section id="workspace" hidden>
-    <div class="project-head">
-      <div>
+  <section id="workspace" hidden aria-label="Project">
+    <header class="project-head">
+      <div class="project-title">
         <h1 id="project-name">—</h1>
         <p class="meta">
-          <span id="project-root" class="mono"></span>
-          <span class="dot">·</span>
+          <span id="project-root" class="mono path"></span>
           <span id="project-repos"></span>
-          <span class="dot">·</span>
-          <span id="project-state"></span>
         </p>
       </div>
-      <div class="branch-box">
-        <span class="label">branch</span>
-        <span id="project-branch" class="branch mono">—</span>
+      <div class="project-facts">
+        <span id="project-state"></span>
+        <span class="branch-chip" title="The branch the project is on">
+          <svg class="i" aria-hidden="true"><use href="#i-branch"/></svg>
+          <span id="project-branch" class="mono">—</span>
+        </span>
       </div>
-    </div>
+    </header>
 
     <p id="project-notices" class="notices" hidden></p>
 
-    <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="status" role="tab" aria-selected="true">Overview</button>
-      <button class="tab" data-tab="changes" role="tab" aria-selected="false">Changes <span id="changes-count" class="pill">0</span></button>
-      <button class="tab" data-tab="branches" role="tab" aria-selected="false">Branches</button>
-      <button class="tab" data-tab="sync" role="tab" aria-selected="false">Sync</button>
-      <button class="tab" data-tab="repos" role="tab" aria-selected="false">Repositories</button>
-      <button class="tab" data-tab="settings" role="tab" aria-selected="false">Project</button>
+    <nav class="tabs" role="tablist" aria-label="Project views">
+      <button class="tab active" data-tab="status" role="tab" id="tab-status" aria-controls="panel-status" aria-selected="true" tabindex="0">Overview</button>
+      <button class="tab" data-tab="changes" role="tab" id="tab-changes" aria-controls="panel-changes" aria-selected="false" tabindex="-1">Changes <span id="changes-count" class="pill">0</span></button>
+      <button class="tab" data-tab="branches" role="tab" id="tab-branches" aria-controls="panel-branches" aria-selected="false" tabindex="-1">Branches</button>
+      <button class="tab" data-tab="sync" role="tab" id="tab-sync" aria-controls="panel-sync" aria-selected="false" tabindex="-1">Sync</button>
+      <button class="tab" data-tab="repos" role="tab" id="tab-repos" aria-controls="panel-repos" aria-selected="false" tabindex="-1">Repositories</button>
+      <button class="tab" data-tab="settings" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Project</button>
     </nav>
 
-    <section id="panel-status" class="panel">
-      <p id="next-step" class="next-step" role="status"></p>
-      <details class="concept">
-        <summary>How a GitMesh project works</summary>
-        <p>A GitMesh project is one folder. Some directories inside it are separate Git
-          repositories (marked <span class="tag">repo</span> below); everything else belongs to
-          the <strong>root repository</strong>. GitMesh shows them as one project, so you commit,
-          pull and push once. Each repository still gets its own real Git commit, and Git itself
-          makes every change.</p>
-      </details>
-      <div class="split">
-        <div class="card">
-          <h2>Project tree</h2>
-          <p class="hint">Every line is a directory of the project. Repositories are marked.</p>
-          <div id="tree" class="tree"></div>
-        </div>
-        <div class="card">
+    <!-- Overview: what needs attention, then every repository on one line each. -->
+    <section id="panel-status" class="panel" role="tabpanel" aria-labelledby="tab-status">
+      <div id="next-step" class="attention" role="status"></div>
+      <div class="card">
+        <div class="card-head">
           <h2>Repositories</h2>
-          <div id="status-table"></div>
+          <span id="status-summary" class="hint"></span>
         </div>
+        <div id="status-table" class="repo-list"></div>
       </div>
     </section>
 
-    <section id="panel-changes" class="panel" hidden>
+    <section id="panel-changes" class="panel" role="tabpanel" aria-labelledby="tab-changes" hidden>
       <div class="card">
-        <div class="row-between">
+        <div class="card-head">
           <h2>Changes</h2>
           <label class="check"><input type="checkbox" id="group-by-repo"> group by repository</label>
         </div>
@@ -87,148 +98,159 @@
         <div id="changes-table"></div>
       </div>
       <div class="card" id="commit-card">
-        <h2>Commit</h2>
-        <p class="hint">Commit records every change listed above. Each affected repository is staged and
-          committed separately with this one message; repositories without changes are skipped.
-          There is no combined commit.</p>
+        <div class="card-head">
+          <h2>Commit</h2>
+        </div>
+        <p class="hint">Stages and records every change above. Each repository gets its own commit with
+          this message; repositories without changes are skipped.</p>
+        <details class="inline-disclosure"><summary>How this works</summary>
+          <p class="hint">There is no combined commit: GitMesh runs one real Git commit per affected repository.
+            Git itself makes every change, and nothing is pushed by a commit.</p>
+        </details>
         <div id="commit-targets"></div>
         <label class="field">
           <span>Commit message</span>
           <textarea id="commit-message" rows="3" placeholder="Describe the change for the whole project" autocomplete="off"></textarea>
         </label>
-        <div class="row">
-          <button id="btn-commit" class="primary">Commit the project</button>
+        <div class="row actions-row">
+          <button id="btn-commit" class="primary"><svg class="i" aria-hidden="true"><use href="#i-commit"/></svg><span>Commit</span></button>
           <span id="commit-hint" class="hint inline"></span>
         </div>
       </div>
     </section>
 
-    <section id="panel-branches" class="panel" hidden>
+    <section id="panel-branches" class="panel" role="tabpanel" aria-labelledby="tab-branches" hidden>
       <div class="card">
-        <h2>One branch across the project</h2>
+        <div class="card-head">
+          <h2>Branches</h2>
+        </div>
         <p id="branch-state" class="hint"></p>
-        <div class="grid-actions">
+        <div class="branch-form">
           <label class="field"><span>Branch name</span>
             <input id="branch-name" type="text" placeholder="feature/xyz" autocomplete="off"></label>
-          <div class="row actions">
-            <button id="btn-branch-start" class="primary">Create &amp; switch</button>
+          <div class="row actions-row">
+            <button id="btn-branch-start" class="primary"><svg class="i" aria-hidden="true"><use href="#i-branch"/></svg><span>Create and switch</span></button>
             <button id="btn-branch-create" class="ghost">Create only</button>
             <button id="btn-branch-checkout" class="ghost">Switch</button>
-            <button id="btn-branch-merge" class="ghost">Merge into current</button>
-            <button id="btn-branch-delete" class="danger ghost">Delete</button>
+            <button id="btn-branch-merge" class="ghost"><svg class="i" aria-hidden="true"><use href="#i-merge"/></svg><span>Merge into current</span></button>
           </div>
         </div>
         <div id="branches-table"></div>
+        <div class="danger-zone">
+          <div>
+            <h3>Delete a branch</h3>
+            <p class="hint">Removes the branch named above only where Git can delete it safely.</p>
+          </div>
+          <button id="btn-branch-delete" class="danger"><svg class="i" aria-hidden="true"><use href="#i-trash"/></svg><span>Delete branch…</span></button>
+        </div>
       </div>
     </section>
 
-    <section id="panel-sync" class="panel" hidden>
+    <section id="panel-sync" class="panel" role="tabpanel" aria-labelledby="tab-sync" hidden>
       <div class="card">
-        <h2>Sync every repository</h2>
-        <p class="hint">Pull defaults to fast-forward only: GitMesh never merges or rebases
-          behind your back. Repositories that cannot be updated are reported, the others still
-          complete.</p>
-        <div class="grid-actions">
+        <div class="card-head">
+          <h2>Sync every repository</h2>
+        </div>
+        <div class="sync-actions">
+          <button id="btn-fetch" class="ghost"><svg class="i" aria-hidden="true"><use href="#i-fetch"/></svg><span>Fetch</span></button>
+          <button id="btn-pull" class="ghost"><svg class="i" aria-hidden="true"><use href="#i-pull"/></svg><span>Pull</span></button>
+          <button id="btn-push" class="primary"><svg class="i" aria-hidden="true"><use href="#i-push"/></svg><span>Push</span></button>
+        </div>
+        <details class="inline-disclosure">
+          <summary>Pull options</summary>
           <label class="field"><span>Pull strategy</span>
             <select id="pull-strategy">
               <option value="ff-only">Fast-forward only (refuses divergence)</option>
               <option value="merge">Merge (may create merge commits)</option>
               <option value="rebase">Rebase (rewrites local commits)</option>
             </select></label>
-          <div class="row actions">
-            <button id="btn-fetch" class="ghost">Fetch</button>
-            <button id="btn-pull" class="primary">Pull</button>
-            <button id="btn-push" class="primary">Push</button>
-          </div>
-        </div>
+          <p class="hint">Fast-forward is the default: GitMesh never merges or rebases without your choice.
+            Repositories that cannot be updated are reported, the others still complete.</p>
+        </details>
         <div id="sync-summary"></div>
       </div>
     </section>
 
-    <section id="panel-repos" class="panel" hidden>
+    <section id="panel-repos" class="panel" role="tabpanel" aria-labelledby="tab-repos" hidden>
       <div class="card">
-        <div class="row-between">
+        <div class="card-head">
           <h2>Repositories of this project</h2>
-          <button id="btn-repos-refresh" class="ghost">Refresh</button>
+          <button id="btn-repos-refresh" class="ghost"><svg class="i" aria-hidden="true"><use href="#i-refresh"/></svg><span>Refresh</span></button>
         </div>
-        <p class="hint">A repository boundary is configuration. GitMesh changes one only after
-          you reviewed the plan and the manifest text it writes; files, <code>.git</code>
-          directories, history and remotes are never touched by a configuration change.</p>
+        <p class="hint">A repository boundary is configuration. Changing one is reviewed as a plan first; files,
+          <code>.git</code> directories, history and remotes are never touched by it.</p>
         <p id="repos-summary" class="hint"></p>
         <div id="repos-table"></div>
         <p id="repos-message" class="hint inline" role="status" hidden></p>
       </div>
 
-      <div class="card">
-        <h2>Add a directory as a repository</h2>
-        <p class="hint">GitMesh checks the directory first and tells you exactly what it would
-          do: adopt an existing repository, create one, record a remote, or refuse.</p>
-        <div class="grid-actions">
-          <label class="field"><span>Directory, relative to the project root</span>
-            <input id="repo-path" type="text" placeholder="engine" autocomplete="off"></label>
-          <div class="row actions">
-            <button id="btn-repo-check" class="ghost">Check the directory</button>
-          </div>
-        </div>
-        <div id="repo-candidate" hidden></div>
-        <div id="repo-add-form" hidden>
+      <div class="form-grid">
+        <div class="card">
+          <h2>Add a directory</h2>
+          <p class="hint">GitMesh checks the directory first and shows what it would do.</p>
           <div class="grid-actions">
-            <label class="field"><span>Repository name</span>
-              <input id="repo-id" type="text" autocomplete="off"></label>
-            <label class="field"><span>Remote URL (optional)</span>
-              <input id="repo-remote-url" type="text" placeholder="git@example.com:acme/engine.git" autocomplete="off"></label>
-            <label class="field"><span>Branch</span>
-              <input id="repo-branch" type="text" placeholder="main" autocomplete="off"></label>
+            <label class="field"><span>Directory, relative to the project root</span>
+              <input id="repo-path" type="text" placeholder="engine" autocomplete="off"></label>
+            <div class="row actions-row">
+              <button id="btn-repo-check" class="ghost">Check the directory</button>
+            </div>
           </div>
-          <label class="check"><input type="checkbox" id="repo-initialize"> create a Git
-            repository there when there is none (<code>git init</code>)</label>
-          <label class="check"><input type="checkbox" id="repo-configure-remote"> also configure
-            <code>origin</code> in Git, not just record it</label>
-          <label class="check"><input type="checkbox" id="repo-untrack"> stop tracking these files
-            in the root repository</label>
-          <div class="row actions">
-            <button id="btn-repo-review" class="primary">Review the change</button>
+          <div id="repo-candidate" hidden></div>
+          <div id="repo-add-form" hidden>
+            <div class="grid-actions">
+              <label class="field"><span>Repository name</span>
+                <input id="repo-id" type="text" autocomplete="off"></label>
+              <label class="field"><span>Remote URL (optional)</span>
+                <input id="repo-remote-url" type="text" placeholder="git@example.com:acme/engine.git" autocomplete="off"></label>
+              <label class="field"><span>Branch</span>
+                <input id="repo-branch" type="text" placeholder="main" autocomplete="off"></label>
+            </div>
+            <label class="check"><input type="checkbox" id="repo-initialize"> create a Git repository there when there is none (<code>git init</code>)</label>
+            <label class="check"><input type="checkbox" id="repo-configure-remote"> also configure <code>origin</code> in Git, not just record it</label>
+            <label class="check"><input type="checkbox" id="repo-untrack"> stop tracking these files in the root repository</label>
+            <div class="row actions-row">
+              <button id="btn-repo-review" class="primary">Review the change</button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div class="card">
-        <h2>Change one repository</h2>
-        <div class="grid-actions">
-          <label class="field" id="repo-target-field"><span>Repository</span>
-            <select id="repo-target"></select></label>
-          <label class="field"><span>What to do</span>
-            <select id="repo-intent">
-              <option value="rename">give it another name</option>
-              <option value="set-remote">record another remote</option>
-              <option value="clone">clone a remote into a new directory</option>
-              <option value="remove">remove it from the project</option>
-            </select></label>
-          <label class="field" id="repo-new-id-field"><span>New name</span>
-            <input id="repo-new-id" type="text" autocomplete="off"></label>
-          <label class="field" id="repo-edit-remote-field" hidden><span>Remote URL (empty clears it)</span>
-            <input id="repo-edit-remote" type="text" autocomplete="off"></label>
+        <div class="card">
+          <h2>Change one repository</h2>
+          <div class="grid-actions">
+            <label class="field" id="repo-target-field"><span>Repository</span>
+              <select id="repo-target"></select></label>
+            <label class="field"><span>What to do</span>
+              <select id="repo-intent">
+                <option value="rename">give it another name</option>
+                <option value="set-remote">record another remote</option>
+                <option value="clone">clone a remote into a new directory</option>
+                <option value="remove">remove it from the project</option>
+              </select></label>
+            <label class="field" id="repo-new-id-field"><span>New name</span>
+              <input id="repo-new-id" type="text" autocomplete="off"></label>
+            <label class="field" id="repo-edit-remote-field" hidden><span>Remote URL (empty clears it)</span>
+              <input id="repo-edit-remote" type="text" autocomplete="off"></label>
+          </div>
+          <div class="grid-actions" id="repo-clone-fields" hidden>
+            <label class="field"><span>Directory: missing or empty, relative to the project</span>
+              <input id="repo-clone-path" type="text" autocomplete="off" placeholder="libs/core"></label>
+            <label class="field"><span>Remote URL or local path</span>
+              <input id="repo-clone-remote" type="text" autocomplete="off" placeholder="git@host:team/core.git"></label>
+            <label class="field"><span>Name in GitMesh (empty = suggested)</span>
+              <input id="repo-clone-id" type="text" autocomplete="off"></label>
+          </div>
+          <div class="row actions-row">
+            <label class="check" id="repo-configure-git-field" hidden><input type="checkbox" id="repo-configure-git">
+              also configure <code>origin</code> in Git</label>
+            <label class="check" id="repo-takeover-field" hidden><input type="checkbox" id="repo-takeover">
+              the root repository takes those files back</label>
+          </div>
+          <div class="row actions-row">
+            <button id="btn-repo-change" class="ghost">Review the change</button>
+          </div>
+          <p class="hint">Removing a repository never deletes its directory, <code>.git</code>, history or remote.
+            Renaming changes only the name in GitMesh.</p>
         </div>
-        <div class="grid-actions" id="repo-clone-fields" hidden>
-          <label class="field"><span>Directory: missing or empty, relative to the project</span>
-            <input id="repo-clone-path" type="text" autocomplete="off" placeholder="libs/core"></label>
-          <label class="field"><span>Remote URL or local path</span>
-            <input id="repo-clone-remote" type="text" autocomplete="off" placeholder="git@host:team/core.git"></label>
-          <label class="field"><span>Name in GitMesh (empty = suggested)</span>
-            <input id="repo-clone-id" type="text" autocomplete="off"></label>
-        </div>
-        <div class="row actions">
-          <label class="check" id="repo-configure-git-field" hidden><input type="checkbox" id="repo-configure-git">
-            also configure <code>origin</code> in Git</label>
-          <label class="check" id="repo-takeover-field" hidden><input type="checkbox" id="repo-takeover">
-            the root repository takes those files back</label>
-        </div>
-        <div class="row actions">
-          <button id="btn-repo-change" class="ghost">Review the change</button>
-        </div>
-        <p class="hint">Removing a repository is a configuration change: its directory, its
-          <code>.git</code>, its history and its remote stay exactly where they are.
-          Renaming changes the name in GitMesh, never the directory.</p>
       </div>
 
       <div class="card" id="repo-review" hidden>
@@ -236,7 +258,7 @@
         <div id="repo-plan"></div>
         <label class="check"><input type="checkbox" id="repo-confirm"> I reviewed this change and
           the manifest it writes</label>
-        <div class="row actions">
+        <div class="row actions-row">
           <button id="btn-repo-apply" class="primary">Apply the change</button>
           <button id="btn-repo-discard" class="ghost">Cancel</button>
         </div>
@@ -248,24 +270,33 @@
       </div>
     </section>
 
-    <section id="panel-settings" class="panel" hidden>
+    <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="card">
-        <h2>Project information</h2>
-        <p class="hint">This view is read-only. Repository boundaries are configuration: change
-          them in the <strong>Repositories</strong> tab (reviewed as a plan before anything is
-          written), or with <code>gitmesh configure</code> from a terminal.</p>
+        <div class="card-head">
+          <h2>Project information</h2>
+        </div>
+        <p class="hint">Read-only. Change repository boundaries in <strong>Repositories</strong>, or with
+          <code>gitmesh configure</code> in a terminal.</p>
         <div id="settings-table"></div>
       </div>
-    </section>
 
-    <!-- Operation progress and result, shared by every action. -->
-    <section id="operation" class="card operation" role="status" aria-live="polite" hidden>
-      <div class="row-between">
-        <h2 id="operation-title">Operation</h2>
-        <span id="operation-elapsed" class="mono"></span>
+      <div class="card">
+        <div class="card-head">
+          <h2>Structure</h2>
+        </div>
+        <p class="hint">Every line is a directory of the project. Repositories are marked.</p>
+        <div id="tree" class="tree"></div>
       </div>
-      <div id="operation-progress" class="progress"></div>
-      <div id="operation-result" class="result" hidden></div>
+
+      <div class="card">
+        <details class="concept">
+          <summary>How a GitMesh project works</summary>
+          <p>A GitMesh project is one folder. Some directories inside it are separate Git repositories
+            (marked <span class="tag">repo</span>); everything else belongs to the <strong>root
+            repository</strong>. GitMesh shows them as one project, so you commit, pull and push once.
+            Each repository still gets its own real Git commit, and Git itself makes every change.</p>
+        </details>
+      </div>
     </section>
   </section>
 
@@ -444,6 +475,18 @@
     </section>
   </section>
 </main>
+
+<!-- Operation progress and result, shared by every action. Docked above the status bar so
+     it stays in view wherever the user is; it is dismissed by its own button. -->
+<section id="operation" class="dock" role="status" aria-live="polite" aria-label="Operation" hidden>
+  <div class="dock-head">
+    <span class="dock-title"><span id="operation-title">Operation</span></span>
+    <span id="operation-elapsed" class="mono"></span>
+    <button id="btn-operation-close" class="ghost icon-only" type="button" aria-label="Hide this operation" title="Hide"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button>
+  </div>
+  <div id="operation-progress" class="progress"></div>
+  <div id="operation-result" class="result" hidden></div>
+</section>
 
 <dialog id="open-dialog">
   <form method="dialog" class="dialog-body">

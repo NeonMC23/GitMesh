@@ -51,6 +51,15 @@
   --radius: 8px;
   --radius-sm: 5px;
   --focus-ring: 0 0 0 3px rgba(124, 192, 255, 0.45);
+
+  /* Redesign tokens: tinted surfaces for semantic states, one shadow, one status-bar height. */
+  --surface-sunken: #0b0e13;
+  --accent-soft: rgba(124, 192, 255, 0.10);
+  --ok-soft: rgba(111, 214, 154, 0.09);
+  --warn-soft: rgba(242, 201, 107, 0.09);
+  --bad-soft: rgba(255, 138, 128, 0.09);
+  --shadow-dock: 0 -10px 30px rgba(0, 0, 0, 0.45);
+  --statusbar-h: 40px;
 }
 
 /* 2. Base and layout ----------------------------------------------------------- */
@@ -280,12 +289,6 @@ label.check input { width: 16px; height: 16px; accent-color: var(--accent); }
 }
 .card h2 { margin-bottom: var(--space-3); }
 
-.split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--space-4);
-}
-
 .row {
   display: flex;
   flex-wrap: wrap;
@@ -343,66 +346,6 @@ td.state { font-weight: 650; white-space: nowrap; }
 .path { font-family: var(--mono); font-size: 0.92em; }
 .symbol { font-family: var(--mono); font-weight: 700; }
 
-/* 4. GitMesh components ----------------------------------------------------------- */
-
-/* Top bar: brand on the left, actions grouped on the right; both wrap. */
-.topbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2) var(--space-4);
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  position: sticky;
-  top: 0;
-  z-index: 5;
-}
-.brand { display: flex; align-items: baseline; gap: var(--space-2); flex-wrap: wrap; min-width: 0; }
-.logo { color: var(--accent); font-size: 1.1rem; }
-.brand-name { font-weight: 750; font-size: var(--text-lg); }
-.tagline { color: var(--text-muted); font-size: var(--text-sm); }
-.topbar-right { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
-
-/* Project head: name and root path, branch on the right. */
-.project-head {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  justify-content: space-between;
-  align-items: flex-start;
-  min-width: 0;
-}
-.project-head > div:first-child { min-width: 0; flex: 1 1 260px; }
-.meta { color: var(--text-muted); font-size: var(--text-sm); margin: 0; }
-.branch-box {
-  display: grid;
-  justify-items: end;
-  gap: 2px;
-  min-width: 0;
-  max-width: 100%;
-}
-.branch-box .label { font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
-.branch { color: var(--accent); font-weight: 650; overflow-wrap: anywhere; text-align: right; }
-
-/* Next step: the one sentence that says what to do now, linked to the place to do it. */
-.next-step {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2) var(--space-3);
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius);
-  border: 1px solid var(--accent);
-  background: rgba(124, 192, 255, 0.07);
-  margin: 0;
-}
-.next-step .text { font-weight: 600; min-width: 0; }
-.next-step.tone-bad { border-color: var(--bad); background: rgba(255, 138, 128, 0.07); }
-.next-step.tone-ok { border-color: var(--ok); background: rgba(111, 214, 154, 0.07); }
-
 /* Concept note: collapsed by default, one paragraph when opened. */
 details.concept {
   border: 1px solid var(--border);
@@ -434,9 +377,6 @@ details.concept strong { color: var(--text); }
 .tree-root { font-weight: 700; }
 .tree-node .files { color: var(--text-muted); }
 .tree-node .tag { font-family: var(--font); }
-
-/* Operations: live progress and result. */
-.operation { border-color: var(--accent); }
 .progress { display: grid; gap: var(--space-1); margin-top: var(--space-2); }
 .progress-row {
   display: grid;
@@ -484,22 +424,6 @@ dialog {
   max-width: 94vw;
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
-
-/* Status bar: the last message and the connection, never hidden. */
-.statusbar {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2) var(--space-4);
-  justify-content: space-between;
-  padding: var(--space-2) var(--space-4);
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-.statusbar .mono { color: var(--text-muted); }
 
 /* Setup wizard */
 .setup-head {
@@ -583,31 +507,305 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 #repo-plan .blocker { color: var(--bad); }
 #repo-plan .notice { color: var(--warn); }
 
+/* 4. GitMesh components ----------------------------------------------------------- */
+
+/* Icons: one stroke weight, sized to the text beside them, never coloured on their own. */
+.i {
+  width: 1.1em;
+  height: 1.1em;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -0.18em;
+}
+button { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2); }
+button > span { min-width: 0; }
+button.icon-only { min-width: 36px; padding: 6px; }
+
+/* Top bar: the application only; project-level actions live with the project. */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; min-width: 0; }
+.logo { color: var(--accent); width: 20px; height: 20px; }
+.brand-name { font-weight: 750; font-size: var(--text-lg); letter-spacing: -0.01em; }
+.tagline { color: var(--text-muted); font-size: var(--text-sm); }
+.topbar-right { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+.topbar-right button { min-height: 34px; }
+
+/* Project identity: the name and where it lives, then its state and branch. */
+.project-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-top: var(--space-2);
+}
+.project-title { min-width: 0; flex: 1 1 280px; }
+.project-title h1 { margin: 0 0 var(--space-1); font-size: 1.6rem; letter-spacing: -0.015em; }
+.meta { color: var(--text-muted); font-size: var(--text-sm); margin: 0; display: flex; flex-wrap: wrap; gap: 0 var(--space-3); }
+.meta .path { overflow-wrap: anywhere; }
+.project-facts { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; min-width: 0; }
+.branch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 28px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-sunken);
+  color: var(--accent);
+  font-weight: 600;
+  min-width: 0;
+  max-width: 100%;
+}
+.branch-chip .mono { overflow-wrap: anywhere; }
+
+/* Attention: the one statement that says what to do now, with its action. */
+.next-step {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  margin: 0;
+}
+.next-step .text { font-weight: 600; min-width: 0; }
+.next-step.tone-bad { border-left-color: var(--bad); background: var(--bad-soft); }
+.next-step.tone-ok { border-left-color: var(--ok); background: var(--ok-soft); }
+.next-step > button { flex: none; }
+
+/* Cards: one surface per section, with its heading and optional actions on one line. */
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-3);
+}
+.card-head h2 { margin: 0; }
+.card-head .hint { margin: 0; }
+.actions-row { margin-top: var(--space-2); }
+.form-grid { display: grid; gap: var(--space-4); grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.empty { color: var(--text-muted); margin: 0; padding: var(--space-3) 0; }
+
+/* Repository list: one row per repository; the facts open on demand. */
+.repo-list {
+  display: grid;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  min-width: 0;
+}
+.repo-row { border-bottom: 1px solid var(--border); border-left: 3px solid transparent; min-width: 0; }
+.repo-row:last-child { border-bottom: none; }
+.repo-row.tone-bad { border-left-color: var(--bad); }
+.repo-row.tone-warn { border-left-color: var(--warn); }
+.repo-row.tone-ok { border-left-color: var(--ok); }
+.repo-row > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  list-style: none;
+  min-width: 0;
+}
+.repo-row > summary::-webkit-details-marker { display: none; }
+.repo-row > summary:hover { background: var(--surface-raised); }
+.repo-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 220px;
+  min-width: 0;
+  font-weight: 650;
+}
+.repo-name .name { overflow-wrap: anywhere; }
+.repo-name .i { color: var(--text-muted); }
+.repo-branch { color: var(--accent); font-size: var(--text-sm); max-width: 100%; overflow-wrap: anywhere; }
+.repo-changes { color: var(--text-muted); font-size: var(--text-sm); white-space: nowrap; }
+.repo-row .chevron { color: var(--text-muted); transition: transform 0.15s ease; }
+.repo-row[open] .chevron { transform: rotate(90deg); }
+.repo-row > summary:focus-visible { border-radius: var(--radius-sm); }
+
+/* State chips: colour, a dot and the word; never colour alone. */
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  font-weight: 650;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.state-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.state-chip.tone-ok { color: var(--ok); background: var(--ok-soft); }
+.state-chip.tone-warn { color: var(--warn); background: var(--warn-soft); }
+.state-chip.tone-bad { color: var(--bad); background: var(--bad-soft); }
+.state-chip.tone-muted { color: var(--text-muted); }
+
+.repo-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-4) calc(var(--space-4) + 24px);
+  font-size: var(--text-sm);
+}
+.repo-facts > div { display: contents; }
+.repo-facts dt { color: var(--text-muted); font-weight: 600; }
+.repo-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* Inline disclosures: secondary text stays one click away. */
+details.inline-disclosure { margin: var(--space-2) 0; }
+details.inline-disclosure > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  list-style: none;
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+details.inline-disclosure > summary::-webkit-details-marker { display: none; }
+details.inline-disclosure > summary::before { content: "▸"; display: inline-block; transition: transform 0.15s ease; }
+details.inline-disclosure[open] > summary::before { transform: rotate(90deg); }
+details.inline-disclosure > :not(summary) { margin-top: var(--space-2); }
+
+/* Sync and branch actions: grouped, with the destructive one set apart. */
+.sync-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); }
+.branch-form { display: grid; gap: var(--space-2); margin-bottom: var(--space-3); min-width: 0; }
+.danger-zone {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+.danger-zone h3 { margin: 0 0 var(--space-1); font-size: var(--text-md); }
+.danger-zone .hint { margin: 0; }
+button.danger { background: transparent; }
+
+/* While an operation runs, the buttons that would start another are visibly inert. */
+body.is-busy button:disabled { cursor: progress; }
+
+/* Operation dock: progress and results stay in view above the status bar. */
+.dock {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: var(--statusbar-h);
+  z-index: 20;
+  width: min(1200px, calc(100% - 24px));
+  max-height: 45vh;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-top: 2px solid var(--accent);
+  border-radius: var(--radius) var(--radius) 0 0;
+  box-shadow: var(--shadow-dock);
+}
+.dock-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.dock-title { flex: 1 1 auto; min-width: 0; font-weight: 650; overflow-wrap: anywhere; }
+.dock .progress { margin-top: 0; }
+.dock .result { margin-top: var(--space-2); }
+
+/* Status bar: fixed at the foot of the window, so it is always the last thing visible. */
+.statusbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 25;
+  height: var(--statusbar-h);
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: var(--space-4);
+  justify-content: space-between;
+  padding: 0 var(--space-4);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+#status-line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.statusbar .mono { color: var(--text-muted); flex: none; }
+body { padding-bottom: calc(var(--statusbar-h) + var(--space-4)); }
+
+/* Tables: compact; a table that is wider than its card scrolls inside the card. */
+table { min-width: 480px; }
+.card table { font-variant-numeric: tabular-nums; }
+
 /* 5. Responsive ------------------------------------------------------------------ */
 
-/* Narrow windows and phones: one column, a compact header, and the tabs scroll. */
+/* Narrow windows and phones: one column, the header wraps, the tabs scroll sideways. */
 @media (max-width: 600px) {
-  main { padding: var(--space-3); gap: var(--space-3); }
+  main { padding: var(--space-3) var(--space-3) 160px; gap: var(--space-3); }
   .topbar { padding: var(--space-2) var(--space-3); }
   .tagline { display: none; }
   .topbar-right { width: 100%; }
   .topbar-right button { flex: 1 1 auto; }
+  .project-title h1 { font-size: 1.3rem; }
   .card { padding: var(--space-3); }
+  .repo-row > summary { padding: var(--space-3); }
+  .repo-facts { grid-template-columns: minmax(0, 1fr); gap: 2px var(--space-3); padding: 0 var(--space-3) var(--space-3); }
+  .repo-facts > div { display: grid; gap: 2px; }
+  .repo-changes { white-space: normal; }
   .next-step { padding: var(--space-3); }
-  .branch-box { justify-items: start; }
-  .branch { text-align: left; }
   .welcome { padding: var(--space-4); margin: var(--space-2) auto; }
   .dialog-body { min-width: 0; width: 88vw; }
-  button.tab { padding: 8px 10px; }
+  .dock { width: calc(100% - 16px); }
+  .dock .progress-row { overflow-wrap: anywhere; }
+  .statusbar { gap: var(--space-2); padding: 0 var(--space-3); }
+  .statusbar #status-connection { display: none; }
   h1 { font-size: 1.25rem; }
+  .tabs { margin: 0 calc(var(--space-3) * -1); padding: 0 var(--space-3); }
+  button.tab { padding: 8px 10px; flex: none; white-space: nowrap; }
 }
 
-/* Wide windows: two columns for overview and changes. */
+/* Wide windows: overview and changes sit side by side where there is room. */
 @media (min-width: 900px) {
-  .split { grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); }
+  .form-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
   .repo-editor .grid-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+  html { scroll-behavior: auto !important; }
 }

@@ -149,12 +149,65 @@ def main():
                 "getComputedStyle(document.activeElement).boxShadow")
             check("keyboard focus is visible", ring not in ("none", ""), ring)
 
-            # Concept note is collapsed by default and opens with one click.
+            # Concept note lives in the Project view, collapsed by default and opened with one click.
+            page.click('button.tab[data-tab="settings"]')
             check("concept note collapsed by default",
                   not page.evaluate("document.querySelector('details.concept').open"))
             page.click("details.concept summary")
             check("concept note opens",
                   page.evaluate("document.querySelector('details.concept').open"))
+
+            # ---- overview rows, keyboard tabs, dry-run guard, one commit --------
+            page.click('button.tab[data-tab="status"]')
+            rows = page.locator("details.repo-row")
+            check("each repository is one row", rows.count() == 2, f"found {rows.count()}")
+            check("repository facts are collapsed by default",
+                  not page.evaluate("document.querySelector('details.repo-row').open"))
+            page.click("details.repo-row > summary")
+            check("a repository row opens to its facts",
+                  page.evaluate("document.querySelector('details.repo-row').open")
+                  and "Path" in page.inner_text("details.repo-row[open]"))
+
+            page.focus('button.tab[data-tab="status"]')
+            page.keyboard.press("ArrowRight")
+            check("arrow keys move between views",
+                  page.get_attribute('button.tab[data-tab="changes"]', "aria-selected") == "true")
+            page.click('button.tab[data-tab="status"]')
+
+            # Dry run is switched on, and switching it off asks first: dismissing keeps it on.
+            page.keyboard.press("d")
+            page.wait_for_selector("#dry-run-badge:not([hidden])")
+            asked = []
+            page.once("dialog", lambda d: (asked.append(d.message), d.dismiss()))
+            page.keyboard.press("d")
+            page.wait_for_timeout(400)
+            check("turning dry run off asks first",
+                  len(asked) == 1 and "Turn dry run off" in asked[0], str(asked))
+            check("dismissing the question keeps dry run on", page.is_visible("#dry-run-badge"))
+            page.once("dialog", lambda d: d.accept())
+            page.keyboard.press("d")
+            page.wait_for_selector("#dry-run-badge", state="hidden")
+            check("accepting turns dry run off", page.is_hidden("#dry-run-badge"))
+
+            # A double click on Commit starts one operation, and the dock keeps its result.
+            page.click('button.tab[data-tab="changes"]')
+            page.fill("#commit-message", "browser check commit")
+            commits = []
+            page.on("request", lambda r: commits.append(r.url)
+                    if r.method == "POST" and r.url.endswith("/api/commit") else None)
+            page.click("#btn-commit", click_count=2)
+            page.wait_for_selector("#operation:not([hidden])")
+            check("the dock reserves room for itself while shown",
+                  "calc" in page.evaluate("document.body.style.paddingBottom"))
+            page.wait_for_function(
+                "() => !document.getElementById('operation-result').hidden", timeout=60000)
+            check("a double click sends one commit request", len(commits) == 1, str(commits))
+            check("the commit result is shown in the dock",
+                  "commit" in page.inner_text("#operation-result").lower())
+            page.click("#btn-operation-close")
+            check("the dock can be hidden", page.is_hidden("#operation"))
+            check("the reserved room is released when the dock is hidden",
+                  page.evaluate("document.body.style.paddingBottom") == "")
 
             check("no script errors while navigating", not errors, str(errors))
             page.close()
