@@ -299,6 +299,28 @@ impl OperationReport {
     }
 
     /// Detail lines for every outcome that carries them.
+    /// The details a user needs to act on when everything succeeded or was skipped. Skipped
+    /// repositories are normal (local-only ones, for instance), so their details are shown only
+    /// when they carry a next step the user has to take: a missing upstream.
+    pub fn guidance_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for outcome in &self.outcomes {
+            let needs_step = match outcome.kind {
+                OutcomeKind::Success => false,
+                OutcomeKind::Skipped => outcome.summary.starts_with("no upstream"),
+                _ => true,
+            };
+            if !needs_step || outcome.details.is_empty() {
+                continue;
+            }
+            lines.push(format!("{} ({}):", outcome.id, outcome.path));
+            for detail in &outcome.details {
+                lines.push(format!("  {detail}"));
+            }
+        }
+        lines
+    }
+
     pub fn detail_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for outcome in &self.outcomes {
@@ -476,5 +498,44 @@ mod tests {
         assert!(json.contains("\"operation\":\"commit\""));
         assert!(json.contains("\"dry_run\":true"));
         assert!(json.contains("\"outcome\":\"success\""));
+    }
+}
+
+#[cfg(test)]
+mod guidance_tests {
+    use super::*;
+    use crate::model::RepositoryRole;
+
+    #[test]
+    fn guidance_shows_the_next_step_for_a_missing_upstream_but_not_for_local_only_repositories() {
+        let report = OperationReport::new(
+            "pull",
+            false,
+            vec![
+                RepoOutcome::new(
+                    "local",
+                    RepositoryRole::External,
+                    "local",
+                    OutcomeKind::Skipped,
+                    "no remote configured",
+                )
+                .with_detail("add one with `git remote add origin <url>`".to_string()),
+                RepoOutcome::new(
+                    "tracked",
+                    RepositoryRole::External,
+                    "tracked",
+                    OutcomeKind::Skipped,
+                    "no upstream branch configured",
+                )
+                .with_detail("set one with `git push -u <remote> <branch>`".to_string()),
+            ],
+        );
+        let lines = report.guidance_lines();
+        assert!(lines.iter().any(|l| l.contains("git push -u")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("remote add")), "{lines:?}");
+        assert!(report
+            .detail_lines()
+            .iter()
+            .any(|l| l.contains("remote add")));
     }
 }

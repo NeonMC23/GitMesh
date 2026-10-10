@@ -236,16 +236,7 @@ fn pull_one(
     }
     let upstream = match state.status.as_ref().and_then(|s| s.upstream.clone()) {
         Some(upstream) => upstream,
-        None => {
-            return base(
-                OutcomeKind::Skipped,
-                "no upstream branch configured".to_string(),
-            )
-            .with_detail(
-                "set one with `git push -u <remote> <branch>` (gitmesh push does this automatically)"
-                    .to_string(),
-            );
-        }
+        None => return no_upstream_outcome(&base, state, git),
     };
 
     // The `ahead`/`behind` numbers from `git status` are only as fresh as the last
@@ -406,6 +397,80 @@ fn pull_one(
         }
         Err(err) => base(OutcomeKind::Failed, "git could not be run".to_string())
             .with_detail(err.to_string()),
+    }
+}
+
+/// A repository with commits and a remote, but no upstream. The outcome says which of the
+/// situations this is, and gives a concrete next step only when that step is unambiguous:
+///
+/// * the remote cannot be read: a failure, because the remote is broken whatever the upstream;
+/// * several remotes are configured: nothing is guessed, the user chooses;
+/// * one remote, and its branch of the same name exists: the exact command is named (it is
+///   not run);
+/// * one remote with no branch of that name: GitMesh tracks only a same-name branch, so the
+///   branches the remote does have are listed, and the user chooses.
+fn no_upstream_outcome(
+    base: &dyn Fn(OutcomeKind, String) -> RepoOutcome,
+    state: &RepositoryState,
+    git: &GitRepo<'_>,
+) -> RepoOutcome {
+    let guidance =
+        "set one with `git push -u <remote> <branch>` (gitmesh push does this automatically)";
+    let names: Vec<String> = state.remotes.iter().map(|r| r.name.clone()).collect();
+    if names.len() != 1 {
+        return base(
+            OutcomeKind::Skipped,
+            "no upstream branch configured".to_string(),
+        )
+        .with_details(vec![
+            format!(
+                "several remotes are configured ({}), so no upstream is chosen for you",
+                names.join(", ")
+            ),
+            "choose one with `git push -u <remote> <branch>`".to_string(),
+        ]);
+    }
+    let remote = &state.remotes[0];
+    let url = remote.fetch_url().unwrap_or_default().to_string();
+    match crate::git::probe_remote(git.runner(), &url) {
+        crate::git::RemoteProbe::Unreachable { reason, hint } => base(
+            OutcomeKind::Failed,
+            format!(
+                "no upstream branch configured, and remote '{}' could not be read",
+                remote.name
+            ),
+        )
+        .with_details(vec![
+            reason,
+            hint,
+            "nothing local was changed; fix the remote, then set an upstream".to_string(),
+        ]),
+        crate::git::RemoteProbe::Reachable { branches, .. } => {
+            let branch = state.branch();
+            let mut outcome = base(
+                OutcomeKind::Skipped,
+                "no upstream branch configured".to_string(),
+            )
+            .with_detail(guidance.to_string());
+            match branch {
+                Some(branch) if branches.is_empty() => outcome.details.push(format!(
+                    "remote '{}' has no commits yet: `gitmesh push` publishes '{branch}' and sets its upstream",
+                    remote.name
+                )),
+                Some(branch) if branches.contains(&branch) => outcome.details.push(format!(
+                    "'{}/{branch}' exists on the remote; to track it, run `git branch --set-upstream-to={}/{branch}` (GitMesh does not choose it for you)",
+                    remote.name, remote.name
+                )),
+                Some(branch) => outcome.details.push(format!(
+                    "remote '{}' has no branch named '{branch}' (it has: {}); GitMesh tracks only a branch of the same name. Push '{branch}' with `gitmesh push`, or choose one with `git branch --set-upstream-to={}/<branch>`",
+                    remote.name,
+                    branches.join(", "),
+                    remote.name
+                )),
+                None => {}
+            }
+            outcome
+        }
     }
 }
 

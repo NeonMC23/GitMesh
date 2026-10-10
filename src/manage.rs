@@ -380,6 +380,8 @@ pub struct CandidateInspection {
     pub is_repository: bool,
     /// True when that repository has at least one commit.
     pub has_commits: bool,
+    /// True when the directory exists and holds no entries at all.
+    pub empty_directory: bool,
     /// Branch currently checked out.
     pub branch: Option<String>,
     /// `origin` configured in Git, if any.
@@ -486,6 +488,13 @@ pub fn inspect_candidate(
             nested_repositories[0]
         ));
     }
+    let empty_directory = exists && !is_repository && discovery::is_empty_directory(&absolute);
+    if is_repository && !has_commits {
+        warnings.push(format!(
+            "'{}' has no commits yet: pull and push skip it until its first commit",
+            to_slash(&relative)
+        ));
+    }
     let tracked_by_root = if exists {
         discovery::count_files_tracked_under(&project.root, &relative, runner)
     } else {
@@ -505,6 +514,7 @@ pub fn inspect_candidate(
         exists,
         is_repository,
         has_commits,
+        empty_directory,
         branch,
         origin,
         tracked_by_root,
@@ -1580,6 +1590,21 @@ fn plan_add(
     }
 
     // ---- the repository itself -------------------------------------------------
+    if is_repository && !has_commits {
+        if let Some(url) = clean_url(remote) {
+            if let crate::git::RemoteProbe::Reachable { branches, .. } =
+                crate::git::probe_remote(runner, &url)
+            {
+                if !branches.is_empty() {
+                    planner.notices.push(format!(
+                        "'{path_label}' has no commits, but {url} already has history: GitMesh \
+                         does not merge that history into an empty repository. Make the first \
+                         commit here, or clone the remote into a new directory instead"
+                    ));
+                }
+            }
+        }
+    }
     if is_repository {
         let mut detail = if has_commits {
             format!(

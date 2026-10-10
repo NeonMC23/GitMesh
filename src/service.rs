@@ -1446,6 +1446,7 @@ pub fn management_candidate_view_json(candidate: &manage::CandidateInspection) -
         ("exists", Json::from(candidate.exists)),
         ("isRepository", Json::from(candidate.is_repository)),
         ("hasCommits", Json::from(candidate.has_commits)),
+        ("emptyDirectory", Json::from(candidate.empty_directory)),
         (
             "branch",
             Json::opt(candidate.branch.clone().map(Json::from)),

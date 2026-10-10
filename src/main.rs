@@ -726,6 +726,9 @@ fn run_repository_intent(
     for warning in &plan.warnings {
         eprintln!("gitmesh: note: {warning}");
     }
+    for notice in &plan.notices {
+        eprintln!("gitmesh: note: {notice}");
+    }
     if !plan.is_ready() {
         return Err(Error::InvalidConfiguration(plan.blockers.clone()));
     }
@@ -1071,8 +1074,12 @@ fn render_report(global: &GlobalOptions, report: &OperationReport) -> Result<u8>
     for line in report.summary_lines() {
         println!("{line}");
     }
-    if global.verbose || !report.is_success() {
-        let details = report.detail_lines();
+    if global.verbose || !report.is_success() || !report.guidance_lines().is_empty() {
+        let details = if global.verbose || !report.is_success() {
+            report.detail_lines()
+        } else {
+            report.guidance_lines()
+        };
         if !details.is_empty() {
             println!();
             println!("Details:");

@@ -771,7 +771,8 @@ var GitMesh = (function () {
     var steps = [];
     var headline;
     if (!candidate.exists) {
-      headline = 'There is no directory \'' + candidate.path + '\' in this project.';
+      headline = 'There is no directory \'' + candidate.path + '\' in this project. ' +
+        'To bring a remote in as a new directory, clone it instead.';
       return { path: candidate.path, headline: headline, steps: [], blockers: candidate.blockers || [],
         warnings: candidate.warnings || [], canAdd: false, isRepository: false, trackedByRoot: 0,
         nestedRepositories: [], suggestedId: '', remote: '', branch: '' };
@@ -781,8 +782,19 @@ var GitMesh = (function () {
       steps.push('nothing is added and nothing is re-initialised');
       steps.push('use "give it another name" or "record another remote" below to change it');
     } else if (candidate.isRepository) {
-      headline = 'An existing Git repository would be adopted.';
+      headline = candidate.hasCommits === false
+        ? 'An existing Git repository with no commits would be adopted.'
+        : 'An existing Git repository would be adopted.';
       steps.push('use the repository as it is; it is never re-initialised');
+      if (candidate.hasCommits === false) {
+        steps.push('it has no commits yet, so pull and push skip it until its first commit');
+      }
+      steps.push('add it to the project as \'' + (candidate.suggestedId || candidate.path) + '\'');
+    } else if (candidate.emptyDirectory) {
+      headline = 'An empty directory: a Git repository would be created there, with no history.';
+      steps.push('run git init in \'' + candidate.path + '\'');
+      steps.push('a remote that already has history is never merged into it: to bring that ' +
+        'history in, clone the remote into a new directory instead');
       steps.push('add it to the project as \'' + (candidate.suggestedId || candidate.path) + '\'');
     } else {
       headline = 'A Git repository would be created there.';

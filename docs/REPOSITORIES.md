@@ -28,10 +28,14 @@ states it distinguishes are:
 
 - **Local only**: a repository with no remote. It is valid. Pull and push skip it with
   "no remote configured" and this is not a failure.
-- **Uninitialised directory**: a plain folder. It can be initialised, but only when it is
-  not an empty folder that a remote already has history for (see below).
+- **Missing directory**: GitMesh does not create it. The check points to clone, which creates
+  the directory from a remote.
+- **Empty directory**: a folder with no entries. GitMesh can `git init` it, but a remote that
+  already has history is never merged into it (see below). To bring that history in, clone.
+- **Uninitialised directory**: a folder with files. It can be initialised as a new repository.
 - **Initialised, no commits**: a repository with no commit yet. Commit-dependent operations
-  (pull, push) are skipped with "repository has no commits yet".
+  (pull, push) are skipped with "repository has no commits yet". When its remote already has
+  history, the review says the history is not brought in: make the first commit here, or clone.
 - **Valid remote**: the remote answers and has commits.
 - **Empty remote**: the remote answers but has no commits. Pushing publishes the repository.
 - **Missing or unreachable remote**: the real Git error is shown, with what to check.
@@ -78,20 +82,31 @@ If the remote is empty, the plan says so. Pushing the first commits publishes th
 
 **Do not connect an empty folder to a remote that has history.** GitMesh refuses to `git init`
 an empty folder whose remote already has commits, because the result would be an unrelated
-history. Clone the remote into that folder instead (`configure clone`), after removing the empty
-folder or choosing a new one.
+history. Clone the remote into a new or empty directory instead (`configure clone`).
+
+**A repository without commits does not receive its remote's history.** Connecting it records
+the remote, and the review says that the history is not merged in. Pull skips the repository
+until it has a commit. To work from the remote's history, clone it into a new directory.
 
 A directory that does not exist yet is refused with a pointer to `configure clone`, not
 created silently.
 
 ## Upstream (tracking) branches
 
-- After a clone, the default branch is tracked (`origin/<default>`).
-- A repository with a remote but no upstream is reported as
-  "no upstream branch configured". Pull skips it and says how to set one.
-- Push sets the upstream on the first push with `gitmesh push` (it runs
-  `git push --set-upstream <remote> <branch>`). It never guesses among several remote
-  branches; it pushes the current branch to the branch of the same name.
+- **After a clone**, the local default branch tracks `origin/<default>`, where `<default>` is
+  the branch the remote's `HEAD` points to. An empty remote has nothing to track yet.
+- **After connecting an existing repository**, no upstream is set. The first `gitmesh push`
+  sets one (`git push --set-upstream <remote> <branch>`).
+- **Same-name rule.** GitMesh tracks and pushes only a branch of the *same name* as the local
+  branch. It does not rename branches, and it does not choose between several remote branches.
+  If your local branch is `feature-x` and the remote has only `main`, pull reports that there is
+  no branch named `feature-x` and lists what the remote has. Push it with `gitmesh push`, or
+  choose the upstream yourself with `git branch --set-upstream-to=<remote>/<branch>`.
+- **Several remotes.** When more than one remote is configured, pull and push never choose a
+  remote for you. Pull reports the situation and names the command to use.
+- **Pull without an upstream** first reads the remote. An unreachable remote is a failure,
+  because it is broken whatever the upstream is. A reachable remote is reported as "no upstream",
+  with the one command that fits (if there is exactly one reading).
 - Fetch never changes your branches or working files. Pull is a separate step.
 
 ## Sync errors and what to do
@@ -103,7 +118,11 @@ operation as a whole is never reported as a success when any repository failed.
 | Message | Meaning | What to do |
 |---|---|---|
 | `no remote configured` (skipped) | Local-only repository. | Nothing, or `configure remote <id> --url … --set-git-remote`. |
-| `no upstream branch configured` (skipped) | Remote exists, no tracking branch. | `git push -u <remote> <branch>`, or `gitmesh push`. |
+| `no upstream branch configured` (skipped) | Remote exists, no tracking branch. The details say which situation it is (below). | `git push -u <remote> <branch>`, or `gitmesh push`. |
+| `… and remote 'origin' could not be read` (failed) | No upstream, and the remote itself is unreachable or gone. | Fix the URL or access; nothing local was changed. |
+| `several remotes are configured … no upstream is chosen` (skipped) | More than one remote and no upstream. | Choose one with `git push -u <remote> <branch>`. |
+| `remote 'x' has no branch named 'y' (it has: …)` (detail) | Same-name rule: no branch of that name on the remote. | Push it, or set the upstream to a branch you choose. |
+| `'origin/y' exists on the remote; to track it, run …` (detail) | Unambiguous: the same-name branch exists. | Run the printed command if you want that tracking. GitMesh does not run it. |
 | `repository has no commits yet` (skipped) | No commit to pull or push. | Commit first. |
 | `no longer exists on the remote` (failed) | The remote deleted the tracked branch. | Push the branch again, or pick another upstream. |
 | `diverged from …` (failed) | Both sides have commits the other lacks. Pull refuses to merge silently. | `gitmesh pull --strategy merge` or `--strategy rebase`, then push. |
@@ -120,6 +139,11 @@ cleans, force-pushes or overwrites your changes.
 
 - Integrating diverged branches is done by you, with `pull --strategy merge|rebase`, not
   automatically.
+- Only same-name branches are tracked and pushed (see "Same-name rule"). Renaming a branch
+  to match the remote is not done by GitMesh.
+- A repository without commits is not given its remote's history by GitMesh; pull skips it.
+- After a clone, tracking follows the remote's `HEAD`. If the remote has no `HEAD` branch
+  recorded, the clone may have no upstream; pull then reports it as above.
 - A remote that is unreachable at `configure add` time is recorded with a warning; GitMesh
   does not block it.
 - The TUI does not clone; this is a GUI and CLI operation.

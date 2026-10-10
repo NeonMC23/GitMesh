@@ -652,6 +652,23 @@ function sampleInspection() {
   });
   equal(missing.canAdd, false, 'a missing directory cannot be added');
   contains(missing.headline, 'no directory', 'and the interface says why');
+  contains(missing.headline, 'clone', 'and names the clone path for a remote');
+
+  var empty = GitMesh.candidateSummary({
+    path: 'libs/fresh', exists: true, isRepository: false, hasCommits: false, emptyDirectory: true,
+    trackedByRoot: 0, nestedRepositories: [], suggestedId: 'fresh', managedAs: null, canAdd: true,
+    blockers: [], warnings: []
+  });
+  contains(empty.headline, 'empty directory', 'an empty directory is named as one');
+  contains(empty.steps.join(' | '), 'clone', 'and the history is brought in by cloning, not init');
+
+  var unborn = GitMesh.candidateSummary({
+    path: 'libs/draft', exists: true, isRepository: true, hasCommits: false, emptyDirectory: false,
+    branch: 'main', origin: null, trackedByRoot: 0, nestedRepositories: [], suggestedId: 'draft',
+    managedAs: null, canAdd: true, blockers: [], warnings: []
+  });
+  contains(unborn.headline, 'no commits', 'a repository without commits says so');
+  contains(unborn.steps.join(' | '), 'skip it', 'and says what that means for sync');
   equal(missing.blockers.length, 1, 'the blocker comes from the inspection');
 
   var managed = GitMesh.candidateSummary({

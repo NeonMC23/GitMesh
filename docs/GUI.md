@@ -287,8 +287,14 @@ view says so and names them.
   repository has diverged, GitMesh refuses and says so instead of silently creating a
   merge commit. *Merge* and *Rebase* are explicit choices.
 * **Push** pushes only the repositories that have commits to push and sets the upstream
-  on the first push. Repositories with nothing to push are reported as "nothing to do",
+  on the first push. Repositories with nothing to push are reported as "nothing to push",
   not as failures.
+* **Upstream branches.** GitMesh tracks and pushes only a branch of the *same name* as the
+  local branch; it never renames branches or picks among several remote branches. A
+  repository with no upstream is skipped with the exact command to fix it (for example
+  `git branch --set-upstream-to=origin/main`), which GitMesh does not run for you. A remote
+  that cannot be read is a failure, not a "no upstream" skip. Several remotes are never
+  chosen automatically. See [REPOSITORIES.md](REPOSITORIES.md).
 * A failing repository never stops the others. The result panel lists every repository
   with its own outcome and keeps the details Git returned.
 

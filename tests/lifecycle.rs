@@ -695,3 +695,162 @@ fn a_fast_forward_pull_still_updates_a_repository_that_tracks_its_remote() {
     assert_eq!(outcome(&report, "ff").kind, OutcomeKind::Success);
     assert!(clone.join("later.txt").exists());
 }
+
+// ------------------------------------------------- upstream diagnostics (pull) --
+
+#[test]
+fn a_pull_without_upstream_reports_an_unreachable_remote_as_a_failure() {
+    let f = RepoFixture::named("lifecycle-no-upstream-unreachable");
+    f.project_with(&[(".", ".")]);
+    let bare = seeded_remote(&f, "gone-soon.git", "g.txt");
+    let clone = f.clone_from(&bare, "libs/gone");
+    f.project_with(&[(".", "."), ("gone", "libs/gone")]);
+    f.runner()
+        .repo(&clone)
+        .run_checked(&["branch", "--unset-upstream"])
+        .unwrap();
+    // The remote disappears; the repository still has a remote but no upstream.
+    std::fs::remove_dir_all(&bare).unwrap();
+
+    let report = pull_project(&f.load_project(), f.runner(), &SyncOptions::new()).unwrap();
+    let gone = outcome(&report, "gone");
+    assert_eq!(gone.kind, OutcomeKind::Failed, "{}", all_text(gone));
+    assert!(
+        gone.summary.contains("could not be read"),
+        "{}",
+        gone.summary
+    );
+    assert!(!report.is_success());
+}
+
+#[test]
+fn a_pull_without_upstream_names_the_one_branch_it_could_track() {
+    let f = RepoFixture::named("lifecycle-no-upstream-same-name");
+    f.project_with(&[(".", ".")]);
+    let bare = seeded_remote(&f, "same.git", "s.txt");
+    let clone = f.clone_from(&bare, "libs/same");
+    f.project_with(&[(".", "."), ("same", "libs/same")]);
+    f.runner()
+        .repo(&clone)
+        .run_checked(&["branch", "--unset-upstream"])
+        .unwrap();
+
+    let report = pull_project(&f.load_project(), f.runner(), &SyncOptions::new()).unwrap();
+    let same = outcome(&report, "same");
+    assert_eq!(same.kind, OutcomeKind::Skipped);
+    assert_eq!(same.summary, "no upstream branch configured");
+    let text = all_text(same);
+    assert!(
+        text.contains("origin/main") && text.contains("set-upstream-to"),
+        "the exact command is named, not run: {text}"
+    );
+    // Nothing was tracked behind the user's back.
+    assert!(f.runner().repo(&clone).upstream().unwrap().is_none());
+}
+
+#[test]
+fn a_pull_without_upstream_does_not_pick_among_several_remotes() {
+    let f = RepoFixture::named("lifecycle-no-upstream-several");
+    f.project_with(&[(".", ".")]);
+    let bare = seeded_remote(&f, "several.git", "x.txt");
+    let other = seeded_remote(&f, "several-other.git", "y.txt");
+    let clone = f.clone_from(&bare, "libs/several");
+    f.project_with(&[(".", "."), ("several", "libs/several")]);
+    let runner = f.runner();
+    runner
+        .repo(&clone)
+        .run_checked(&["branch", "--unset-upstream"])
+        .unwrap();
+    runner
+        .repo(&clone)
+        .run_checked(&["remote", "add", "mirror", &url(&other)])
+        .unwrap();
+
+    let report = pull_project(&f.load_project(), f.runner(), &SyncOptions::new()).unwrap();
+    let several = outcome(&report, "several");
+    assert_eq!(several.kind, OutcomeKind::Skipped);
+    let text = all_text(several);
+    assert!(text.contains("several remotes"), "{text}");
+    assert!(
+        !text.contains("set-upstream-to=origin/main") && !text.contains("set-upstream-to=mirror/"),
+        "no candidate is chosen for the user: {text}"
+    );
+}
+
+#[test]
+fn a_pull_without_a_same_named_branch_lists_what_the_remote_has() {
+    let f = RepoFixture::named("lifecycle-no-upstream-other-branch");
+    f.project_with(&[(".", ".")]);
+    let bare = seeded_remote(&f, "other.git", "o.txt");
+    let clone = f.clone_from(&bare, "libs/other");
+    f.project_with(&[(".", "."), ("other", "libs/other")]);
+    let runner = f.runner();
+    runner
+        .repo(&clone)
+        .run_checked(&["branch", "--unset-upstream"])
+        .unwrap();
+    runner
+        .repo(&clone)
+        .run_checked(&["branch", "-m", "feature-x"])
+        .unwrap();
+
+    let report = pull_project(&f.load_project(), f.runner(), &SyncOptions::new()).unwrap();
+    let other = outcome(&report, "other");
+    assert_eq!(other.kind, OutcomeKind::Skipped);
+    let text = all_text(other);
+    assert!(
+        text.contains("no branch named 'feature-x'") && text.contains("main"),
+        "{text}"
+    );
+}
+
+// ----------------------------------------------- onboarding classification --
+
+#[test]
+fn an_existing_repository_without_commits_is_told_its_remote_has_history() {
+    let f = RepoFixture::named("lifecycle-unborn-remote-history");
+    f.project_with(&[(".", ".")]);
+    let bare = seeded_remote(&f, "history-here.git", "h.txt");
+    f.init_repo("libs/draft");
+
+    let plan = plan(
+        &f,
+        add_intent("libs/draft", "draft", Some(&url(&bare)), false),
+    );
+    assert!(
+        plan.is_ready(),
+        "adopting an unborn repository is allowed: {:?}",
+        plan.blockers
+    );
+    assert!(
+        plan.notices
+            .iter()
+            .any(|n| n.contains("no commits") && n.contains("already has history")),
+        "the plan says the history is not brought in: {:?}",
+        plan.notices
+    );
+}
+
+#[test]
+fn the_candidate_inspection_distinguishes_empty_directories_and_unborn_repositories() {
+    let f = RepoFixture::named("lifecycle-candidate-states");
+    f.project_with(&[(".", ".")]);
+    std::fs::create_dir_all(f.path().join("libs/empty")).unwrap();
+    f.init_repo("libs/unborn");
+    let project = f.load_project();
+
+    let empty = manage::inspect_candidate(&project, "libs/empty", f.runner()).unwrap();
+    assert!(empty.exists && empty.empty_directory && !empty.is_repository);
+
+    let unborn = manage::inspect_candidate(&project, "libs/unborn", f.runner()).unwrap();
+    assert!(unborn.is_repository && !unborn.has_commits && !unborn.empty_directory);
+    assert!(
+        unborn.warnings.iter().any(|w| w.contains("no commits")),
+        "{:?}",
+        unborn.warnings
+    );
+
+    f.write("libs/busy/notes.txt", "x");
+    let busy = manage::inspect_candidate(&project, "libs/busy", f.runner()).unwrap();
+    assert!(!busy.empty_directory, "a directory with files is not empty");
+}

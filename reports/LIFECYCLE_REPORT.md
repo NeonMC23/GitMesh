@@ -1,6 +1,8 @@
 # Repository lifecycle: audit, implementation and verification
 
 Status: implemented in the working tree, uncommitted, untagged. Baseline commit `b4198d8`.
+The final audit pass (CLI guidance, GUI clone journey, upstream diagnostics, docs) is recorded in
+section 10. Browser and E2E suites were run on the final tree and passed; see section 5.
 Everything in "Verified" was run in this sandbox; everything in "Not verified" was not.
 
 ## 1. Audit: what was wrong, and how each state is classified
@@ -68,7 +70,10 @@ Further defects found:
 - `src/gui/server.rs`: `clone` intent in the repository form (plus a unit test).
 - `src/gui/static/app.js`, `index.html`, `client.test.js`: a "clone a remote into a new directory"
   option with its own fields. The GUI sends the request; the Rust core plans and runs it.
-- `tests/lifecycle.rs` (new): 21 integration tests on temp bare repositories, no network.
+- `tests/lifecycle.rs` (new): 27 integration tests on temp bare repositories, no network. Six were
+  added in the final audit: pull diagnostics (unreachable remote, no upstream with one remote, several
+  remotes, same-name branch available, no same-name branch, empty remote), the unborn-repository
+  notice, and the onboarding candidate state.
 - `tests/cli.rs`: one test for `configure clone` through the real binary.
 - Docs: `docs/REPOSITORIES.md` (new), `docs/GUI.md` (clone section), `docs/ARCHITECTURE.md`
   (section 9), `README.md` (command table and documentation index).
@@ -81,6 +86,13 @@ Further defects found:
 (new), `tests/cli.rs`, `docs/REPOSITORIES.md` (new), `docs/GUI.md`, `docs/ARCHITECTURE.md`,
 `README.md`, `reports/LIFECYCLE_REPORT.md` (new).
 
+Final audit pass, additionally: `src/ops/mod.rs` (`guidance_lines`, one unit test), `src/main.rs`
+(plan notices printed in dry runs; no-upstream guidance printed for skipped pull/push),
+`src/ops/sync.rs` (`no_upstream_outcome`), `src/manage.rs`, `src/service.rs`, `src/gui/static/app.js`,
+`src/gui/static/client.test.js`, `tools/gui-clone-check.py` (new), `docs/GUI.md`.
+`cargo fmt` (run in the final pass) changed only hunks in `src/ops/mod.rs`, `src/ops/sync.rs` and
+`tests/lifecycle.rs`, all written by this task.
+
 The working tree also contains changes from the earlier GUI/TUI redesign task, which are not
 part of this report. `cargo fmt` reported no changes beyond these.
 
@@ -89,15 +101,31 @@ to `src/git/command.rs`.
 
 ## 5. Test commands and actual results
 
-Run in this sandbox against the final tree.
+Run in this sandbox against the final tree (after the final audit pass, all in one session, no
+later edits).
 
 | Command | Result |
 |---|---|
-| `cargo fmt --check` | exit 0 |
-| `cargo clippy --all-targets -- -D warnings` | exit 0, no warnings |
-| `cargo test --no-fail-fast` | exit 0: lib 353 passed; cli 16 passed; client 2 passed; lifecycle 21 passed; workflows 15 passed |
-| `cargo build --release` | exit 0 |
-| Manual smoke via the binary (`/tmp/audit/smoke_clone.sh`) | clone into a new dir: exit 0, `origin/main` tracked, files present; dry run changes nothing; repeat refused with exit 2 and a clear message; non-empty directory refused with exit 2 and files intact; unreachable remote refused with Git's reason and exit 2 |
+| `bash tools/rust-env.sh cargo fmt --check` | exit 0 (after one `cargo fmt` that changed only this task's hunks) |
+| `bash tools/rust-env.sh cargo clippy --all-targets -- -D warnings` | exit 0, no warnings |
+| `bash tools/rust-env.sh cargo test --no-fail-fast` | exit 0: lib 354 passed; cli 16 passed; client 2 passed; lifecycle 27 passed; workflows 15 passed; 0 failed |
+| `bash tools/rust-env.sh cargo build --release` | exit 0 |
+| `python3 tools/gui-clone-check.py` | exit 0: 32 PASS, 0 FAIL (clone journey and onboarding states in Chromium) |
+| `python3 tools/gui-browser-check.py` | exit 0: 29 PASS, 0 FAIL |
+| `python3 tools/gui-workflow.py` | exit 0: 75 checks passed, 0 failed |
+| `python3 tools/repository-workflow.py` | exit 0: 179 checks passed, 0 failed |
+| `python3 tools/setup-workflow.py` | exit 0: 115 checks passed, 0 failed |
+| `python3 tools/tui-pty-check.py` | exit 0: 24 PASS (terminal checks) |
+| `/tmp/smoke2.sh` (CLI, against the rebuilt release binary) | unborn repository dry run prints the history notice; missing directory exit 2 with the clone hint; empty directory with remote history exit 2; unreachable pull Failed with guidance; reachable pull with no same-name branch Skipped with the branch list; reachable same-name branch Skipped with the exact `git branch --set-upstream-to` command |
+
+The earlier manual smoke script (`/tmp/audit/smoke_clone.sh`, from the first pass) is no longer in
+the sandbox and was not re-run. Its earlier results were: clone into a new directory exit 0 with
+`origin/main` tracked; dry run changed nothing; repeat refused with exit 2; non-empty directory
+refused with files intact; unreachable remote refused with Git's reason.
+
+The `tools/gui-clone-check.py` checks cover, in the browser: duplicate destination, non-empty
+destination, unreachable remote, invalid remote (looks like an option), and empty remote, plus the
+onboarding states (empty directory, unborn repository, missing directory).
 
 The lifecycle tests cover: clone into a new directory (tracking and manifest); clone does not
 change root ownership; refusal into a non-empty directory; refusal into an existing repository;
@@ -107,7 +135,12 @@ an empty remote; empty directory not initialised onto remote history; unreachabl
 with a warning; local-only repository skipped, not failed; remote without upstream; repository
 without commits skipped; rejected diverged push explained and not forced; unrelated histories
 reported by pull and push; hook refusal reported as the remote's refusal; deleted upstream not
-reported up to date; one failing repository among several, counts correct; fast-forward pull.
+reported up to date; one failing repository among several, counts correct; fast-forward pull; and
+the six final-audit cases listed in section 3.
+
+The unit test `guidance_shows_the_next_step_for_a_missing_upstream_but_not_for_local_only_repositories`
+(in `src/ops/mod.rs`) checks that a local-only skip is left out of the guidance and that a missing
+upstream is included, while the full listing still has both.
 
 ## 6. Changes to existing tests (disclosed)
 
@@ -136,21 +169,48 @@ PTY sizes 40×10 and 60×16 match `tools/tui-pty-check.py`. The cited test
 
 ## 9. Limitations and not verified
 
-- **Browser and E2E not re-run.** The GUI clone option and the server change were checked with the
-  Rust unit test and the client test (`tests/client.rs`), but not in a browser. The Playwright
-  checks (`tools/gui-browser-check.py`, `tools/gui-workflow.py`) and the repository E2E script
-  (`tools/repository-workflow.py`) were not re-run after this change.
+- **Browser and E2E were run** on the final tree (section 5), not only on the earlier one. Their
+  results are the counts recorded there. Nothing in this section is claimed beyond those runs.
+- **The TUI does not clone.** Clone is a GUI and CLI operation (`gitmesh configure clone`), in line
+  with the TUI's one-screen scope. The TUI has no clone path to test.
 - **Only same-name upstreams.** Push tracks and pushes the branch with the same name. Differently
   named remote branches are not matched or guessed. Cloning tracks the remote's default branch only.
-- **Pull without an upstream does not probe the remote.** It still reports "no upstream" first.
+- **Pull without an upstream does probe the remote.** An unreachable remote is a failure; a reachable
+  remote gives the same-name command or the list of remote branches, and nothing is run for you.
 - **Refusal header.** CLI refusals still print the generic `project configuration is invalid:`
   header, which is existing behaviour, not new wording.
+- **Clone-failure manifest protection** skips the whole manifest update when any clone in a
+  multi-intent plan fails, including other repositories' manifest changes. Known limitation.
 - **Unreachable remote at `configure add` is a warning**, by design, so a temporary outage does not
   block setup. It is recorded and reported.
 - **Integration of diverged branches is manual** (`pull --strategy merge|rebase`). GitMesh does not
-  merge or rebase automatically.
+  merge, rebase, reset or force-push automatically.
 - **Probe cost.** Planning runs `git ls-remote` for any remote it is given. Over HTTP the probe uses
   Git's low-speed limits; other transports have no timeout of GitMesh's own. Not measured on a slow network.
 - **Platform.** Tests were run on Linux only. The hook test writes an executable `pre-receive` script
   and relies on Unix permissions; it is not expected to pass unchanged on other platforms.
+- **Not verified:** the GUI against a real remote over the network (all remotes are local bare repos);
+  Windows and macOS; the sync and push E2E on repositories larger than the fixtures.
+- **Not recovered:** the previously overwritten `src/ui/app.rs` and `src/gui/static/app.css` (section 7).
 - **Not committed, not tagged.** No version or milestone number was assigned.
+
+## 10. Final audit pass
+
+Focus areas and status:
+
+1. **GUI clone journey:** browser coverage for duplicate, non-empty, unreachable, invalid, and empty
+   remote, plus onboarding states. `tools/gui-clone-check.py`: 32 PASS.
+2. **Onboarding consistency:** empty directory, unborn repository, missing directory, and existing
+   repository are classified distinctly in the GUI (`candidateSummary`) and the CLI (refusal and
+   notice text). An unborn repository is never presented as connected to a remote with history.
+   The CLI now prints the plan notices in dry runs, so the no-commit notice reaches the terminal.
+3. **Pull and upstream diagnostics:** no remote, unreachable remote, deleted upstream, no local commits,
+   several remotes, and genuine divergence are distinct. Six lifecycle tests cover the no-upstream
+   cases. The CLI shows the no-upstream guidance for skipped repositories; local-only skips stay quiet.
+   Nothing is merged, rebased, reset or force-pushed automatically.
+4. **Branch docs:** `docs/REPOSITORIES.md` and `docs/GUI.md` describe the same-name rule, the
+   no-upstream skip with the command GitMesh does not run, and the default-branch behaviour of clone.
+   The push wording in `docs/GUI.md` was corrected from "nothing to do" to "nothing to push" to match
+   the code. `README.md` was checked; it has no same-name or default-branch claims beyond its links.
+
+Failing items at the end of this pass: none in the suites listed in section 5.
