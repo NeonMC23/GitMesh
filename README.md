@@ -87,9 +87,13 @@ thin orchestration layer that makes them behave like one project for everyday wo
 ## Installation
 
 ```console
-$ cargo build --release
-$ install -m755 target/release/gitmesh ~/.local/bin/gitmesh   # or copy it anywhere on PATH
+$ ./build.sh                                                  # release build; no arguments; works from any directory
+$ target/release/gitmesh --help                               # run it (build.sh does not start GitMesh)
+$ install -m755 target/release/gitmesh ~/.local/bin/gitmesh   # optional: or copy it anywhere on PATH
 ```
+
+`build.sh` runs `cargo build --release` through `tools/rust-env.sh` and checks that the
+executable was produced.
 
 Requirements: Rust (edition 2021, Rust 1.74+) to build, and Git on `PATH` at runtime.
 GitMesh is a single binary with no runtime dependencies beyond Git itself.

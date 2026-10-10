@@ -19,6 +19,8 @@ $ cargo fmt --all                 # format
 $ cargo fmt --all -- --check      # verify formatting (CI)
 $ cargo clippy --all-targets -- -D warnings   # lint, warnings are errors
 $ cargo build --release           # optimised binary: target/release/gitmesh
+$ ./build.sh                      # the same release build, from any directory, with checks
+$ ./tools/build-script-check.sh   # fast checks for build.sh (fake toolchains, no build)
 ```
 
 The full validation sequence used for every milestone:
