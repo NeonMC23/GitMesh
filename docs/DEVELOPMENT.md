@@ -21,6 +21,7 @@ $ cargo clippy --all-targets -- -D warnings   # lint, warnings are errors
 $ cargo build --release           # optimised binary: target/release/gitmesh
 $ ./build.sh                      # the same release build, from any directory, with checks
 $ ./tools/build-script-check.sh   # offline checks for build.sh and the toolchain discovery (no real build)
+$ tools/install-check.sh          # install.sh in a temporary directory (needs a release build; never touches ~/.local/bin)
 ```
 
 The full validation sequence used for every milestone:

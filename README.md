@@ -10,6 +10,8 @@ You keep working normally: one directory, one status, one commit, one pull, one 
 runs real `git` commands in each physical repository and reports, per repository, what happened.
 It does not reimplement Git.
 
+**Install, update and uninstall GitMesh: [docs/INSTALLATION.md](docs/INSTALLATION.md).**
+
 ```text
 my-project/                      physical repositories         hosting
 ├── .gitmesh/project.toml        (the manifest: the source of truth)
@@ -65,11 +67,14 @@ You need **Git** on your `PATH` (GitMesh runs it) and, to build, **Rust 1.88 or 
 ```console
 $ cd gitmesh               # the source tree
 $ ./build.sh               # builds the release executable
-$ target/release/gitmesh --help
+$ ./install.sh             # installs it for your user account: ~/.local/bin/gitmesh
+$ gitmesh --help           # if ~/.local/bin is not on your PATH, see docs/INSTALLATION.md
 ```
 
 `build.sh` works from any directory, takes no configuration, does not start GitMesh, and prints the
-path of the executable when it finishes. Nothing is installed system-wide.
+path of the executable when it finishes. `install.sh` (optional) copies that executable to a per-user
+directory; it needs no root and does not edit your shell configuration. Nothing is installed
+system-wide.
 
 * **Rust.** If a suitable Rust is already installed (system packages or rustup), `build.sh` uses it.
   If none is installed, it stops and asks before installing. In a script, use
@@ -88,11 +93,10 @@ path of the executable when it finishes. Nothing is installed system-wide.
 
 `cargo build --release --locked` produces the same executable if you prefer to run Cargo yourself.
 
-To make `gitmesh` available on your `PATH` for your user account (optional):
-
-```console
-$ install -m755 target/release/gitmesh ~/.local/bin/gitmesh
-```
+To install GitMesh permanently for your user account, run `./install.sh`. It copies the executable to
+`~/.local/bin/gitmesh` (or another directory with `--bin-dir`), refuses to overwrite files that are not
+GitMesh, and can update or remove it. The guide covers `PATH` setup, updating, backups and uninstalling:
+[docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 GitMesh is a single binary; at runtime it needs only Git.
 
@@ -202,7 +206,7 @@ not change its exit code; a `commit` that cannot proceed because of a conflict e
 
 | Platform | Status |
 | --- | --- |
-| Linux x86_64 (Debian 13 "trixie") | Built and tested: `cargo test --locked` (full suite), the build-script checks, the browser and terminal checks, and `build.sh --install-rust` from an empty home directory. Git 2.47.3, Rust stable 1.99.0 |
+| Linux x86_64 (Debian 13 "trixie") | Built and tested: `cargo test --locked` (full suite), the build-script checks, the installer checks (`tools/install-check.sh`), the browser and terminal checks, and `build.sh --install-rust` from an empty home directory. Git 2.47.3, Rust stable 1.99.0 |
 | Linux aarch64 | Not tested. `build.sh` knows the triple; nothing has been built here |
 | macOS (Apple silicon or Intel) | Not tested. `build.sh` contains the rustup triples and the Xcode hint; nothing has been built here |
 | Other Linux distributions | Not tested. `build.sh` prints the C-compiler package to install for Fedora, Debian/Ubuntu, Arch and openSUSE |
@@ -216,6 +220,7 @@ with stable 1.99.0; 1.88 has not been tested. The minimum Git version has not be
 
 | Document | Read it for |
 | --- | --- |
+| [docs/INSTALLATION.md](docs/INSTALLATION.md) | Installing GitMesh: prerequisites, supported platforms, build, `install.sh`, `PATH`, updating, uninstalling, and troubleshooting |
 | [docs/GUI.md](docs/GUI.md) | The web interface: layout, views, the repository overview, operations and progress, confirmations, conflicts, responsive behaviour, safety, its HTTP routes, and its tests |
 | [docs/TUI.md](docs/TUI.md) | The terminal interface: opening a project, the keys, committing, staging rules, limits |
 | [docs/REPOSITORIES.md](docs/REPOSITORIES.md) | Adding and cloning repositories, connecting remotes, root and child ownership, upstreams, push preflight, unrelated histories, sync errors and their fixes |
