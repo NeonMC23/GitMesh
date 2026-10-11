@@ -9,11 +9,11 @@ exercised on the same project, because both front ends share one service.
 
     cargo build --release && ./tools/repository-workflow.py
 
-Requires python3 (standard library only) and git. The project it creates is left in
-/tmp/gitmesh-repositories-e2e for inspection. Ports 7414 and 7415 are used, so this
+Requires python3 (standard library only) and git. The project it creates is left in a new temporary directory (its path is printed)
+for inspection; an existing directory is never removed. Ports 7414 and 7415 are used, so this
 script never collides with the setup and interface workflows (7411-7413).
 """
-import atexit, hashlib, json, os, shutil, socket, stat, subprocess, sys, time, http.client
+import atexit, hashlib, json, os, shutil, socket, stat, subprocess, sys, tempfile, time, http.client
 from urllib.parse import urlencode
 
 BIN = os.environ.get(
@@ -21,7 +21,8 @@ BIN = os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "target", "release", "gitmesh"),
 )
-WORK = "/tmp/gitmesh-repositories-e2e"
+# A new directory per run: an existing directory is never removed.
+WORK = os.path.realpath(tempfile.mkdtemp(prefix="gitmesh-repositories-e2e-"))
 PORT = 7414
 SPARE_PORT = 7415
 
@@ -208,8 +209,8 @@ if not port_is_free(PORT) or not port_is_free(SPARE_PORT):
     sys.exit(2)
 
 step(0, "Prepare a project: root repository, one existing repository, plain directories")
-force_remove(WORK)
-os.makedirs(WORK)
+os.makedirs(WORK, exist_ok=True)
+print(f"workspace: {WORK}")
 project = os.path.join(WORK, "shop")
 remotes = os.path.join(WORK, "remotes")
 os.makedirs(remotes)

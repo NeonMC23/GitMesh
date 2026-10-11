@@ -9,16 +9,18 @@ the script exits non-zero if any check failed.
     cargo build --release && ./tools/gui-workflow.py
 
 Requires python3 (standard library only), git, and a free TCP port.
-The project it creates is left in /tmp/gui-e2e for inspection.
+The project it creates is left in a new temporary directory (its path is printed) for inspection.
+An existing directory is never removed.
 """
-import json, os, re, shutil, subprocess, sys, time, http.client
+import json, os, re, shutil, subprocess, sys, tempfile, time, http.client
 
 BIN = os.environ.get(
     "GITMESH",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "target", "release", "gitmesh"),
 )
-WORK = "/tmp/gui-e2e"
+# A new directory per run: an existing directory is never removed.
+WORK = os.path.realpath(tempfile.mkdtemp(prefix="gitmesh-gui-e2e-"))
 PORT = 7411
 
 ok_count = 0
@@ -94,8 +96,8 @@ def outcome_of(events, repo_id, phase):
 
 # ----------------------------------------------------------------- environment --
 step(0, "Prepare a three-repository project with local bare remotes")
-shutil.rmtree(WORK, ignore_errors=True)
-os.makedirs(WORK)
+os.makedirs(WORK, exist_ok=True)
+print(f"workspace: {WORK}")
 project = os.path.join(WORK, "shop")
 remotes = os.path.join(WORK, "remotes")
 os.makedirs(remotes)

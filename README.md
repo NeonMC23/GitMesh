@@ -2,23 +2,22 @@
 
 **One logical project. Many physical Git repositories. No new version-control system.**
 
-GitMesh lets you keep working in a single local project directory while the project is
-physically stored in several Git repositories — typically because parts of it are hosted
-separately on GitHub so that teams, permissions and CI pipelines can be scoped to them.
+GitMesh lets you work in one local project directory while the project is stored in several
+Git repositories — usually because parts of it are hosted separately (for example on GitHub)
+so that access, review and CI can be scoped to each part.
 
-You work normally: one directory, one tree, one status, one commit, one pull, one push,
-one branch. Underneath, GitMesh runs real `git` commands in each physical repository and
-reports exactly what happened in each of them.
+You keep working normally: one directory, one status, one commit, one pull, one push. GitMesh
+runs real `git` commands in each physical repository and reports, per repository, what happened.
+It does not reimplement Git.
 
 ```text
-my-project/                     physical repositories      hosting
-├── .gitmesh/project.toml       (the manifest: source of truth)
-├── .git/                       ── root repository      ──▶ github.com/acme/my-project
-├── src/                        │   (project files not assigned elsewhere)
-├── docs/
-├── engine/                     ── engine repository    ──▶ github.com/acme/engine
+my-project/                      physical repositories         hosting
+├── .gitmesh/project.toml        (the manifest: the source of truth)
+├── .git/                        root repository          ──▶ github.com/acme/my-project
+├── src/                         │  (files not owned by a child repository)
+├── engine/                      engine repository        ──▶ github.com/acme/engine
 │   └── .git/
-└── renderer/                   ── renderer repository  ──▶ github.com/acme/renderer
+└── renderer/                    renderer repository      ──▶ github.com/acme/renderer
     └── .git/
 ```
 
@@ -26,10 +25,10 @@ my-project/                     physical repositories      hosting
 $ gitmesh status
 Project 'my-project' at /home/dev/my-project (3 repositories)
 
-REPOSITORY     ROLE      PATH        BRANCH   STATE
-root           root      .           main     main, 1 modified
-engine         external  engine      main     main, clean
-renderer       external  renderer    main     main, 2 modified, 1 untracked
+REPOSITORY  ROLE      PATH      BRANCH  STATE
+root        root      .         main    main, 1 modified
+engine      external  engine    main    main, clean
+renderer    external  renderer  main    main, 2 modified, 1 untracked
 
 $ gitmesh commit -m "add GPU backend"
 gitmesh commit
@@ -41,268 +40,191 @@ renderer     ✓ committed 3 file(s) [91b0d47]
 commit: 2 succeeded, 1 skipped, 0 conflicted, 0 failed
 ```
 
+(Output abridged; the hashes shown are examples.)
+
+## Core concepts
+
+| Concept | Meaning |
+| --- | --- |
+| **Project** | The directory that contains `.gitmesh/project.toml`. Its name and configuration live there. |
+| **Root repository** | The Git repository at the project root, if there is one. It owns every file that no child repository claims. |
+| **Child (external) repository** | A Git repository in its own directory below the root, registered in the manifest with an id and a path. Its files belong to it alone. |
+| **Manifest** | `.gitmesh/project.toml`, written by GitMesh. Repository boundaries come only from the manifest — GitMesh never guesses them from the presence of a `.git` directory. See [docs/MANIFEST.md](docs/MANIFEST.md). |
+| **Ownership** | A path belongs to the repository with the longest matching path. Child content never appears in the root's commits. See [docs/REPOSITORIES.md](docs/REPOSITORIES.md). |
+| **Logical operation** | A command such as `commit`, `pull` or `push` is run in each affected repository, one after another. Each repository gets its own real commit, pull or push. |
+| **Outcome** | Every repository reports `✓` success, `-` skipped, `!` conflict or `✗` failed. A failure in one repository never stops the others, and the result is never reported as success when something failed. |
+
+GitMesh never creates a synthetic global commit, never force-pushes, never resolves conflicts for
+you, and never discards local work. Configuration changes are planned and shown before they run.
+
 ## Quick start
 
-You need **Git** (to run GitMesh) and **Rust 1.88 or newer** with a **C linker** (`cc`) to
-build it. You do not need to know Cargo or Rust's file layout.
+You need **Git** on your `PATH` (GitMesh runs it) and, to build, **Rust 1.88 or newer** with a
+**C linker** (`cc`). You do not need to know Cargo.
 
 ```console
-$ cd gitmesh            # the source tree (cloned or unpacked)
-$ ./build.sh            # builds the release executable
+$ cd gitmesh               # the source tree
+$ ./build.sh               # builds the release executable
 $ target/release/gitmesh --help
 ```
 
-If `./build.sh` reports `Permission denied`, the executable bit was lost (some archives and
-copies drop it). Run `bash build.sh`, or restore it with `chmod +x build.sh`.
+`build.sh` works from any directory, takes no configuration, does not start GitMesh, and prints the
+path of the executable when it finishes. Nothing is installed system-wide.
 
-`build.sh` works from any directory, takes no configuration, and never starts GitMesh. It
-prints the exact path of the executable when it finishes.
+* **Rust.** If a suitable Rust is already installed (system packages or rustup), `build.sh` uses it.
+  If none is installed, it stops and asks before installing. In a script, use
+  `./build.sh --install-rust`. The installer is the official rustup-init, verified against its
+  published SHA-256 checksum; Rust is installed for your user only, and shell start-up files are not
+  edited. A Rust that is installed but too old or broken is reported and never overwritten.
+* **C linker.** If `cc` is missing, `build.sh` stops before any download and prints the command for
+  your system (for example `sudo dnf install gcc` or `sudo apt install build-essential`). It never runs
+  package managers itself.
+* **Network and disk.** The first build downloads crates from crates.io (and rustup from
+  static.rust-lang.org if Rust is installed by `build.sh`). Measured here: the stable Rust toolchain
+  with the minimal profile plus `rustfmt`/`clippy` took about 0.6 GB, the crate cache about 0.1 GB, and
+  the release build about 0.17 GB. Running the full test suite builds a debug copy, about 1.1 GB more.
+* **Permission denied.** If `./build.sh` reports `Permission denied`, the executable bit was lost
+  (some archives and copies drop it). Run `bash build.sh`, or restore it with `chmod +x build.sh`.
 
-**Rust, on the first run**
+`cargo build --release --locked` produces the same executable if you prefer to run Cargo yourself.
 
-* If a suitable Rust is already installed (from your system packages or from rustup),
-  `build.sh` uses it and installs nothing.
-* If no Rust is installed, `build.sh` explains what it will install and asks first. In a
-  script, use `./build.sh --install-rust` to allow it without the prompt. It downloads the
-  official rustup installer, checks it against its published SHA-256 checksum, and installs
-  stable Rust into `~/.cargo` and `~/.rustup`. It needs no administrator rights and does not
-  edit your shell start-up files.
-* If an installed Rust is too old or not working, `build.sh` says why and does not overwrite it.
-* **Network and disk.** The first build needs internet access: crates are downloaded from
-  crates.io (and, if Rust is installed by `build.sh`, the installer from static.rust-lang.org).
-  Plan for about 1 GB of free disk space for Rust and the first build; the finished
-  executable is a few megabytes.
-
-**C linker.** Rust links programs with `cc`. If it is missing, `build.sh` stops before any
-download and prints the command for your system, for example `sudo dnf install gcc` (Fedora,
-Nobara), `sudo apt install build-essential` (Debian, Ubuntu), `sudo pacman -S base-devel`
-(Arch) or `xcode-select --install` (macOS). `build.sh` never runs these itself.
-
-**Platforms.** GitMesh has no native library dependencies (every crate is pure Rust), so the only system
-requirement to build is the C linker. `build.sh` needs bash. It is written for Linux and macOS; Windows is not
-supported by `build.sh`.
-
-| Platform | Status |
-|---|---|
-| Linux x86_64 (Debian 13) | built and tested: `cargo test`, the build-script checks, and a first run from an empty home |
-| Fedora, Nobara, Ubuntu, Arch | not tested here; the matching C-compiler package is listed above |
-| Linux aarch64, macOS (Apple silicon or Intel) | not tested here |
-| Windows | not supported by `build.sh` (WSL is untested) |
-
-`cargo build --release` produces the same executable if you prefer to run Cargo yourself.
-
-## Why GitMesh exists
-
-Splitting a project into several GitHub repositories is often required by *hosting*
-concerns — access control, review workflows, release cycles, CI. But development is not
-split: the developer changes several parts at once, and suddenly every task means
-repeating `git status`, `git add`, `git commit`, `git pull` and `git push` in five
-directories, plus remembering which branch each of them is on.
-
-Existing solutions do not fit that need:
-
-| Approach | Why it is not the answer here |
-| --- | --- |
-| Git submodules | The outer repository pins an exact commit; a change in a part is a two-step commit in two repositories, and submodules are a well-known source of confusion. |
-| Monorepo tooling | Assumes the opposite direction: one repository, many projects. |
-| Git subtree | Copies history into one repository, so the hosted repositories stop being independent. |
-| Custom VCS | Reinvents Git, losing Git's ecosystem, hosting and tooling. |
-
-GitMesh takes the opposite approach: keep real, independent Git repositories, and add a
-thin orchestration layer that makes them behave like one project for everyday work.
-
-## Core principles
-
-1. GitMesh represents **one logical project**.
-2. The user works from **one local project root**.
-3. Users should not need to think about physical repository boundaries during normal work.
-4. Physical repositories exist for hosting, collaboration and scale.
-5. **Git remains the version-control engine.**
-6. GitMesh does **not** reimplement Git: it drives the `git` CLI.
-7. Repository boundaries are **explicitly configured** by the user, never guessed.
-8. GitMesh generates and maintains the TOML manifest.
-9. Every logical operation is translated into physical repository operations.
-10. Only the repositories actually affected by an operation are modified.
-11. Commit stages the relevant changes automatically.
-12. Push is automatic across repositories.
-13. Pull operates across repositories and reports conflicts instead of hiding them.
-14. Branches behave as one logical branch.
-15. A failure in one repository does not prevent independent repositories from finishing.
-16. Every result distinguishes success, failure, skipped and conflict.
-17. No user data or local modification is silently discarded.
-18. GitHub is optional; the local core never requires it.
-19. The implementation stays lightweight and maintainable.
-20. The architecture stays extensible without becoming a Git replacement.
-
-## Installing for your user account (optional)
-
-Building does not install GitMesh anywhere. To make the executable available as `gitmesh`
-for your user account, copy it to a directory on your `PATH` (for example `~/.local/bin`):
+To make `gitmesh` available on your `PATH` for your user account (optional):
 
 ```console
 $ install -m755 target/release/gitmesh ~/.local/bin/gitmesh
 ```
 
-GitMesh is a single binary. At runtime it needs Git on `PATH`.
+GitMesh is a single binary; at runtime it needs only Git.
 
-## Getting started
+## Your first project
 
 ```console
-# 0. Create the project from an ordinary folder (or use the graphical wizard below)
-$ gitmesh init . --name my-project
-#    ...or, with a remote: recorded in the manifest, and configured in Git when asked
-$ gitmesh init . --name my-project --remote git@github.com:acme/my-project.git --add-git-remote
-
-# 1. In an existing project directory
 $ cd my-project
-$ gitmesh init --name my-project
-$ gitmesh discover                     # which directories are Git repositories?
-
-# 2. Mark the directories that are separate repositories
+$ gitmesh init --name my-project --git-init  # creates .gitmesh/project.toml and the root repository
+$ gitmesh discover                            # which directories are Git repositories?
 $ gitmesh configure add engine --remote git@github.com:acme/engine.git
 $ gitmesh configure add renderer --git-init --remote git@github.com:acme/renderer.git
 $ gitmesh configure list
 
-# 3. Work normally — and keep the layout alive while you develop
-$ mkdir new-module                          # an ordinary directory appears
-$ gitmesh configure add new-module --git-init --untrack-from-root --dry-run
-$ gitmesh configure add new-module --git-init --untrack-from-root
-$ gitmesh status --changes
+$ gitmesh status --changes                    # every change, with its owning repository
 $ gitmesh commit -m "implement the new backend"
 $ gitmesh pull
 $ gitmesh push
 ```
 
-Every configuration change is planned before it is made: `--dry-run` prints exactly the
-changes and the steps that would run, and nothing is written. `--untrack-from-root` stops
-the root repository from tracking the files that now belong to the new repository (the
-files stay on disk — nothing is ever deleted or moved).
+Two things to know:
 
-Prefer an interface? GitMesh ships two, and both drive the same core as the CLI:
+* **`gitmesh init` creates a Git repository only with `--git-init`.** Add `--remote URL --add-git-remote`
+  to also configure `origin` there. Without `--git-init`, `init` writes the manifest but then exits 1
+  with "Project setup completed with errors", because the root is not yet a repository. The manifest
+  is still on disk, so run `git init` in the root (or re-run with `--git-init`); this is a known issue
+  and is reported in the final audit.
+* **Commit the manifest.** The first `gitmesh commit` in the root includes `.gitmesh/project.toml`,
+  because the manifest describes the project as a whole.
 
-```console
-$ gitmesh gui                    # graphical interface in your browser (local only)
-$ gitmesh ui                     # full-screen terminal interface (alias: tui)
-$ gitmesh ui ~/work/demo         # ...for a project elsewhere (or: gitmesh -C ~/work/demo ui)
-```
-
-The graphical interface shows the project as **one** project — one tree, one status, one
-changes list, one commit message, one branch, one pull, one push — while GitMesh keeps
-managing the physical repositories underneath. It starts a small local server
-(`http://127.0.0.1:7345` by default) and calls nothing outside your machine: no account,
-no telemetry, no CDN.
-
-It also **creates** a project: point it at an ordinary folder, let it scan the structure,
-tick the directories that should be separate repositories, configure their names and
-optional remotes, review the complete plan *and* the exact `.gitmesh/project.toml` it will
-write, confirm it, and watch the setup run step by step — then keep working in the same
-interface, with an optional first commit and push through the ordinary GitMesh operations.
-Nothing is created before you confirm, an existing repository or manifest is never
-replaced silently, and remotes are optional: a fully local project is a first-class
-project. See [docs/GUI.md](docs/GUI.md).
-
-The same interface **manages** the project afterwards, in the *Repositories* tab: check a
-directory, review the complete plan (including the exact `.gitmesh/project.toml` it would
-write), confirm it, watch the steps run, and read the evidence for every change. A new
-directory can be turned into a managed repository while the project is open; an existing
-Git repository is *adopted* with its history and remote left exactly as they are; a
-repository's logical id or recorded remote can be changed; and a repository can be
-**removed from GitMesh without its directory, its `.git`, its history or its remote being
-touched** — a removal that hands files back to the root repository says so and asks for
-confirmation first. Repository management is done with `gitmesh configure` on the command
-line or in the graphical interface — both drive one service and one plan. The terminal
-interface (`gitmesh ui`) is deliberately limited to the everyday workflow.
-
-To see the whole workflow run end to end against real repositories and local bare remotes
-(including a genuine cross-repository conflict), use the demo script:
+Every configuration change is planned first: `--dry-run` prints the exact changes and steps, and
+nothing is written. `--untrack-from-root` stops the root repository from tracking files that now belong
+to a child; the files stay on disk, and nothing is deleted or moved. To see the workflow end to end on
+real repositories and local bare remotes, including a real cross-repository conflict:
 
 ```console
-$ ./examples/demo.sh /tmp/gitmesh-demo
+$ ./examples/demo.sh /tmp/gitmesh-demo      # creates everything under the directory you give
 ```
+
+## The three interfaces
+
+GitMesh has one core and three front ends. All of them call the same services, so the same project
+gives the same results in each. Use whichever suits the task.
+
+| | Command line (`gitmesh <command>`) | Terminal (`gitmesh ui`, alias `tui`) | Web (`gitmesh gui`) |
+| --- | --- | --- | --- |
+| **For** | scripts, CI, everything | the everyday loop in a terminal | the whole project in a browser |
+| **Covers** | every command below | status, stage all, commit (staged files only), pull, push, dry run | overview, changes and commit, branches, sync, repository management, project creation (setup wizard), history checks |
+| **Repository management** (add, remove, rename, remotes, clone) | yes, `gitmesh configure …` | no | yes, *Repositories* tab and the setup wizard |
+| **Needs** | a terminal | an interactive terminal, at least 56×14 | a browser, on the same machine |
+| **Machine output** | `--json` | no | no |
+| **Documentation** | this page, and the command help | [docs/TUI.md](docs/TUI.md) | [docs/GUI.md](docs/GUI.md) |
+
+The web interface listens only on `127.0.0.1` by default and has no authentication. Its safety rules,
+confirmation steps and layout are described in [docs/GUI.md](docs/GUI.md).
 
 ## Command reference
 
 | Command | What it does |
 | --- | --- |
-| `gitmesh init [path] [--name N] [--remote URL] [--add-git-remote] [--git-init] [--branch B] [--force]` | Create the manifest for a project (does not touch your files). `--remote` only *records* the URL; `--add-git-remote` also points `origin` at it, and is what allows replacing an existing one |
-| `gitmesh discover [--depth N] [--hidden] [--deep]` | Scan the tree, list the Git repositories in it |
-| `gitmesh configure add <dir> [--id I] [--remote URL] [--git-init] [--branch B] [--untrack-from-root] [--dry-run]` | Make a directory an independent repository (planned first; `--untrack-from-root` stops the root repository from tracking its files) |
-| `gitmesh configure remove <id> [--confirm-takeover] [--dry-run]` | Remove a repository from the configuration: its directory, `.git`, history and remote are kept. `--confirm-takeover` confirms that files tracked by the root repository go back to it |
-| `gitmesh configure rename <id> <new>` / `remote <id> --url U [--set-git-remote] [--clear]` | Change the logical identity, or record / configure / clear a remote |
-| `gitmesh configure list` | List configured repositories |
-| `gitmesh status [--changes] [--short] [--json]` | Unified project status with change ownership |
-| `gitmesh commit -m MSG [--repo ID] [--path PATH] [--dry-run]` | Stage and commit in every affected repository |
-| `gitmesh branch [create NAME \| delete NAME]` | Show or change the logical branch |
-| `gitmesh checkout NAME [--create]` | Switch every repository to a branch |
-| `gitmesh merge NAME` | Merge a branch (Git's own merge) in every repository |
-| `gitmesh fetch` / `gitmesh pull [--strategy ff-only\|merge\|rebase]` | Synchronise the project |
-| `gitmesh push [--dry-run] [--no-set-upstream]` | Push every repository that has commits to push |
-| `gitmesh remotes` | Remotes per repository, provider and GitHub coordinates |
-| `gitmesh configure clone <dir> --remote <url>` | Clone a remote into a new (missing or empty) directory and record it |
-| `gitmesh ui` | Interactive terminal interface for the everyday workflow: stage, commit, pull, push (see [docs/TUI.md](docs/TUI.md)) |
-| `gitmesh gui [--port N] [--host A] [--allow-host NAME] [--open] [--dry-run]` | Graphical interface served locally in a browser |
+| `gitmesh init [PATH] [--name N] [--remote URL] [--add-git-remote] [--git-init] [--branch B] [--force]` | Create the manifest for a project. Records `--remote`; `--add-git-remote` also configures `origin`. `--force` replaces an existing manifest. |
+| `gitmesh discover [--depth N] [--hidden] [--deep]` | List the Git repositories found in the tree. Reports facts; changes nothing. |
+| `gitmesh configure add <dir> [--id I] [--remote URL] [--git-init] [--branch B] [--untrack-from-root] [--dry-run]` | Make a directory an independent repository. |
+| `gitmesh configure clone <dir> --remote URL [--id I] [--branch B] [--dry-run]` | Clone a remote into a missing or empty directory and record it. |
+| `gitmesh configure remove <id> [--confirm-takeover] [--dry-run]` | Remove a repository from the configuration. Its directory, `.git`, history and remote are kept. |
+| `gitmesh configure rename <id> <new-id> [--dry-run]` | Change the logical id only. |
+| `gitmesh configure remote <id> [--url URL \| --clear] [--set-git-remote] [--dry-run]` | Record, change or clear a repository's remote. `--set-git-remote` also configures it in Git. |
+| `gitmesh configure list` | List configured repositories. |
+| `gitmesh status [--changes] [--short] [--json]` | Unified status and change ownership. |
+| `gitmesh commit -m MSG [--repo ID] [--path PATH] [--dry-run]` | Stage and commit each affected repository with one message. |
+| `gitmesh branch [create NAME \| delete NAME] [--dry-run]` | Show the logical branch, or create or delete it in every repository. |
+| `gitmesh checkout NAME [--create] [--dry-run]` | Switch every repository to a branch. |
+| `gitmesh merge NAME [--dry-run]` | Merge a branch into the current one, in every repository (Git's own merge). |
+| `gitmesh fetch [--repo ID] [--dry-run]` | Fetch every repository. Never changes branches or files. |
+| `gitmesh pull [--strategy ff-only\|merge\|rebase] [--repo ID] [--dry-run]` | Fetch and update. Defaults to fast-forward only. |
+| `gitmesh push [--repo ID] [--no-set-upstream] [--dry-run]` | Push every repository that has commits to push. |
+| `gitmesh remotes` | Remotes per repository, with provider and GitHub coordinates. |
+| `gitmesh ui [PATH] [--dry-run]` (alias `tui`) | Open the terminal interface. See [docs/TUI.md](docs/TUI.md). |
+| `gitmesh gui [PATH] [--port N] [--host A] [--allow-host NAME] [--open] [--dry-run]` | Serve the web interface locally. See [docs/GUI.md](docs/GUI.md). |
 
-Global flags: `-C <path>` (project directory), `--json` (machine-readable output),
-`-v/--verbose` (include Git output and details).
+Global options: `-C <path>` (or `--project <path>`) selects the project directory; `--json` prints
+machine-readable output; `-v` / `--verbose` includes Git's own output. The project is the one at or
+above the directory you run the command in, so commands work from any subdirectory.
 
-Exit codes: `0` everything succeeded, `1` an operation had failures or conflicts (or a
-repository of an inspection command is unavailable), `2` usage or configuration error.
-Inspection commands (`status`, `branch`, `remotes`, `discover`) report conflicts and
-problems in their output but exit `0` as long as the project itself could be read.
+**Exit codes.** `0` the operation succeeded everywhere. `1` the operation failed or was partly
+successful, or a configured repository is unavailable (for example its directory is missing; `status`
+reports this and exits `1`). `2` usage or configuration error. A conflict reported by `status` does
+not change its exit code; a `commit` that cannot proceed because of a conflict exits `1`.
 
-## What GitMesh guarantees
+## Safety
 
-* **Nothing is discarded.** GitMesh only runs Git commands that Git itself refuses to run
-  destructively: `checkout` that would overwrite local work is refused, `pull` defaults
-  to `--ff-only`, branch deletion defaults to `git branch -d`, conflicts are reported and
-  left in place, never resolved behind your back.
-* **Nothing is guessed.** Repository boundaries come from the manifest. Discovery reports
-  facts and asks; it never moves, copies or deletes files, and it never decides on its own
-  that a directory should become a repository.
-* **Nothing is faked.** Every physical repository keeps its own real history. There is no
-  synthetic global commit and no shadow repository.
-* **Nothing is hidden.** A failing repository does not stop the others, and the result
-  always lists success, skipped, conflict and failure per repository.
+* **Nothing is discarded.** GitMesh runs only Git commands that refuse to destroy work. `pull` defaults
+  to `--ff-only`, branch deletion uses `git branch -d`, a checkout that would overwrite local work is
+  refused, and conflicts are left in place for you to resolve in the repository.
+* **Nothing is guessed.** Repository boundaries come from the manifest. Discovery reports facts and
+  never decides on its own that a directory is a repository.
+* **Nothing is silently changed.** Configuration changes are planned, reviewed and confirmed before they
+  run. An existing `.git`, remote or manifest is never replaced without explicit intent. Removing a
+  repository never deletes files.
+* **Child content stays out of the root.** Root staging excludes every configured child directory, so a
+  root commit never contains child files and never records a child as a gitlink. Plain Git can still do
+  this if you run `git add -A` in the root yourself. Use `gitmesh commit` (see
+  [docs/REPOSITORIES.md](docs/REPOSITORIES.md)).
+* **Nothing is hidden.** A failing repository does not stop the others, and every result lists the
+  outcome per repository with Git's own message.
+
+## Platforms and support
+
+| Platform | Status |
+| --- | --- |
+| Linux x86_64 (Debian 13 "trixie") | Built and tested: `cargo test --locked` (full suite), the build-script checks, the browser and terminal checks, and `build.sh --install-rust` from an empty home directory. Git 2.47.3, Rust stable 1.99.0 |
+| Linux aarch64 | Not tested. `build.sh` knows the triple; nothing has been built here |
+| macOS (Apple silicon or Intel) | Not tested. `build.sh` contains the rustup triples and the Xcode hint; nothing has been built here |
+| Other Linux distributions | Not tested. `build.sh` prints the C-compiler package to install for Fedora, Debian/Ubuntu, Arch and openSUSE |
+| Windows | Not supported (`build.sh` needs bash; WSL has not been tested) |
+
+The declared minimum Rust is **1.88** (`rust-version` in `Cargo.toml`). The project was built and tested
+with stable 1.99.0; 1.88 has not been tested. The minimum Git version has not been established. Git
+2.47.3 is the only version tested.
 
 ## Documentation
 
-| Document | Contents |
+| Document | Read it for |
 | --- | --- |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layering, module boundaries, ownership model, safety invariants, design decisions |
-| [`docs/MANIFEST.md`](docs/MANIFEST.md) | The exact manifest format, semantics and validation rules |
-| [`docs/REPOSITORIES.md`](docs/REPOSITORIES.md) | Onboarding a directory, cloning a remote, connecting remotes and upstreams, and what the sync errors mean |
-| [`docs/GUI.md`](docs/GUI.md) | The graphical interface: running it, the views, commit/branch/pull/push semantics, conflict presentation, safety, what is not supported |
-| [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Build, test, lint, extend; test strategy; UI architecture |
-| [`reports/DEVELOPMENT_REPORT.md`](reports/DEVELOPMENT_REPORT.md) | What was built, milestone by milestone, and why |
-| [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md) | Hardening audit, limitations, technical debt, readiness assessment |
-| [`reports/GUI_REPORT.md`](reports/GUI_REPORT.md) | The graphical interface: audit, architecture, technology choice, tests, manual end-to-end validation, readiness |
-| [`reports/REPOSITORY_REPORT.md`](reports/REPOSITORY_REPORT.md) | Managing repositories after creation: audit findings, the reuse of the plan-driven architecture, the management service, safety decisions, tests, end-to-end validation, limitations |
-| [`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md) | Integrated project creation and repository setup: audit findings, the plan-driven setup service, the wizard, first publish, tests, end-to-end validation, limitations |
-
-## Status
-
-GitMesh implements the complete local multi-repository workflow — project creation,
-discovery, configuration, status/ownership, commit, branch/checkout/merge,
-fetch/pull/push — with a command line, a minimal full-screen terminal interface and a local
-graphical interface, over a GitHub-aware (but GitHub-independent) provider foundation.
-Creating a project from an ordinary folder is part of the flow now: `gitmesh init` and the
-graphical wizard are two front ends of the same plan-driven setup service, which previews
-every change, writes the manifest, and can hand over to a first commit and push.
-
-The project's repository layout is no longer fixed at creation time. `gitmesh configure`
-and the GUI's *Repositories* tab manage it afterwards through one plan-driven service
-(`src/manage.rs`): a directory becomes a repository (initialised or adopted), a remote is
-recorded, configured or replaced only when that is explicitly asked for, a logical id is
-renamed without touching a directory, and a repository leaves the configuration while its
-directory, `.git`, history and remote stay exactly where they are. Everything is
-inspected, planned, reviewed and confirmed before it runs, and every applied change is
-proven afterwards by evidence and a validation of the reopened project.
-
-It is usable by a small team on a real multi-repository project today, with the
-limitations listed in [`reports/FINAL_REPORT.md`](reports/FINAL_REPORT.md),
-[`reports/SETUP_REPORT.md`](reports/SETUP_REPORT.md) and
-[`reports/REPOSITORY_REPORT.md`](reports/REPOSITORY_REPORT.md).
+| [docs/GUI.md](docs/GUI.md) | The web interface: layout, views, the repository overview, operations and progress, confirmations, conflicts, responsive behaviour, safety, its HTTP routes, and its tests |
+| [docs/TUI.md](docs/TUI.md) | The terminal interface: opening a project, the keys, committing, staging rules, limits |
+| [docs/REPOSITORIES.md](docs/REPOSITORIES.md) | Adding and cloning repositories, connecting remotes, root and child ownership, upstreams, push preflight, unrelated histories, sync errors and their fixes |
+| [docs/MANIFEST.md](docs/MANIFEST.md) | The `.gitmesh/project.toml` format, validation rules and semantics |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layering, module boundaries, the safety invariants, design decisions |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, the test suites and what they need, validation scripts, adding commands, troubleshooting |
+| [reports/README.md](reports/README.md) | The dated development reports, and the status of each |
 
 ## Licence
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0 (as declared in `Cargo.toml`). The repository does not currently contain separate
+licence files.

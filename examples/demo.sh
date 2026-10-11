@@ -103,7 +103,8 @@ git -C renderer status --short || true
 step "10. Resolve it (plain Git in one repository) and finish the logical operation"
 printf '// merged\n' > renderer/src/index.js
 git -C renderer add -A
-run "$GITMESH" commit -m "resolve the renderer conflict"
+# Git concludes its own merge: GitMesh never completes an unfinished merge in a repository.
+git -C renderer commit -q --no-edit
 run "$GITMESH" push
 run "$GITMESH" status
 

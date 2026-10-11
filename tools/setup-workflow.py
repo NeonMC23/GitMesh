@@ -10,9 +10,10 @@ that is now already configured.
     cargo build --release && ./tools/setup-workflow.py
 
 Requires python3 (standard library only), git and a free TCP port. The project it
-builds is left in /tmp/gitmesh-setup-e2e for inspection.
+builds is left in a new temporary directory (its path is printed) for inspection;
+an existing directory is never removed.
 """
-import atexit, json, os, shutil, subprocess, sys, time, http.client
+import atexit, json, os, shutil, subprocess, sys, tempfile, time, http.client
 from urllib.parse import quote
 
 BIN = os.environ.get(
@@ -20,7 +21,8 @@ BIN = os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "target", "release", "gitmesh"),
 )
-WORK = "/tmp/gitmesh-setup-e2e"
+# A new directory per run: an existing directory is never removed.
+WORK = os.path.realpath(tempfile.mkdtemp(prefix="gitmesh-setup-e2e-"))
 PROJECT = os.path.join(WORK, "MyProject")
 REMOTES = os.path.join(WORK, "remotes")
 OUTSIDE = os.path.join(WORK, "Untouched")
@@ -185,7 +187,7 @@ for port in (PORT, SECOND_PORT):
         print(f"port {port} is already in use: stop whatever holds it (a leftover "
               f"`gitmesh gui` is the usual reason)")
         sys.exit(2)
-shutil.rmtree(WORK, ignore_errors=True)
+print(f"workspace: {WORK}")
 os.makedirs(REMOTES)
 os.makedirs(OUTSIDE)
 write(os.path.join(PROJECT, "src/main.rs"), "fn main() {}\n")
