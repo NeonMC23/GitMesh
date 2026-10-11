@@ -95,6 +95,9 @@ if [ "$mode" = uninstall ]; then
     echo "nothing to remove: $dest does not exist"
     exit 0
   fi
+  if [ -L "$dest" ]; then
+    die "$dest is a symbolic link, so it was NOT removed"
+  fi
   if ! is_gitmesh_exe "$dest"; then
     die "$dest is not a GitMesh executable, so it was NOT removed"
   fi
@@ -124,7 +127,12 @@ src="$target_dir/release/gitmesh"
 is_gitmesh_exe "$src" || die "$src is not a GitMesh executable; run ./build.sh again"
 
 # ---- check the destination before changing anything ----
-if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+# A symbolic link is never followed, replaced or treated as GitMesh, not even with --force:
+# `mv` onto a link to a directory would move the new file into that directory.
+if [ -L "$dest" ]; then
+  die "$dest is a symbolic link, so it was NOT changed. Remove the link yourself, or choose another --bin-dir."
+fi
+if [ -d "$dest" ]; then
   die "$dest is a directory; choose another --bin-dir"
 fi
 replacing=""
@@ -141,7 +149,7 @@ fi
 
 # ---- create the directory (never with sudo) ----
 if [ ! -d "$bin_dir" ]; then
-  mkdir -p -- "$bin_dir" 2>/dev/null || die "cannot create $bin_dir (permission denied or invalid path); choose another --bin-dir. This installer never uses sudo."
+  mkdir -p -- "$bin_dir" || die "cannot create $bin_dir; choose another --bin-dir. This installer never uses sudo."
 fi
 [ -w "$bin_dir" ] || die "$bin_dir is not writable by your user account; choose another --bin-dir. This installer never uses sudo."
 

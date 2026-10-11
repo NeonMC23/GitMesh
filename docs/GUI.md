@@ -13,6 +13,9 @@ gitmesh gui
   (GitMesh runs locally: no cloud service, no telemetry, no account.)
 ```
 
+The address shows the port GitMesh chose. With `--port 0` GitMesh picks a free port and prints it. Lines
+for `mode`, `warning` (non-local `--host`) and `note` appear only when they apply.
+
 `gitmesh gui` starts a small web server **on your machine** and serves one page. Open the
 address it prints in any browser; there is nothing to install, no account, and nothing is
 fetched from the internet. Stop it with `Ctrl+C`.
@@ -46,26 +49,22 @@ stylesheet and its script are compiled into the `gitmesh` binary.
 The interface presents the whole project:
 
 ```text
-MyProject                          branch  main        modified
-/home/dev/MyProject · 4 repositories · 5 changes
-
-  MyProject                    [root]
-    src/               3 files
-    engine/           1 file     [repo]
-    renderer/         2 files    [repo]
-    tools/            1 file     [repo]
+shop/                  the project root (owned by the root repository)
+├── src/               root repository
+├── engine/            repository "engine"
+└── renderer/          repository "renderer"
 ```
 
 * **Overview** — the header shows the project name, its root, its state and its branch. One
-  sentence says what to do next (for example *5 changed files not committed yet* with a
-  button that opens Changes). Below it, one line per repository shows its name, branch, state
+  sentence says what to do next (for example "N changed files not committed yet. Review them,
+  write a message, then commit.", with a button that opens Changes). Below it, one line per repository shows its name, branch, state
   and number of changes. A line opens on click to its path, remote, sync position and any
   problem; nothing else is shown until asked for.
 * **Changes** — one list of changed files with their *logical* path (`engine/src/lib.rs`),
   their change type, and the physical repository that owns them. Optional grouping by
   repository makes the mapping explicit without making it the default. The **Commit** card
   sits directly below the list it commits: the repositories that will receive a commit, the
-  ones that cannot (with the reason), one message box, one button.
+  ones that cannot (with the reason), one message box, one **Commit** button.
 * **Branches** — the logical branch, every branch across the project (which repositories
   have it, which have it checked out), and create / switch / merge / delete actions.
 * **Sync** — the pull strategy selector plus fetch, pull and push, with the
@@ -93,26 +92,22 @@ screen; opening another project is a single action and does not require restarti
 ## Creating a project (the setup wizard)
 
 Starting from an ordinary folder — no manifest and no repositories, or some of each — the
-interface can build the GitMesh project for you. Press **New project** (or **Create a
-GitMesh project here** on the welcome screen) and walk the twelve steps:
+interface can build the GitMesh project for you. When no project is open, the welcome screen offers
+**Set up a project in this directory…**. The wizard has twelve numbered steps, shown in this order:
 
 ```text
-1  choose the project root            any local directory, absolute path
-2  scan the structure                 facts only: sub-directories, files, existing .git
-3  select repository boundaries       one checkbox per directory; nested or overlapping
-                                      selections are refused, with the reason
-4  name the root repository           name, branch, optional remote, optional provider
-5  configure each selected directory  id, "create a Git repository here if there is
-                                      none", remote, and "stop tracking it in the root"
-6  see what already exists            existing repositories are adopted, explained, and
-                                      never re-initialised
-7  review the remotes                 local paths, existing remotes, or a GitHub target
-8  the manifest                       `.gitmesh/project.toml` is generated from the
-                                      answers; an existing one is kept unless you confirm
-9  review the plan                    every step, every refusal, the exact manifest text
-10 confirm                            the plan id you reviewed is what will run
-11 execute                            live per-step progress
-12 result                             validation, and the project opens with no restart
+ 1  Project root                          the directory that becomes the project
+ 2  Structure                             the scan: sub-directories, files, existing .git
+ 3  Root repository                       name, branch and optional remote of the root
+ 4  Repositories inside the project       one choice per directory; overlaps are refused
+ 5  Repositories that already exist       existing repositories are adopted, never re-initialised
+ 6  Remotes                               local paths, existing remotes, or a remote you give
+ 7  Hosting (optional)                    a GitHub target: GitMesh prints the command, never runs it
+ 8  Manifest                              `.gitmesh/project.toml`, generated from your answers
+ 9  Review and dry run                    every step, every refusal, the exact manifest text
+10  Confirm                               the reviewed plan is what will run
+11  Apply                                 live per-step progress
+12  Result                                validation; the project opens without a restart
 ```
 
 What the wizard is:
@@ -168,8 +163,9 @@ received a remote here. Concretely:
 * Resolving conflicts: normal Git tooling, as everywhere else in GitMesh.
 * Creating the hosted repository for a repository you add later: the same rule as in the
   wizard — GitMesh records the URL, and the repository itself is created on the provider.
-* Editing the configuration afterwards works in three places and means the same thing in
-  all of them: the **Repositories** tab (below), `gitmesh configure`, and `gitmesh ui`.
+* Editing the configuration afterwards works in two places and means the same thing in both: the
+  **Repositories** tab (below) and `gitmesh configure`. The terminal interface does not edit the
+  configuration.
 
 ## Managing repositories after creation
 
@@ -255,7 +251,7 @@ every 15 seconds while it is visible and no operation is running.
 
 ## How the unified commit works
 
-Pressing *Commit the project* (in the Changes view) records every change listed there:
+Pressing **Commit** (the Commit card under the Changes list) records every change listed there:
 
 1. analyses every repository,
 2. stages the changes of each affected repository (never the files of another
@@ -273,10 +269,11 @@ are before you press the button.
 
 ## How branch operations work
 
-A branch is a project branch: *Create & switch* creates it in every repository (or
-switches where it already exists), *Switch* moves every repository onto an existing
-branch, *Merge* merges into the current branch in each repository, and *Delete* removes
-it from the repositories that can delete it safely.
+A branch is a project branch: **Create and switch** creates it in every repository (or
+switches where it already exists), **Create only** creates it without switching, **Switch**
+moves every repository onto an existing branch, **Merge into current** merges into the
+current branch in each repository, and **Delete branch…** removes it from the repositories
+that can delete it safely.
 
 Repositories that cannot follow are reported explicitly — the interface never pretends
 the project is on one branch when it is not. If the physical repositories are already on
@@ -399,7 +396,8 @@ The page talks only to the server it was served from.
 * **Nothing is discarded.** The interface offers exactly the operations the CLI offers,
   with the same safety rules: no forced checkout, no destructive reset, conflicts left in
   place, local work never overwritten.
-* **Dry-run** simulates every operation and is visible in the status bar.
+* **Dry-run** simulates every operation. It is shown as a *dry run* badge in the header, and the
+  badge or the `D` key turns it off.
 * **No silent configuration changes.** The GUI can change the project's configuration,
   but never silently: a change is planned first, the plan shows every change, every step
   and the exact manifest it would write, and it runs only after it is confirmed. A plan
@@ -455,10 +453,10 @@ still there afterwards), refuses a removal that would hand files back to the roo
 is confirmed, breaks one repository on purpose to check the partial result and the message
 that goes with it, and finally checks that the command line sees exactly the same project —
 from the project root, from a nested directory and from nowhere at all. It leaves the
-project in `/tmp/gitmesh-repositories-e2e` for inspection.
+project in a new temporary directory, whose path it prints, for inspection.
 
-`tools/setup-workflow.py` starts from an ordinary directory (`/tmp/gitmesh-setup-e2e`,
-which it leaves behind for inspection), scans it, reviews a plan that creates two
+`tools/setup-workflow.py` starts from an ordinary directory (in a new temporary directory, whose path
+it prints and leaves for inspection), scans it, reviews a plan that creates two
 repositories, adopts one that already exists and keeps a fourth local-only, executes it,
 and then checks the result on disk: real `.git` directories, the generated manifest, the
 configured remotes, the first publish, a real push, a deliberately broken remote (partial
@@ -482,4 +480,4 @@ See [REPOSITORIES.md](REPOSITORIES.md) for the rules and the sync error messages
 
 ## Repository history checks
 
-Project setup and "Add repository" show a **Repository history** step when a remote is connected. Its role is "History". The step is planned by the Rust core and only displayed here: an empty repository adopting its remote's history, a remote that cannot be read (a warning), or an unrelated history (the plan is blocked, and the review shows the blocker and the recovery options from [REPOSITORIES.md](REPOSITORIES.md)). A push that the preflight refuses shows the refusal and its guidance in the repository's result; the GUI never offers a force-push.
+Project setup and "Add repository" show a **Repository history** step when a remote is connected. The step is planned by the Rust core and only displayed here: an empty repository adopting its remote's history, a remote that cannot be read (a warning), or an unrelated history (the plan is blocked, and the review shows the blocker and the recovery options from [REPOSITORIES.md](REPOSITORIES.md)). A push that the preflight refuses shows the refusal and its guidance in the repository's result; the GUI never offers a force-push.

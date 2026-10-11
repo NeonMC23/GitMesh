@@ -16,6 +16,7 @@ test GitMesh today, use the current guides: [README](../README.md),
 | [UX_REDESIGN_AUDIT.md](UX_REDESIGN_AUDIT.md) | The audit that preceded the GUI and terminal interface redesign, written before any implementation change | Audit. **Not committed** (untracked) |
 | [UX_REDESIGN_REPORT.md](UX_REDESIGN_REPORT.md) | The implementation report for the redesign (web and terminal interfaces) | Implemented and verified in the working tree at the time; **not committed** (untracked) |
 | [LIFECYCLE_REPORT.md](LIFECYCLE_REPORT.md) | Repository lifecycle: clone recovery, remote history, upstream diagnostics, and the documentation pass | Implemented in the working tree; **not committed** (untracked). Records what was and was not verified |
+| [INSTALLATION_REPORT.md](INSTALLATION_REPORT.md) | The per-user installation workflow (`install.sh`, its checks, `docs/INSTALLATION.md`), with the validation commands and results | Implemented and validated in the working tree at the time; **not committed** (untracked) |
 
 Two rules apply when reading these records:
 

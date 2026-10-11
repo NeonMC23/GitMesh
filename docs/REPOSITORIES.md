@@ -82,7 +82,7 @@ offers it:
 - **CLI**: the refusal prints the command to run, for example:
 
 ```sh
-gitmesh configure clone RAMforge --remote /srv/git/ramforge.git --id RAMforge -C /path/to/project
+gitmesh configure clone engine --remote /srv/git/engine.git --id engine -C /path/to/project
 ```
 
 The offer is made only when the clone would itself be accepted. The offer is planned with the
@@ -102,7 +102,7 @@ GitMesh has one **project root** and any number of **child repositories** inside
   directory. The **root repository** is the Git repository at the project root, when there is
   one. It is always listed first in the manifest with the id `root` and the path `.`.
 - **Child repository**: a Git repository in its own directory below the root (for example
-  `RAMforge/`), listed in the manifest with its own id and path. Its `.git` directory is its
+  `engine/`), listed in the manifest with its own id and path. Its `.git` directory is its
   own, and its sources exist only in its directory.
 - **Manifest**: `.gitmesh/project.toml`, at the project root. It is the only place GitMesh
   records the repositories. The root repository tracks it like any other file of the root.
@@ -193,8 +193,8 @@ when a check fails, and the reason is given in the summary and the details:
 | --- | --- | --- |
 | The remote cannot be read (URL, network, authentication, permission) | Refused, with the Git error and hints for each cause | Fix the URL, check your credentials or access, then push again |
 | The branch has no counterpart on the remote, and the remote has no branches | Pushed as the first publication | none |
-| The remote's branch is ahead of yours | Refused: "pull first" | `gitmesh pull --strategy merge` (or `rebase`), then push |
-| Your history and the remote's diverged | Refused: "diverged" | Integrate deliberately (`pull --strategy merge` or `rebase`), then push |
+| The remote has commits this repository does not have | Refused: `rejected: <remote branch> has N commit(s) this repository does not have` | `gitmesh pull --strategy merge` (or `rebase`), then push |
+| Your history and the remote's diverged | Refused: `rejected: '<branch>' has diverged from <remote branch> (…)` | Integrate deliberately (`pull --strategy merge` or `rebase`), then push |
 | Your history shares no commit with the remote's branch | Refused: "unrelated histories" | See below |
 | The remote has branches, none with your history, and your branch's name is not on it | Refused: "no commits in common" with a branch-name hint | Push under the name the remote uses, or rename your local branch to match (`git branch -m <name>`) |
 
@@ -250,7 +250,7 @@ operation as a whole is never reported as a success when any repository failed.
 | `repository has no commits yet` (skipped) | No commit to pull or push. | Commit first. |
 | `no longer exists on the remote` (failed) | The remote deleted the tracked branch. | Push the branch again, or pick another upstream. |
 | `diverged from …` (failed) | Both sides have commits the other lacks. Pull refuses to merge silently. | `gitmesh pull --strategy merge` or `--strategy rebase`, then push. |
-| `rejected: … diverged` (push, failed) | Same as above, seen from the push. | Integrate with `gitmesh pull --strategy merge` (or `rebase`), then push again. |
+| `rejected: … has diverged from …` (push, failed) | Same as above, seen from the push. | Integrate with `gitmesh pull --strategy merge` (or `rebase`), then push again. |
 | `… unrelated histories (no common commit)` (failed) | The two repositories share no commit at all, so neither pull nor merge can join them automatically. | Decide which history to keep. Do not force it: GitMesh never force-pushes. |
 | `rejected: the remote has commits this repository does not have` (push, failed) | The remote is ahead. | `gitmesh pull` first, then push. |
 | `rejected by the remote` (push, failed) | The remote refused the update itself (a hook, a protected branch). The remote's own message is shown. | Follow the remote's policy. Local work is unchanged. |

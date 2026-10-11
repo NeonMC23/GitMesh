@@ -96,6 +96,14 @@ ln -s "$repo/target/release/gitmesh" "$work/linked/gitmesh"
 expect_fail "install refuses a symlink at the destination" "$installer" --no-build --bin-dir "$work/linked"
 check "symlink still points where it did" test -L "$work/linked/gitmesh"
 
+# 7b. Even with --force, a symlink is refused and nothing is written through it (a symlink to a
+# directory must not receive the new file).
+mkdir -p "$work/linkdir-target" "$work/linked-force"
+ln -s "$work/linkdir-target" "$work/linked-force/gitmesh"
+expect_fail "--force refuses a symlink at the destination" "$installer" --no-build --bin-dir "$work/linked-force" --force
+check "symlink target directory received nothing" test -z "$(ls -A "$work/linkdir-target")"
+check "symlink itself is kept" test -L "$work/linked-force/gitmesh"
+
 # 8. A directory at the destination is refused.
 mkdir -p "$work/isdir/gitmesh"
 expect_fail "install refuses a directory at the destination" "$installer" --no-build --bin-dir "$work/isdir"

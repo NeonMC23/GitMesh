@@ -94,7 +94,9 @@ $ ./install.sh --no-build                      # install the existing build, wit
 
 * **Identity check.** A file counts as a GitMesh executable only if it is a regular file that contains
   GitMesh's own help text. The file is searched as data, never run, before it is replaced or removed.
-  A symbolic link at the destination is never followed or treated as GitMesh.
+  A symbolic link at the destination is never followed, replaced or treated as GitMesh, **even with
+  `--force`**: a link to a directory would otherwise receive the new file inside that directory. The
+  installer stops and leaves the link alone. Remove the link yourself, then re-run.
 * **No silent overwrite.** An existing non-GitMesh file, or a directory, at the destination stops the
   install with a message and changes nothing. `--force` is the explicit choice to replace a
   non-GitMesh file.
@@ -132,7 +134,7 @@ To make it permanent, add the same line to your start-up file:
 
 | Shell | File | Line to add |
 |---|---|---|
-| bash | `~/.bashrc` (login shells also read `~/.profile`) | `export PATH="$HOME/.local/bin:$PATH"` |
+| bash | `~/.bashrc` (if your login shell does not read it, put the line in `~/.profile`) | `export PATH="$HOME/.local/bin:$PATH"` |
 | zsh | `~/.zshrc` | `export PATH="$HOME/.local/bin:$PATH"` |
 | fish | (run once) | `fish_add_path ~/.local/bin` |
 
@@ -243,6 +245,7 @@ executable. It keeps:
 * the destination directory itself (it may contain other files);
 * every project, its `.gitmesh/project.toml`, every repository and its history, and every remote;
 * the source checkout and its build output;
+* a symbolic link at the destination: it is refused, not removed (see Troubleshooting);
 * any `PATH` line you added to a shell start-up file (remove it yourself if you no longer want it).
 
 To remove the build output too, run `cargo clean` in the checkout. To remove the checkout, delete the
@@ -257,7 +260,7 @@ directory yourself once you are sure you do not need it. Neither step is automat
 **`Permission denied` when running `./build.sh` or `./install.sh`.** The script lost its executable
 bit, which some archive tools and copies do. Run `bash ./install.sh` or `chmod +x install.sh build.sh`.
 
-**`cannot create ... (permission denied)` or `is not writable`.** The destination belongs to another
+**`cannot create ...` or `... is not writable by your user account`.** The destination belongs to another
 user or is read-only. Choose a directory you own, for example `./install.sh --bin-dir "$HOME/bin"`.
 The installer never uses `sudo`.
 
@@ -268,9 +271,12 @@ path such as `bin`.
 with `file ~/.local/bin/gitmesh`. If you are sure it can be replaced, re-run with `--force`; otherwise
 install to a different `--bin-dir`. Nothing was changed.
 
-**`is a directory`.** Remove or rename the directory yourself, or choose another `--bin-dir`. The installer
-never deletes it. A symbolic link at the destination is reported as "already exists and is not a GitMesh
-executable" and is also left alone.
+**`... is a directory`.** Remove or rename the directory yourself, or choose another `--bin-dir`. The installer
+never deletes it.
+
+**`... is a symbolic link, so it was NOT changed`.** The destination is a symbolic link. The installer never
+follows, replaces or removes a link, even with `--force`. Check where it points with `ls -l <destination>`,
+remove the link yourself if you no longer need it, then re-run, or choose another `--bin-dir`.
 
 **Build fails: no Rust.** Run `./build.sh` and answer the prompt, or `./build.sh --install-rust` in a
 script. Or install Rust yourself from https://rustup.rs or your system packages, then re-run.

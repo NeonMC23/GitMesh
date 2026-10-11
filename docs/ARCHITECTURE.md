@@ -93,9 +93,9 @@ Rules that keep the layering honest:
   creation logic of its own, and neither can run a plan the user did not see (the plan id
   is checked again before execution).
 * **`cli`, `ui` and `gui` contain no Git logic.** They call `service` (and, for
-  configuration editing, `discovery`), so the front ends cannot drift apart. The GUI
-  additionally goes through `service` exclusively: it has no direct `ops` call for
-  anything but the observer-aware operation methods, and no direct `git` call at all.
+  configuration editing, `discovery`), so the front ends cannot drift apart. The GUI holds a
+  `GitRunner` (`src/gui/mod.rs`) and passes it to the `setup`, `manage`, `service` and `discovery`
+  calls it makes; it runs no Git command of its own, and every decision is made in those modules.
 * **`manage` is the counterpart of `setup` for an existing project.** `inspect` reports
   what the configuration says and what is on disk, `plan` produces every change, every
   step, the exact manifest it would write and the reasons it refuses, `apply` replays that
@@ -124,6 +124,8 @@ Rules that keep the layering honest:
 | `src/analyzer.rs` | Unified project status, change ownership, ownership warnings, JSON status |
 | `src/ops/` | `commit`, `branch` (create/checkout/delete/merge/show), `sync` (fetch/pull), `push`, shared `util` (selection, per-repository loop, exclusions) |
 | `src/paths.rs` | Lexical normalisation, project-relative conversion, manifest path validation |
+| `src/git/history.rs` | Repository lifecycle rules: how a local repository may relate to a remote (adopting remote history, divergence, unrelated histories), decided before anything is connected, adopted or pushed |
+| `src/git/remote.rs` | Remote-facing Git knowledge read from structured output: reachability (`ls-remote`), default branch, push refusals (`push --porcelain`), ahead/behind and shared-history checks |
 | `src/json.rs` | Minimal JSON writer used by `--json` output (no serialisation dependency) |
 | `src/providers/` | Hosting provider abstraction; `github.rs` parses GitHub URLs and coordinates |
 | `src/setup.rs` | Project creation service: `inspect` (facts about a directory), `SetupRequest` → `SetupPlan` → `SetupResult` → `ValidationReport`, `FirstPublish` (a plan entry the caller runs through the ordinary commit/push), `SetupObserver` for progress |
@@ -224,7 +226,7 @@ on is refused instead of executed, and the result is checked afterwards against 
 
 **No framework bloat.** Dependencies: `clap` (CLI), `serde` + `toml` (manifest),
 `thiserror` (errors), `ratatui` + `crossterm` (terminal UI). JSON output is written by
-~130 lines of code in `src/json.rs` rather than adding a serialisation dependency.
+271 lines of code in `src/json.rs` rather than adding a serialisation dependency.
 
 ## 7. GitHub integration boundary
 
@@ -263,4 +265,3 @@ One module decides how a repository meets its remote. Setup (`setup.rs`), reposi
 - Adoption (`discovery::adopt_remote_history`) runs only after the remote is configured and only on a repository without commits: `git fetch`, then `git checkout -B <branch> --track origin/<branch>`. Git refuses the checkout when a local file would be overwritten, and nothing is changed in that case.
 - `push_preflight` runs before any push and refuses an unrelated history, a diverged or advanced branch, an unreadable remote, and a branch-name mismatch. It never force-pushes.
 - Nothing merges, resets, or rewrites history automatically. The only merge is one the user starts with `pull --strategy merge`, or with Git directly.
-

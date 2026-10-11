@@ -5,7 +5,7 @@ logical project, its root repository and its external repositories.
 
 * **Location:** `<project root>/.gitmesh/project.toml`
 * **Format version:** `1`
-* **Written by:** GitMesh (`gitmesh init`, `gitmesh configure ...`, the terminal UI)
+* **Written by:** GitMesh only: `gitmesh init`, `gitmesh configure ...`, the project setup wizard and the Repositories tab of the web interface. The terminal interface does not write it.
 * **Read by:** every operation that needs to know repository boundaries
 
 The manifest is an *internal persistent representation*: users are not expected to
@@ -57,7 +57,7 @@ path = "vendor/lib"
 | `repositories[].remote` | no | Remote URL (recorded; configure it in the repository with `--set-git-remote`). |
 | `repositories[].branch` | no | Branch hint. |
 
-Unknown keys are rejected by the parser (a typo must not be silently ignored).
+Unknown keys are **accepted** by the parser without a message, and they are **dropped** the next time GitMesh saves the manifest (for example after `gitmesh configure`). Check the spelling of keys you write by hand; GitMesh does not preserve keys it does not know.
 
 ## 2. Validation rules
 
@@ -86,9 +86,11 @@ Errors are printed as a list:
 ```console
 $ gitmesh configure add engine/deep
 gitmesh: project configuration is invalid:
-  - repository paths overlap: 'engine' ('engine') and 'nested' ('engine/deep') - a
-    directory cannot belong to two physical repositories
+  - directory 'engine/deep' is inside the repository 'engine' ('engine'); nested repository boundaries are not supported
 ```
+
+The same rule is enforced when the manifest is validated: two repositories whose paths overlap are rejected
+with `repository paths overlap: ...` (see the table above).
 
 Exit code `2` for configuration errors, `1` for operational failures.
 
